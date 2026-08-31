@@ -3,3 +3,11 @@
 
 class TTSGenerationError(RuntimeError):
     pass
+
+
+class MediaProbeError(RuntimeError):
+    """Raised when media duration cannot be determined."""
+
+
+class VideoRenderError(RuntimeError):
+    """Raised when FFmpeg cannot render video output."""

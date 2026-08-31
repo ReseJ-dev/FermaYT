@@ -9,10 +9,23 @@
   </head>
   <body>
     <header class="app-header">
-      <a class="brand" href="/">FermaYT</a>
+      <div class="header-inner">
+        <a class="brand" href="/">
+          <span class="brand-mark" aria-hidden="true">F</span>
+          <span>FermaYT</span>
+        </a>
+        <nav class="main-nav" aria-label="Основная навигация">
+          <a href="/" {% if request.url.path == '/' %}aria-current="page"{% endif %}>Проекты</a>
+          <a href="/settings" {% if request.url.path == '/settings' %}aria-current="page"{% endif %}>Настройки</a>
+          <span class="local-badge"><span></span>Локально</span>
+        </nav>
+      </div>
     </header>
     <main class="app-content">
+      {% if notice %}<div class="flash flash-success" role="status">{{ notice }}</div>{% endif %}
+      {% if error %}<div class="flash flash-error" role="alert">{{ error }}</div>{% endif %}
       {% block content %}{% endblock %}
     </main>
+    <footer class="app-footer">FermaYT работает локально на вашем компьютере</footer>
   </body>
 </html>

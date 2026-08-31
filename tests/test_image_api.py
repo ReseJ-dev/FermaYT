@@ -83,6 +83,31 @@ def test_generate_returns_image_url(
     assert run_generate() == "https://example.com/image.png"
 
 
+def test_seedream_uses_explicit_constructor_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://custom.example.com/seedream"
+        assert request.headers["Authorization"] == "Bearer explicit-key"
+        assert json.loads(request.content)["model"] == "custom-seedream"
+        return httpx.Response(
+            200,
+            json={"data": [{"url": "https://example.com/image.png"}]},
+        )
+
+    monkeypatch.setenv("BYTEPLUS_ARK_API_KEY", "environment-key")
+    install_mock_transport(monkeypatch, handler)
+    client = BytePlusImageApiClient(
+        api_key="explicit-key",
+        endpoint="https://custom.example.com/seedream",
+        model="custom-seedream",
+    )
+
+    result = asyncio.run(client.generate("A mountain"))
+
+    assert result == "https://example.com/image.png"
+
+
 @pytest.mark.parametrize("prompt", ["", "   "])
 def test_generate_rejects_empty_prompt(prompt: str) -> None:
     with pytest.raises(ImageGenerationError, match="Invalid image prompt"):
@@ -227,6 +252,44 @@ def test_qwen_generate_returns_image_url(
     configure_qwen(monkeypatch, handler)
 
     assert run_qwen_generate() == "https://example.com/qwen.png"
+
+
+def test_qwen_uses_explicit_constructor_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url == "https://custom.example.com/qwen"
+        assert request.headers["Authorization"] == "Bearer explicit-key"
+        assert json.loads(request.content)["model"] == "custom-qwen"
+        return httpx.Response(
+            200,
+            json={
+                "output": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": [
+                                    {"image": "https://example.com/qwen.png"}
+                                ]
+                            }
+                        }
+                    ]
+                }
+            },
+        )
+
+    monkeypatch.setenv("DASHSCOPE_API_KEY", "environment-key")
+    monkeypatch.setenv("QWEN_IMAGE_ENDPOINT", "https://env.example.com")
+    install_mock_transport(monkeypatch, handler)
+    client = QwenImageApiClient(
+        api_key="explicit-key",
+        endpoint="https://custom.example.com/qwen",
+        model="custom-qwen",
+    )
+
+    result = asyncio.run(client.generate("A mountain"))
+
+    assert result == "https://example.com/qwen.png"
 
 
 @pytest.mark.parametrize("prompt", ["", "   "])

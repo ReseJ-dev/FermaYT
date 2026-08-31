@@ -12,6 +12,21 @@ def validate_image_prompt(prompt: str) -> str:
     return normalized_prompt
 
 
+def build_image_generation_prompt(
+    scene_prompt: str,
+    global_image_style_prompt: str | None,
+) -> str:
+    """Combine scene content and project style without mutating either."""
+    normalized_scene_prompt = validate_image_prompt(scene_prompt)
+    if global_image_style_prompt is None:
+        return normalized_scene_prompt
+
+    normalized_style_prompt = global_image_style_prompt.strip()
+    if not normalized_style_prompt:
+        return normalized_scene_prompt
+    return f"{normalized_scene_prompt}\n\n{normalized_style_prompt}"
+
+
 async def generate_image(
     prompt: str,
     output_path: str,

@@ -1,0 +1,12 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <div class="page-heading"><div><p class="eyebrow">Configuration</p><h1>Настройки провайдеров</h1><p class="lead">Секретные ключи не отображаются и не передаются браузеру.</p></div></div>
+  <div class="settings-grid">
+    <section class="panel provider-card"><div class="provider-heading"><div class="provider-logo seedream">S</div><div><h2>BytePlus Seedream</h2><p>Генерация изображений</p></div><span class="config-status {{ 'configured' if byteplus_configured else '' }}">{{ 'Настроено' if byteplus_configured else 'Не настроено' }}</span></div><dl class="settings-list"><div><dt>Переменная</dt><dd><code>BYTEPLUS_ARK_API_KEY</code></dd></div><div><dt>Модель</dt><dd>seedream-5-0-260128</dd></div></dl></section>
+    <section class="panel provider-card"><div class="provider-heading"><div class="provider-logo qwen">Q</div><div><h2>Alibaba Qwen</h2><p>Изображения и озвучка</p></div><span class="config-status {{ 'configured' if dashscope_configured else '' }}">{{ 'Настроено' if dashscope_configured else 'Не настроено' }}</span></div><dl class="settings-list"><div><dt>Ключ</dt><dd><code>DASHSCOPE_API_KEY</code></dd></div><div><dt>Image endpoint</dt><dd>{{ 'Настроен' if qwen_image_endpoint_configured else 'Не настроен' }}</dd></div><div><dt>TTS</dt><dd>qwen3-tts-flash · Cherry · Russian</dd></div></dl></section>
+  </div>
+  <section class="panel settings-note"><h2>Как добавить ключи</h2><p>В текущем MVP клиенты читают ключи из environment variables. Перезапустите FermaYT после их изменения. Сохранение ключей из браузера появится после подключения безопасного OS keyring.</p><pre>export BYTEPLUS_ARK_API_KEY="..."
+export DASHSCOPE_API_KEY="..."
+export QWEN_IMAGE_ENDPOINT="https://..."</pre></section>
+{% endblock %}

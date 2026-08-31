@@ -19,6 +19,16 @@ class BytePlusImageApiClient:
     MODEL_ID: ClassVar[str] = "seedream-5-0-260128"
     TIMEOUT_SECONDS: ClassVar[float] = 30.0
 
+    def __init__(
+        self,
+        api_key: str | None = None,
+        endpoint: str | None = None,
+        model: str = MODEL_ID,
+    ) -> None:
+        self.api_key = api_key
+        self.endpoint = endpoint if endpoint is not None else self.API_URL
+        self.model = model
+
     async def generate(self, prompt: str) -> str:
         """Generate one image and return its temporary URL."""
         from app.generators.image import validate_image_prompt
@@ -28,14 +38,18 @@ class BytePlusImageApiClient:
         except ValueError as exc:
             raise ImageGenerationError("Invalid image prompt") from exc
 
-        api_key = os.getenv("BYTEPLUS_ARK_API_KEY")
+        api_key = (
+            self.api_key
+            if self.api_key is not None
+            else os.getenv("BYTEPLUS_ARK_API_KEY")
+        )
         if not api_key or not api_key.strip():
             raise ImageGenerationError(
                 "BYTEPLUS_ARK_API_KEY environment variable is not set"
             )
 
         payload: dict[str, str | bool] = {
-            "model": self.MODEL_ID,
+            "model": self.model,
             "prompt": validated_prompt,
             "size": "2K",
             "output_format": "png",
@@ -54,7 +68,7 @@ class BytePlusImageApiClient:
                 timeout=self.TIMEOUT_SECONDS
             ) as client:
                 response = await client.post(
-                    self.API_URL,
+                    self.endpoint,
                     headers=headers,
                     json=payload,
                 )
@@ -112,6 +126,16 @@ class QwenImageApiClient:
     MODEL_ID: ClassVar[str] = "qwen-image-3.0"
     TIMEOUT_SECONDS: ClassVar[float] = 30.0
 
+    def __init__(
+        self,
+        api_key: str | None = None,
+        endpoint: str | None = None,
+        model: str = MODEL_ID,
+    ) -> None:
+        self.api_key = api_key
+        self.endpoint = endpoint
+        self.model = model
+
     async def generate(self, prompt: str) -> str:
         """Generate one image and return its temporary URL."""
         from app.generators.image import validate_image_prompt
@@ -121,20 +145,28 @@ class QwenImageApiClient:
         except ValueError as exc:
             raise ImageGenerationError("Invalid image prompt") from exc
 
-        api_key = os.getenv("DASHSCOPE_API_KEY")
+        api_key = (
+            self.api_key
+            if self.api_key is not None
+            else os.getenv("DASHSCOPE_API_KEY")
+        )
         if not api_key or not api_key.strip():
             raise ImageGenerationError(
                 "DASHSCOPE_API_KEY environment variable is not set"
             )
 
-        endpoint = os.getenv("QWEN_IMAGE_ENDPOINT")
+        endpoint = (
+            self.endpoint
+            if self.endpoint is not None
+            else os.getenv("QWEN_IMAGE_ENDPOINT")
+        )
         if not endpoint or not endpoint.strip():
             raise ImageGenerationError(
                 "QWEN_IMAGE_ENDPOINT environment variable is not set"
             )
 
         payload = {
-            "model": self.MODEL_ID,
+            "model": self.model,
             "input": {
                 "messages": [
                     {
@@ -189,9 +221,9 @@ class QwenImageApiClient:
                 "Qwen Image API response does not contain output"
             )
 
-        if "code" in response_data:
-            error_code = response_data.get("code")
-            error_message = response_data.get("message")
+        error_code = response_data.get("code")
+        error_message = response_data.get("message")
+        if error_code or error_message:
             raise ImageGenerationError(
                 f"Qwen Image API error {error_code}: {error_message}"
             )
@@ -241,4 +273,6 @@ class QwenImageApiClient:
         return image_url.strip()
 
 
-ImageApiClient = BytePlusImageApiClient
+SeedreamImageProvider = BytePlusImageApiClient
+QwenImageProvider = QwenImageApiClient
+ImageApiClient = SeedreamImageProvider

@@ -1,0 +1,137 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <div class="breadcrumbs"><a href="/">Проекты</a><span>/</span><span>{{ project.name }}</span></div>
+
+  <div class="page-heading project-heading">
+    <div>
+      <p class="eyebrow">Project workspace</p>
+      <h1>{{ project.name }}</h1>
+      <p class="lead">{{ scene_cards | length }} сцен · {{ project.width }}×{{ project.height }} · {{ project.fps }} FPS</p>
+    </div>
+    <span class="status-pill">Черновик</span>
+  </div>
+
+  <div class="workspace-layout">
+    <section class="workspace-main">
+      <form class="panel project-form" action="/projects/{{ project.id }}" method="post">
+        <div class="section-heading">
+          <div><p class="eyebrow">Основа ролика</p><h2>История и стиль</h2></div>
+          <button class="button button-primary" type="submit">Сохранить проект</button>
+        </div>
+
+        <div class="form-grid two-columns">
+          <label>Название<input name="name" maxlength="255" required value="{{ project.name }}"></label>
+          <label>Количество сцен<input name="scene_count" type="number" min="1" max="50" value="{{ project.scene_count or '' }}" placeholder="До 50"></label>
+        </div>
+        <label>История<textarea name="story_text" rows="7" required>{{ project.story_text }}</textarea></label>
+        <label>Общий визуальный стиль<textarea name="global_image_style_prompt" rows="3" placeholder="Например: layered cardboard, warm colors, soft cinematic light">{{ project.global_image_style_prompt or '' }}</textarea><small>Стиль добавляется к промпту при генерации и не изменяет промпты сцен.</small></label>
+
+        <details class="settings-details">
+          <summary>Провайдеры и параметры видео</summary>
+          <div class="form-grid two-columns details-content">
+            <label>Провайдер изображений
+              <select name="image_provider">
+                <option value="seedream" {% if project.image_provider == 'seedream' %}selected{% endif %}>BytePlus Seedream</option>
+                <option value="qwen" {% if project.image_provider == 'qwen' %}selected{% endif %}>Alibaba Qwen Image</option>
+              </select>
+            </label>
+            <label>Модель изображений<input name="image_model" value="{{ project.image_model or '' }}" placeholder="По умолчанию провайдера"></label>
+            <label>Провайдер озвучки<select name="tts_provider"><option value="qwen" selected>Alibaba Qwen TTS</option></select></label>
+            <label>Модель TTS<input name="tts_model" value="{{ project.tts_model or '' }}" placeholder="qwen3-tts-flash"></label>
+            <label>Голос<input name="tts_voice" required value="{{ project.tts_voice }}"></label>
+            <label>Язык<input name="tts_language" required value="{{ project.tts_language }}"></label>
+            <label>Формат видео
+              <select name="output_preset">
+                <option value="vertical" {% if project.width == 1080 and project.height == 1920 %}selected{% endif %}>Вертикальный 9:16 — 1080×1920</option>
+                <option value="horizontal" {% if project.width == 1920 and project.height == 1080 %}selected{% endif %}>Горизонтальный 16:9 — 1920×1080</option>
+                <option value="square" {% if project.width == 1080 and project.height == 1080 %}selected{% endif %}>Квадратный 1:1 — 1080×1080</option>
+              </select>
+            </label>
+            <label>FPS<select name="fps">{% for fps in [24, 30, 60] %}<option value="{{ fps }}" {% if project.fps == fps %}selected{% endif %}>{{ fps }}</option>{% endfor %}</select></label>
+            <label>Масштаб изображения<select name="image_fit"><option value="cover" {% if project.image_fit == 'cover' %}selected{% endif %}>Заполнить кадр (cover)</option><option value="contain" {% if project.image_fit == 'contain' %}selected{% endif %}>Показать целиком (contain)</option></select></label>
+          </div>
+        </details>
+      </form>
+
+      <section class="scenes-section">
+        <div class="section-heading">
+          <div><p class="eyebrow">Storyboard</p><h2>Сцены</h2></div>
+          <button class="button button-primary" type="button" data-open-dialog="add-scene">+ Добавить сцену</button>
+        </div>
+
+        {% if scene_cards %}
+          <div class="scene-list">
+            {% for card in scene_cards %}
+              {% set scene = card.scene %}
+              <article class="panel scene-card" id="scene-{{ scene.id }}">
+                <div class="scene-number"><span>{{ loop.index }}</span><small>SCENE</small></div>
+                <div class="scene-content">
+                  <form action="/projects/{{ project.id }}/scenes/{{ scene.id }}" method="post">
+                    <div class="scene-toolbar">
+                      <h3>Сцена {{ loop.index }}</h3>
+                      <div class="compact-actions">
+                        <button class="icon-button" formaction="/projects/{{ project.id }}/scenes/{{ scene.id }}/move/up" formmethod="post" title="Переместить вверх" {% if loop.first %}disabled{% endif %}>↑</button>
+                        <button class="icon-button" formaction="/projects/{{ project.id }}/scenes/{{ scene.id }}/move/down" formmethod="post" title="Переместить вниз" {% if loop.last %}disabled{% endif %}>↓</button>
+                        <button class="button button-danger-ghost button-small" formaction="/projects/{{ project.id }}/scenes/{{ scene.id }}/delete" formmethod="post" data-confirm="Удалить сцену {{ loop.index }}?">Удалить</button>
+                      </div>
+                    </div>
+                    <div class="scene-editor-grid">
+                      <div class="scene-fields">
+                        <label>Текст озвучки<textarea name="text" rows="5" required>{{ scene.text }}</textarea></label>
+                        <label>Промпт изображения<textarea name="image_prompt" rows="5" required>{{ scene.image_prompt }}</textarea></label>
+                        <button class="button button-secondary" type="submit">Сохранить сцену</button>
+                      </div>
+                      <div class="asset-stack">
+                        <div class="asset-card">
+                          <div class="asset-label">Изображение</div>
+                          {% if card.image_url %}<img src="{{ card.image_url }}" alt="Изображение сцены {{ loop.index }}">{% else %}<div class="asset-placeholder"><span>▧</span><small>Изображения пока нет</small></div>{% endif %}
+                          <button class="button button-secondary button-full" type="button" disabled title="Будет подключено на следующем этапе">{{ 'Перегенерировать' if card.image_url else 'Создать изображение' }}</button>
+                        </div>
+                        <div class="asset-card asset-audio">
+                          <div class="asset-label">Озвучка{% if scene.duration %}<span>{{ '%.1f' | format(scene.duration) }} сек.</span>{% endif %}</div>
+                          {% if card.audio_url %}<audio controls preload="metadata" src="{{ card.audio_url }}"></audio>{% else %}<div class="audio-placeholder">Озвучки пока нет</div>{% endif %}
+                          <button class="button button-secondary button-full" type="button" disabled title="Будет подключено на следующем этапе">{{ 'Перегенерировать голос' if card.audio_url else 'Создать озвучку' }}</button>
+                        </div>
+                      </div>
+                    </div>
+                  </form>
+                </div>
+              </article>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="empty-state compact-empty"><h3>Сцен пока нет</h3><p>Добавьте первую сцену с текстом озвучки и описанием изображения.</p><button class="button button-primary" type="button" data-open-dialog="add-scene">Добавить сцену</button></div>
+        {% endif %}
+      </section>
+    </section>
+
+    <aside class="workspace-sidebar">
+      <section class="panel sticky-panel">
+        <p class="eyebrow">Pipeline</p><h2>Подготовка видео</h2>
+        <ol class="pipeline-steps">
+          <li class="is-active"><span>1</span><div><strong>История</strong><small>Заполнена</small></div></li>
+          <li class="{% if scene_cards %}is-active{% endif %}"><span>2</span><div><strong>Сцены</strong><small>{{ scene_cards | length }} создано</small></div></li>
+          <li><span>3</span><div><strong>Материалы</strong><small>Изображения и звук</small></div></li>
+          <li><span>4</span><div><strong>Видео</strong><small>Финальный рендер</small></div></li>
+        </ol>
+        <div class="sidebar-actions">
+          <button class="button button-primary button-full" type="button" disabled title="Генерационный workflow будет подключён следующим этапом">Создать все материалы</button>
+          <button class="button button-secondary button-full" type="button" disabled>Рендер видео</button>
+        </div>
+        {% if final_video_url %}<video class="final-preview" controls src="{{ final_video_url }}"></video>{% endif %}
+        <p class="helper-text">Настройте API-провайдеры перед генерацией.</p>
+        <a class="text-link" href="/settings">Открыть настройки →</a>
+      </section>
+    </aside>
+  </div>
+
+  <dialog id="add-scene" class="modal">
+    <form action="/projects/{{ project.id }}/scenes" method="post">
+      <div class="modal-heading"><div><p class="eyebrow">Storyboard</p><h2>Новая сцена</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Закрыть">×</button></div>
+      <label>Текст озвучки<textarea name="text" rows="6" required placeholder="Что будет звучать в этой сцене..."></textarea></label>
+      <label>Промпт изображения<textarea name="image_prompt" rows="6" required placeholder="Что должно быть изображено в кадре..."></textarea></label>
+      <div class="modal-actions"><button class="button button-secondary" type="button" data-close-dialog>Отмена</button><button class="button button-primary" type="submit">Добавить сцену</button></div>
+    </form>
+  </dialog>
+{% endblock %}

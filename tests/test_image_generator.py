@@ -6,7 +6,11 @@ import pytest
 
 import app.generators.image as image_generator
 from app.clients.image_api import ImageApiClient
-from app.generators.image import generate_image, validate_image_prompt
+from app.generators.image import (
+    build_image_generation_prompt,
+    generate_image,
+    validate_image_prompt,
+)
 
 
 class FakeImageApiClient(ImageApiClient):
@@ -36,6 +40,36 @@ def test_validate_image_prompt_returns_valid_prompt() -> None:
     prompt = "cinematic mountain landscape"
 
     assert validate_image_prompt(prompt) == prompt
+
+
+def test_build_image_generation_prompt_combines_scene_and_style() -> None:
+    scene_prompt = "  A boy opens a glowing book  "
+    style_prompt = "  layered cardboard, warm colors  "
+
+    result = build_image_generation_prompt(scene_prompt, style_prompt)
+
+    assert result == (
+        "A boy opens a glowing book\n\nlayered cardboard, warm colors"
+    )
+    assert scene_prompt == "  A boy opens a glowing book  "
+    assert style_prompt == "  layered cardboard, warm colors  "
+
+
+@pytest.mark.parametrize("style_prompt", [None, "", "   ", "\t\n"])
+def test_build_image_generation_prompt_ignores_empty_style(
+    style_prompt: str | None,
+) -> None:
+    result = build_image_generation_prompt(
+        "  A boy opens a glowing book  ",
+        style_prompt,
+    )
+
+    assert result == "A boy opens a glowing book"
+
+
+def test_build_image_generation_prompt_validates_scene_prompt() -> None:
+    with pytest.raises(ValueError, match="image prompt must not be empty"):
+        build_image_generation_prompt("   ", "paper art")
 
 
 def test_generate_image_runs_complete_workflow(

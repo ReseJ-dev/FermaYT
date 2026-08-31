@@ -1,11 +1,70 @@
 {% extends "base.html" %}
 
-{% block title %}FermaYT — Video Generation{% endblock %}
+{% block title %}Проекты — FermaYT{% endblock %}
 
 {% block content %}
-  <section class="welcome" aria-labelledby="welcome-title">
-    <p class="eyebrow">Local video workspace</p>
-    <h1 id="welcome-title">FermaYT</h1>
-    <p>Локальное приложение для создания видео.</p>
-  </section>
+  <div class="page-heading">
+    <div>
+      <p class="eyebrow">Video workspace</p>
+      <h1>Ваши проекты</h1>
+      <p class="lead">Создавайте сцены, изображения, озвучку и финальные видео в одном месте.</p>
+    </div>
+    <button class="button button-primary" type="button" data-open-dialog="create-project">+ Новый проект</button>
+  </div>
+
+  {% if project_cards %}
+    <section class="project-grid" aria-label="Список проектов">
+      {% for card in project_cards %}
+        {% set project = card.project %}
+        <article class="project-card">
+          <div class="project-card-preview">
+            <span class="project-initial">{{ project.name[:1] | upper }}</span>
+            {% if project.final_video_path %}
+              <span class="status-pill status-ready">Видео готово</span>
+            {% else %}
+              <span class="status-pill">В работе</span>
+            {% endif %}
+          </div>
+          <div class="project-card-body">
+            <h2>{{ project.name }}</h2>
+            <p>{{ project.story_text | truncate(110) }}</p>
+            <dl class="project-meta">
+              <div><dt>Сцен</dt><dd>{{ card.scene_count }}</dd></div>
+              <div><dt>Изображения</dt><dd>{{ 'Seedream' if project.image_provider == 'seedream' else 'Qwen' }}</dd></div>
+              <div><dt>Формат</dt><dd>{{ project.width }}×{{ project.height }}</dd></div>
+            </dl>
+            <div class="card-actions">
+              <a class="button button-primary" href="/projects/{{ project.id }}">Открыть</a>
+              <form action="/projects/{{ project.id }}/delete" method="post" data-confirm="Удалить проект «{{ project.name }}»?">
+                <button class="button button-danger-ghost" type="submit">Удалить</button>
+              </form>
+            </div>
+          </div>
+        </article>
+      {% endfor %}
+    </section>
+  {% else %}
+    <section class="empty-state">
+      <div class="empty-icon" aria-hidden="true">▶</div>
+      <h2>Создайте первый проект</h2>
+      <p>Добавьте историю, разбейте её на сцены и подготовьте материалы для ролика.</p>
+      <button class="button button-primary" type="button" data-open-dialog="create-project">Создать проект</button>
+    </section>
+  {% endif %}
+
+  <dialog id="create-project" class="modal">
+    <form action="/projects" method="post">
+      <div class="modal-heading">
+        <div><p class="eyebrow">Новый ролик</p><h2>Создание проекта</h2></div>
+        <button class="icon-button" type="button" data-close-dialog aria-label="Закрыть">×</button>
+      </div>
+      <label>Название проекта<input name="name" maxlength="255" required placeholder="Например, Волшебная книга"></label>
+      <label>История<textarea name="story_text" rows="7" required placeholder="Опишите сюжет будущего видео..."></textarea></label>
+      <label>Примерное количество сцен<input name="scene_count" type="number" min="1" max="50" placeholder="Можно указать позже"></label>
+      <div class="modal-actions">
+        <button class="button button-secondary" type="button" data-close-dialog>Отмена</button>
+        <button class="button button-primary" type="submit">Создать и открыть</button>
+      </div>
+    </form>
+  </dialog>
 {% endblock %}

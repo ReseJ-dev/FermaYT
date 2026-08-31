@@ -6,7 +6,6 @@ from typing import ClassVar
 import httpx
 
 from app.errors import TTSGenerationError
-from app.generators.voice import validate_tts_text
 
 
 class QwenTTSApiClient:
@@ -37,6 +36,8 @@ class QwenTTSApiClient:
 
     async def generate(self, text: str) -> str:
         """Generate speech and return its temporary audio URL."""
+        from app.generators.voice import validate_tts_text
+
         try:
             validated_text = validate_tts_text(text)
         except ValueError as exc:

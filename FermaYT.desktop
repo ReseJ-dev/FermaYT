@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=FermaYT
+Comment=Start the local FermaYT video application
+Exec=/home/grindyun/coding/FermaYT/start_fermayt.sh
+Path=/home/grindyun/coding/FermaYT
+Terminal=true
+Icon=video-x-generic
+Categories=AudioVideo;
+StartupNotify=true
