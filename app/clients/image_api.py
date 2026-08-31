@@ -5,8 +5,6 @@ from typing import ClassVar
 
 import httpx
 
-from app.generators.image import validate_image_prompt
-
 
 class ImageGenerationError(Exception):
     """Raised when an external image generation API fails."""
@@ -23,6 +21,8 @@ class BytePlusImageApiClient:
 
     async def generate(self, prompt: str) -> str:
         """Generate one image and return its temporary URL."""
+        from app.generators.image import validate_image_prompt
+
         try:
             validated_prompt = validate_image_prompt(prompt)
         except ValueError as exc:
@@ -114,6 +114,8 @@ class QwenImageApiClient:
 
     async def generate(self, prompt: str) -> str:
         """Generate one image and return its temporary URL."""
+        from app.generators.image import validate_image_prompt
+
         try:
             validated_prompt = validate_image_prompt(prompt)
         except ValueError as exc:
@@ -237,3 +239,6 @@ class QwenImageApiClient:
             )
 
         return image_url.strip()
+
+
+ImageApiClient = BytePlusImageApiClient
