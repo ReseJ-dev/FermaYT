@@ -24,3 +24,19 @@ async def generate_scene_image(
 
     scene.image_path = image_path
     return image_path
+
+
+async def generate_job_images(
+    job: VideoJob,
+    output_dir: str,
+) -> list[str]:
+    """Generate images for all job scenes in sequence."""
+    if not job.scenes:
+        raise ValueError("video job must contain at least one scene")
+
+    image_paths: list[str] = []
+    for scene in job.scenes:
+        image_path = await generate_scene_image(job, scene, output_dir)
+        image_paths.append(image_path)
+
+    return image_paths
