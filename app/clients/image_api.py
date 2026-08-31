@@ -1,0 +1,1 @@
+"""Image generation API client."""
