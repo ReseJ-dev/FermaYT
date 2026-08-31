@@ -1,0 +1,53 @@
+:root {
+  color-scheme: light;
+  font-family: system-ui, sans-serif;
+  color: #172033;
+  background: #f4f6fa;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+.app-header {
+  padding: 1rem 2rem;
+  border-bottom: 1px solid #dce1ea;
+  background: #ffffff;
+}
+
+.brand {
+  color: inherit;
+  font-size: 1.25rem;
+  font-weight: 700;
+  text-decoration: none;
+}
+
+.app-content {
+  width: min(60rem, calc(100% - 2rem));
+  margin: 4rem auto;
+}
+
+.welcome {
+  padding: 3rem;
+  border: 1px solid #dce1ea;
+  border-radius: 1rem;
+  background: #ffffff;
+  box-shadow: 0 1rem 3rem rgb(23 32 51 / 8%);
+}
+
+.welcome h1 {
+  margin: 0;
+  font-size: clamp(2.5rem, 8vw, 5rem);
+}
+
+.eyebrow {
+  color: #54617a;
+  font-size: 0.75rem;
+  font-weight: 700;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
