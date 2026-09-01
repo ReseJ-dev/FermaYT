@@ -34,6 +34,7 @@ def _beat(
         "framing_reason": "Show the relevant geography",
         "camera_movement": "STATIC",
         "geography_established_by": None,
+        "master_scene_id": "shaft_master",
         "physical_state": (
             "The ladder is broken" if progressive_change else "The ladder is intact"
         ),
@@ -97,6 +98,10 @@ def _plan(
                     "id": "shaft_master",
                     "location_id": "shaft",
                     "description": "Wide master cutaway",
+                    "environment_geometry": "Vertical shaft from surface to tunnel",
+                    "recurring_object_positions": "Ladder follows the right wall",
+                    "color_palette": "Dark rock with amber work lights",
+                    "basic_composition": "Surface above, miners below",
                     "characters_visible": ["miners"],
                     "important_objects": ["ladder"],
                 }

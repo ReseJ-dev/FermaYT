@@ -53,6 +53,14 @@ recurring environments, and possible master scenes. Then create meaningful visua
 beats that make spatial layout, movement, distance, routes, obstructions, danger,
 breakage, and progressive physical changes easy to understand.
 
+MASTER SCENES. Select only a small number of important recurring environments. For
+each master, define stable environment geometry, recurring object positions, overall
+color palette, and basic composition. Treat masters as immutable continuity anchors,
+not frames that later beats can silently replace. Every beat occurring in a recurring
+environment must explicitly set master_scene_id. Descendants may change story state
+such as water, damage, people, objects or lighting while preserving the recognizable
+environment.
+
 DIRECTING RULES:
 1. SHOT PROGRESSION. Use WIDE, MEDIUM, CLOSE, DETAIL and CUTAWAY_DIAGRAM in a
 meaningful progression. Every change of framing needs a storytelling reason; never

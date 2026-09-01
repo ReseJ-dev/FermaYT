@@ -91,6 +91,10 @@ class MasterScene(_VisualModel):
         min_length=1,
         description="Reusable establishing composition and physical layout.",
     )
+    environment_geometry: str = Field(min_length=1)
+    recurring_object_positions: str = Field(min_length=1)
+    color_palette: str = Field(min_length=1)
+    basic_composition: str = Field(min_length=1)
     characters_visible: list[str] = Field(default_factory=list)
     important_objects: list[str] = Field(default_factory=list)
 
@@ -134,6 +138,10 @@ class VisualBeat(_VisualModel):
     geography_established_by: str | None = Field(
         default=None,
         description="Earlier wide/master visual that locates this closer view.",
+    )
+    master_scene_id: str | None = Field(
+        default=None,
+        description="Immutable master environment governing this beat's continuity.",
     )
     physical_state: str = Field(
         min_length=1,
@@ -211,6 +219,12 @@ class VisualPlan(_VisualModel):
         )
         master_scene_ids = _unique_ids(self.possible_master_scenes, "master scene")
         beat_ids = _unique_ids(self.visual_beats, "visual beat")
+        recurring_location_ids = {
+            environment.location_id for environment in self.recurring_environments
+        }
+        mastered_location_ids = {
+            master.location_id for master in self.possible_master_scenes
+        }
 
         for environment in self.recurring_environments:
             _require_known(environment.location_id, location_ids, "location")
@@ -237,6 +251,13 @@ class VisualPlan(_VisualModel):
             _require_known(beat.location_id, location_ids, "location")
             _require_all_known(beat.characters_visible, character_ids, "character")
             _require_all_known(beat.important_objects, object_ids, "important object")
+            if (
+                beat.location_id in recurring_location_ids & mastered_location_ids
+                and beat.master_scene_id is None
+            ):
+                raise ValueError(
+                    "beats in a mastered recurring environment require master_scene_id"
+                )
             if beat.source_visual_id is not None:
                 valid_sources = master_scene_ids | previous_beat_ids
                 _require_known(beat.source_visual_id, valid_sources, "source visual")
@@ -259,6 +280,19 @@ class VisualPlan(_VisualModel):
                     raise ValueError(
                         "geography visual must establish the same location"
                     )
+            if beat.master_scene_id is not None:
+                _require_known(beat.master_scene_id, master_scene_ids, "master scene")
+                master_location = visual_locations[beat.master_scene_id]
+                if master_location != beat.location_id:
+                    raise ValueError("master scene must belong to the beat location")
+                for reference_id in (
+                    beat.source_visual_id,
+                    beat.geography_established_by,
+                ):
+                    if reference_id in master_scene_ids and reference_id != beat.master_scene_id:
+                        raise ValueError(
+                            "beat cannot reference a different master scene"
+                        )
             if beat.progressive_change is not None:
                 valid_subjects = character_ids | object_ids | location_ids
                 _require_known(

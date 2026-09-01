@@ -49,6 +49,10 @@ def valid_plan_payload() -> dict[str, object]:
                 "id": "shaft_master",
                 "location_id": "shaft",
                 "description": "Wide cutaway showing the complete shaft",
+                "environment_geometry": "Vertical shaft with a side tunnel at bottom",
+                "recurring_object_positions": "Ladder runs along the right wall",
+                "color_palette": "Dark stone, amber lamps, muted workwear",
+                "basic_composition": "Surface at top and miners small at bottom",
                 "characters_visible": ["miners"],
                 "important_objects": ["ladder"],
             }
@@ -67,6 +71,7 @@ def valid_plan_payload() -> dict[str, object]:
                 "framing_reason": "Establish distance and the complete escape route.",
                 "camera_movement": "SUBTLE_ZOOM",
                 "geography_established_by": None,
+                "master_scene_id": "shaft_master",
                 "physical_state": "Ladder connects miners to the open surface route.",
                 "progressive_change": None,
                 "safety_geography": {
@@ -96,6 +101,7 @@ def valid_plan_payload() -> dict[str, object]:
                 "framing_reason": "Make the exact failed connection readable.",
                 "camera_movement": "HIGHLIGHT",
                 "geography_established_by": "beat_1",
+                "master_scene_id": "shaft_master",
                 "physical_state": "The ladder is broken and no longer spans the shaft.",
                 "progressive_change": {
                     "subject_id": "ladder",
@@ -193,6 +199,18 @@ def test_director_rejects_close_view_without_established_geography() -> None:
     assert isinstance(beats, list)
     assert isinstance(beats[1], dict)
     beats[1]["geography_established_by"] = None
+    client = FakePlanningClient(json.dumps(payload))
+
+    with pytest.raises(VisualDirectorError, match="invalid structured visual plan"):
+        asyncio.run(VisualDirector(client).create_plan("Complete narration"))
+
+
+def test_director_requires_master_id_in_recurring_environment() -> None:
+    payload = valid_plan_payload()
+    beats = payload["visual_beats"]
+    assert isinstance(beats, list)
+    assert isinstance(beats[0], dict)
+    beats[0]["master_scene_id"] = None
     client = FakePlanningClient(json.dumps(payload))
 
     with pytest.raises(VisualDirectorError, match="invalid structured visual plan"):

@@ -7,6 +7,7 @@ from typing import Any
 from uuid import uuid4
 
 from sqlalchemy import (
+    JSON,
     CheckConstraint,
     DateTime,
     Float,
@@ -15,6 +16,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    event,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 from sqlalchemy.types import TypeDecorator
@@ -122,6 +124,11 @@ class Project(Base):
         back_populates="project",
         cascade="all, delete-orphan",
         order_by="Scene.position",
+    )
+    master_scene_assets: Mapped[list[MasterSceneAsset]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="MasterSceneAsset.master_scene_id",
     )
 
     @validates("story_text")
@@ -258,3 +265,57 @@ class Scene(Base):
     )
 
     project: Mapped[Project] = relationship(back_populates="scenes")
+
+
+class MasterSceneAsset(Base):
+    """Immutable generated continuity anchor for one recurring environment."""
+
+    __tablename__ = "master_scene_assets"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "master_scene_id",
+            name="uq_master_scene_assets_project_master",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=_generate_uuid,
+    )
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    master_scene_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    file_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    style_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    generation_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    seed: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    reference_hashes: Mapped[list[str]] = mapped_column(
+        JSON,
+        nullable=False,
+        default=list,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        default=_utc_now,
+        nullable=False,
+    )
+
+    project: Mapped[Project] = relationship(back_populates="master_scene_assets")
+
+
+@event.listens_for(MasterSceneAsset, "before_update")
+def _prevent_master_scene_update(
+    mapper: object,
+    connection: object,
+    target: MasterSceneAsset,
+) -> None:
+    del mapper, connection, target
+    raise ValueError("Master scene assets are immutable")

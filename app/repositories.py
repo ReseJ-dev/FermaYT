@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.persistence import ApplicationSettings, Project, Scene
+from app.persistence import ApplicationSettings, MasterSceneAsset, Project, Scene
 
 PROJECT_UPDATE_FIELDS = frozenset(
     {
@@ -144,6 +144,69 @@ def delete_project(session: Session, project_id: str) -> bool:
     session.delete(project)
     session.commit()
     return True
+
+
+def create_master_scene_asset(
+    session: Session,
+    *,
+    project_id: str,
+    master_scene_id: str,
+    file_path: str,
+    file_sha256: str,
+    style_version: str,
+    generation_prompt: str,
+    provider: str,
+    model: str | None = None,
+    seed: int | None = None,
+    reference_hashes: list[str] | None = None,
+) -> MasterSceneAsset:
+    """Persist a master once; replacement must never happen implicitly."""
+    project = get_project(session, project_id)
+    if project is None:
+        raise ValueError(f"Project not found: {project_id}")
+    if get_master_scene_asset(session, project_id, master_scene_id) is not None:
+        raise ValueError(f"Master scene already exists: {master_scene_id}")
+
+    asset = MasterSceneAsset(
+        project=project,
+        master_scene_id=master_scene_id,
+        file_path=file_path,
+        file_sha256=file_sha256,
+        style_version=style_version,
+        generation_prompt=generation_prompt,
+        provider=provider,
+        model=model,
+        seed=seed,
+        reference_hashes=list(reference_hashes or ()),
+    )
+    session.add(asset)
+    session.commit()
+    session.refresh(asset)
+    return asset
+
+
+def get_master_scene_asset(
+    session: Session,
+    project_id: str,
+    master_scene_id: str,
+) -> MasterSceneAsset | None:
+    statement = select(MasterSceneAsset).where(
+        MasterSceneAsset.project_id == project_id,
+        MasterSceneAsset.master_scene_id == master_scene_id,
+    )
+    return session.scalar(statement)
+
+
+def list_master_scene_assets(
+    session: Session,
+    project_id: str,
+) -> list[MasterSceneAsset]:
+    statement = (
+        select(MasterSceneAsset)
+        .where(MasterSceneAsset.project_id == project_id)
+        .order_by(MasterSceneAsset.master_scene_id)
+    )
+    return list(session.scalars(statement))
 
 
 def create_scene(

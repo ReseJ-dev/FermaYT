@@ -15,3 +15,7 @@ class VideoRenderError(RuntimeError):
 
 class VisualDirectorError(RuntimeError):
     """Raised when a safe, validated visual plan cannot be produced."""
+
+
+class MasterSceneError(RuntimeError):
+    """Raised when an immutable master cannot be generated or verified."""
