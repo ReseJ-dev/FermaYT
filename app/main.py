@@ -117,6 +117,9 @@ async def create_project_route(request: Request) -> RedirectResponse:
                 session,
                 name=name,
                 story_text=story_text,
+                global_image_style_prompt=form.get(
+                    "global_image_style_prompt"
+                ),
                 scene_count=_optional_int(form.get("scene_count")),
                 image_provider=application_settings.image_provider,
                 image_model=(

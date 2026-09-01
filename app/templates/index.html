@@ -60,6 +60,7 @@
       </div>
       <label>Название проекта<input name="name" maxlength="255" required placeholder="Например, Волшебная книга"></label>
       <label>История<textarea name="story_text" rows="7" required placeholder="Опишите сюжет будущего видео..."></textarea></label>
+      <label>Постоянный промпт для всех изображений<textarea name="global_image_style_prompt" rows="4" placeholder="Например: единый мультяшный стиль, layered cardboard, warm colors, вертикальная композиция 9:16"></textarea><small>Он будет автоматически отправляться в Image API вместе с описанием каждой сцены.</small></label>
       <label>Примерное количество сцен<input name="scene_count" type="number" min="1" max="50" placeholder="Можно указать позже"></label>
       <div class="modal-actions">
         <button class="button button-secondary" type="button" data-close-dialog>Отмена</button>

@@ -25,7 +25,7 @@
           <label>Количество сцен<input name="scene_count" type="number" min="1" max="50" value="{{ project.scene_count or '' }}" placeholder="До 50"></label>
         </div>
         <label>История<textarea name="story_text" rows="7" required>{{ project.story_text }}</textarea></label>
-        <label>Общий визуальный стиль<textarea name="global_image_style_prompt" rows="3" placeholder="Например: layered cardboard, warm colors, soft cinematic light">{{ project.global_image_style_prompt or '' }}</textarea><small>Стиль добавляется к промпту при генерации и не изменяет промпты сцен.</small></label>
+        <label>Постоянный промпт для всех изображений<textarea name="global_image_style_prompt" rows="4" placeholder="Например: layered cardboard, warm colors, soft cinematic light">{{ project.global_image_style_prompt or '' }}</textarea><small>При каждой генерации API получает: промпт конкретной сцены + этот постоянный промпт. Промпты сцен при этом не переписываются.</small></label>
 
         <section class="project-provider-settings" aria-labelledby="project-providers-title">
           <div class="section-heading provider-section-heading"><div><p class="eyebrow">AI providers</p><h2 id="project-providers-title">Нейросети проекта</h2><p class="provider-section-note">Нажмите на название оператора, выберите нейросеть и сохраните проект.</p></div></div>
@@ -98,6 +98,7 @@
                       <div class="scene-fields">
                         <label>Текст озвучки<textarea name="text" rows="5" required>{{ scene.text }}</textarea></label>
                         <label>Промпт изображения<textarea name="image_prompt" rows="5" required>{{ scene.image_prompt }}</textarea></label>
+                        {% if project.global_image_style_prompt %}<div class="prompt-composition"><strong>Каждый запрос к Image API:</strong><span>Промпт этой сцены</span><b>+</b><span>{{ project.global_image_style_prompt }}</span></div>{% endif %}
                         <button class="button button-secondary" type="submit">Сохранить сцену</button>
                       </div>
                       <div class="asset-stack">

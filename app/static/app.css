@@ -119,6 +119,10 @@ label small, .helper-text { color: #8a94a7; font-size: .7rem; font-weight: 500; 
 .compact-actions { display: flex; align-items: center; gap: .35rem; }
 .scene-editor-grid { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(15rem, .75fr); gap: 1rem; }
 .scene-fields .button { justify-self: start; }
+.prompt-composition { display: flex; flex-wrap: wrap; align-items: center; gap: .4rem; margin: -.25rem 0 1rem; padding: .7rem; border: 1px solid #dedfff; border-radius: .65rem; color: #545f76; background: #f5f5ff; font-size: .68rem; line-height: 1.4; }
+.prompt-composition strong { width: 100%; color: #3c3da3; }
+.prompt-composition span { padding: .22rem .4rem; border-radius: .35rem; background: white; }
+.prompt-composition b { color: var(--primary); }
 .asset-stack { display: grid; grid-template-columns: 1fr 1fr; gap: .75rem; align-content: start; }
 .asset-card { min-width: 0; overflow: hidden; padding: .7rem; border: 1px solid #e2e6ee; border-radius: .8rem; background: #f8f9fc; }
 .asset-label { display: flex; min-height: 1.2rem; justify-content: space-between; margin-bottom: .55rem; color: #4c5870; font-size: .68rem; font-weight: 800; text-transform: uppercase; }

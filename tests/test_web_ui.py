@@ -91,6 +91,31 @@ def test_dashboard_creates_and_opens_project(web_app: tuple) -> None:
         assert project.scene_count == 3
 
 
+def test_dashboard_saves_permanent_image_prompt(web_app: tuple) -> None:
+    client, session_factory, _ = web_app
+
+    response = client.post(
+        "/projects",
+        data={
+            "name": "Styled story",
+            "story_text": "Story text",
+            "global_image_style_prompt": "  paper art, warm colors  ",
+        },
+        follow_redirects=False,
+    )
+    project_id = response.headers["location"].rsplit("/", 1)[-1]
+
+    assert response.status_code == 303
+    with session_factory() as session:
+        project = get_project(session, project_id)
+        assert project is not None
+        assert project.global_image_style_prompt == "paper art, warm colors"
+
+    editor = client.get(f"/projects/{project_id}")
+    assert "Постоянный промпт для всех изображений" in editor.text
+    assert "paper art, warm colors" in editor.text
+
+
 def test_project_settings_can_be_updated(web_app: tuple) -> None:
     client, session_factory, _ = web_app
     project_id = _create_project(client)
