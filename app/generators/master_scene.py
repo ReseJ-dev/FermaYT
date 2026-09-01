@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
@@ -13,6 +13,7 @@ from sqlalchemy.orm import Session
 
 from app.errors import MasterSceneError
 from app.generators.image import generate_image, validate_image_prompt
+from app.generators.image_prompt import ImagePromptBuilder
 from app.generators.style_reference import (
     build_reference_role_instruction,
     to_style_image_reference,
@@ -21,6 +22,13 @@ from app.generators.style_reference import (
 from app.models.visual_plan import MasterScene, VisualBeat, VisualOperation, VisualPlan
 from app.persistence import MasterSceneAsset, Project, StyleReferenceAsset
 from app.pipeline.visual_operation_engine import VisualProviderCapabilities
+from app.pipeline.visual_qa import (
+    VisualQAContext,
+    VisualQAOutcome,
+    VisualQAService,
+    apply_visual_qa_correction,
+    generate_with_visual_qa,
+)
 from app.providers import (
     ImageEditingProvider,
     ImageReference,
@@ -29,7 +37,11 @@ from app.providers import (
 )
 from app.repositories import create_master_scene_asset, get_master_scene_asset
 from app.storage import ProjectMediaPaths
-from app.style_contracts import DEFAULT_IMAGE_STYLE_ID, apply_image_style_contract
+from app.style_contracts import (
+    DEFAULT_IMAGE_STYLE_ID,
+    apply_image_style_contract,
+    get_image_style_contract,
+)
 from app.utils.download import download_file
 
 
@@ -67,6 +79,8 @@ async def generate_required_master_scenes(
     style_id: str = DEFAULT_IMAGE_STYLE_ID,
     style_reference: StyleReferenceAsset | None = None,
     capabilities: VisualProviderCapabilities | None = None,
+    qa_service: VisualQAService | None = None,
+    max_qa_retries: int = 2,
 ) -> list[MasterSceneAsset]:
     """Generate referenced masters in plan order before dependent visual beats."""
     required_ids = _required_master_scene_ids(plan)
@@ -101,7 +115,11 @@ async def generate_required_master_scenes(
                 raise MasterSceneError(
                     "Master scene style changed; create an explicit new master version"
                 )
-            if existing.generation_prompt != prompt:
+            if not _master_prompt_matches(
+                existing.generation_prompt,
+                prompt,
+                style_id,
+            ):
                 raise MasterSceneError(
                     "Master scene inputs changed; create an explicit new master version"
                 )
@@ -115,24 +133,47 @@ async def generate_required_master_scenes(
                 f"Untracked master scene file already exists: {master_scene_id}"
             )
         try:
-            if style_references:
-                generated_path = await generate_continuity_image(
-                    ContinuityGenerationRequest(
-                        operation=VisualOperation.REFERENCE_GENERATION,
-                        prompt=prompt,
-                        style_version=style_id,
-                        references=style_references,
+            prompts_by_candidate: dict[str, str] = {}
+            generate_master_candidate = _build_master_candidate_generator(
+                prompt,
+                style_id,
+                style_references,
+                client,
+                prompts_by_candidate,
+            )
+
+            if qa_service is not None:
+                qa_context = VisualQAContext(
+                    visual_purpose=f"Establish master environment {definition.id}",
+                    what_viewer_should_understand=definition.environment_geometry,
+                    required_objects=tuple(definition.important_objects),
+                    important_physical_action="Establish the stable initial environment",
+                    location_id=definition.location_id,
+                    expected_physical_state=definition.recurring_object_positions,
+                    style_id=style_id,
+                    style_reference_path=(
+                        style_reference.file_path
+                        if style_reference is not None
+                        else None
                     ),
+                )
+                qa_outcome = await generate_with_visual_qa(
+                    generate_master_candidate,
                     output_path,
-                    client,
+                    qa_context,
+                    qa_service,
+                    max_retries=max_qa_retries,
+                )
+                generated_path = qa_outcome.image_path
+                selected_candidate = qa_outcome.selected_candidate_path
+                generation_prompt = (
+                    prompts_by_candidate.get(selected_candidate, prompt)
+                    if selected_candidate is not None
+                    else prompt
                 )
             else:
-                generated_path = await generate_image(
-                    prompt,
-                    output_path,
-                    client,  # type: ignore[arg-type]
-                    style_id=style_id,
-                )
+                generated_path = await generate_master_candidate(None, output_path)
+                generation_prompt = prompt
             file_sha256 = await asyncio.to_thread(_sha256_file, generated_path)
             asset = create_master_scene_asset(
                 session,
@@ -141,7 +182,7 @@ async def generate_required_master_scenes(
                 file_path=generated_path,
                 file_sha256=file_sha256,
                 style_version=style_version,
-                generation_prompt=prompt,
+                generation_prompt=generation_prompt,
                 provider=project.image_provider,
                 model=project.image_model,
                 seed=None,
@@ -186,7 +227,7 @@ def build_continuity_generation_request(
     plan: VisualPlan,
     beat: VisualBeat,
     operation: VisualOperation,
-    beat_prompt: str,
+    beat_prompt: str | None,
     master_assets: Mapping[str, MasterSceneAsset],
     capabilities: VisualProviderCapabilities,
     *,
@@ -194,7 +235,9 @@ def build_continuity_generation_request(
     style_reference: StyleReferenceAsset | None = None,
 ) -> ContinuityGenerationRequest:
     """Use a master image when supported, otherwise inject its stable description."""
-    normalized_prompt = validate_image_prompt(beat_prompt)
+    normalized_prompt = (
+        validate_image_prompt(beat_prompt) if beat_prompt is not None else None
+    )
     can_use_references = (
         operation is VisualOperation.EDIT_EXISTING and capabilities.image_editing
     ) or capabilities.reference_generation
@@ -204,10 +247,23 @@ def build_continuity_generation_request(
         can_use_references,
     )
     if beat.master_scene_id is None:
-        prompt = _prompt_with_reference_roles(normalized_prompt, style_references)
+        prompt = (
+            ImagePromptBuilder().build(
+                plan,
+                beat,
+                operation,
+                references=style_references,
+                style_id=style_id,
+            )
+            if normalized_prompt is None
+            else apply_image_style_contract(
+                _prompt_with_reference_roles(normalized_prompt, style_references),
+                style_id,
+            )
+        )
         return ContinuityGenerationRequest(
             operation=operation,
-            prompt=apply_image_style_contract(prompt, style_id),
+            prompt=prompt,
             style_version=style_id,
             references=style_references,
         )
@@ -235,13 +291,23 @@ def build_continuity_generation_request(
             role=ImageReferenceRole.CONTENT_CONTINUITY,
         )
         references = (*style_references, continuity_reference)
-        prompt = _prompt_with_reference_roles(normalized_prompt, references)
+        prompt = (
+            ImagePromptBuilder().build(
+                plan,
+                beat,
+                operation,
+                references=references,
+                style_id=asset.style_version,
+            )
+            if normalized_prompt is None
+            else apply_image_style_contract(
+                _prompt_with_reference_roles(normalized_prompt, references),
+                asset.style_version,
+            )
+        )
         return ContinuityGenerationRequest(
             operation=operation,
-            prompt=apply_image_style_contract(
-                prompt,
-                asset.style_version,
-            ),
+            prompt=prompt,
             master_scene_id=master.id,
             master_image_path=asset.file_path,
             style_version=asset.style_version,
@@ -249,15 +315,48 @@ def build_continuity_generation_request(
         )
 
     continuity_description = _structured_master_description(master, asset.style_version)
-    return ContinuityGenerationRequest(
-        operation=operation,
-        prompt=apply_image_style_contract(
+    prompt = (
+        ImagePromptBuilder().build(
+            plan,
+            beat,
+            operation,
+            style_id=asset.style_version,
+        )
+        if normalized_prompt is None
+        else apply_image_style_contract(
             f"{normalized_prompt}\n\n{continuity_description}",
             asset.style_version,
-        ),
+        )
+    )
+    return ContinuityGenerationRequest(
+        operation=operation,
+        prompt=prompt,
         master_scene_id=master.id,
         master_image_path=asset.file_path,
         style_version=asset.style_version,
+    )
+
+
+def build_structured_continuity_generation_request(
+    plan: VisualPlan,
+    beat: VisualBeat,
+    operation: VisualOperation,
+    master_assets: Mapping[str, MasterSceneAsset],
+    capabilities: VisualProviderCapabilities,
+    *,
+    style_id: str = DEFAULT_IMAGE_STYLE_ID,
+    style_reference: StyleReferenceAsset | None = None,
+) -> ContinuityGenerationRequest:
+    """Create a provider request exclusively from semantic visual data."""
+    return build_continuity_generation_request(
+        plan,
+        beat,
+        operation,
+        None,
+        master_assets,
+        capabilities,
+        style_id=style_id,
+        style_reference=style_reference,
     )
 
 
@@ -290,6 +389,48 @@ async def generate_continuity_image(
     else:
         image_url = await client.generate(contracted_prompt)
     return await download_file(image_url, output_path)
+
+
+async def generate_continuity_image_with_qa(
+    request: ContinuityGenerationRequest,
+    output_path: str,
+    client: MasterSceneImageClient,
+    qa_context: VisualQAContext,
+    qa_service: VisualQAService | None,
+    *,
+    max_retries: int = 2,
+) -> VisualQAOutcome:
+    """Generate or edit a descendant and QA every resulting candidate."""
+
+    async def generate_candidate(
+        correction_instruction: str | None,
+        candidate_path: str,
+    ) -> str:
+        corrected_request = ContinuityGenerationRequest(
+            operation=request.operation,
+            prompt=apply_visual_qa_correction(
+                request.prompt,
+                correction_instruction,
+                request.style_version or DEFAULT_IMAGE_STYLE_ID,
+            ),
+            master_scene_id=request.master_scene_id,
+            master_image_path=request.master_image_path,
+            style_version=request.style_version,
+            references=request.references,
+        )
+        return await generate_continuity_image(
+            corrected_request,
+            candidate_path,
+            client,
+        )
+
+    return await generate_with_visual_qa(
+        generate_candidate,
+        output_path,
+        qa_context,
+        qa_service,
+        max_retries=max_retries,
+    )
 
 
 async def verify_master_scene_asset(asset: MasterSceneAsset) -> None:
@@ -358,6 +499,44 @@ def _prompt_with_reference_roles(
     return f"{prompt}\n\n{build_reference_role_instruction(references)}"
 
 
+def _build_master_candidate_generator(
+    base_prompt: str,
+    style_id: str,
+    style_references: tuple[ImageReference, ...],
+    client: MasterSceneImageClient,
+    prompts_by_candidate: dict[str, str],
+) -> Callable[[str | None, str], Awaitable[str]]:
+    async def generate_candidate(
+        correction_instruction: str | None,
+        candidate_path: str,
+    ) -> str:
+        candidate_prompt = apply_visual_qa_correction(
+            base_prompt,
+            correction_instruction,
+            style_id,
+        )
+        prompts_by_candidate[candidate_path] = candidate_prompt
+        if style_references:
+            return await generate_continuity_image(
+                ContinuityGenerationRequest(
+                    operation=VisualOperation.REFERENCE_GENERATION,
+                    prompt=candidate_prompt,
+                    style_version=style_id,
+                    references=style_references,
+                ),
+                candidate_path,
+                client,
+            )
+        return await generate_image(
+            candidate_prompt,
+            candidate_path,
+            client,  # type: ignore[arg-type]
+            style_id=style_id,
+        )
+
+    return generate_candidate
+
+
 def _verify_master_scene_asset_sync(asset: MasterSceneAsset) -> None:
     path = Path(asset.file_path)
     if not path.is_file():
@@ -374,3 +553,20 @@ def _sha256_file(path: str | Path) -> str:
         for chunk in iter(lambda: file_handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _master_prompt_matches(
+    stored_prompt: str,
+    base_prompt: str,
+    style_id: str,
+) -> bool:
+    if stored_prompt == base_prompt:
+        return True
+    contract = get_image_style_contract(style_id).render()
+    if not stored_prompt.endswith(contract) or not base_prompt.endswith(contract):
+        return False
+    stored_content = stored_prompt[: -len(contract)].rstrip()
+    base_content = base_prompt[: -len(contract)].rstrip()
+    return stored_content.startswith(
+        f"{base_content}\n\nVISUAL QA CORRECTION FOR REGENERATION:"
+    )

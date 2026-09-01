@@ -153,6 +153,14 @@ class VisualBeat(_VisualModel):
         default=None,
         description="Physical consequence visually prepared before narration confirms it.",
     )
+    visual_focus: str | None = Field(
+        default=None,
+        description="Single element or action that must attract attention first.",
+    )
+    must_not_show: list[str] = Field(
+        default_factory=list,
+        description="Story mistakes or distracting elements explicitly excluded.",
+    )
     change_from_previous_beat: str = Field(min_length=1)
     information_added_beyond_narration: str = Field(
         min_length=1,

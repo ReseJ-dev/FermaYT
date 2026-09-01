@@ -17,10 +17,15 @@ from app.models.visual_plan import (
     VisualOperation,
     VisualPlan,
 )
+from app.models.visual_qa import (
+    VisualQADecision,
+    VisualQAProblemCategory,
+    VisualQAResult,
+)
 
 __all__ = [
-    "CharacterDefinition",
     "CameraMovement",
+    "CharacterDefinition",
     "ImportantObjectDefinition",
     "LocationDefinition",
     "MasterScene",
@@ -35,4 +40,7 @@ __all__ = [
     "VisualBeat",
     "VisualOperation",
     "VisualPlan",
+    "VisualQADecision",
+    "VisualQAProblemCategory",
+    "VisualQAResult",
 ]

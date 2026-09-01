@@ -27,3 +27,11 @@ class StyleContractError(ValueError):
 
 class StyleReferenceError(RuntimeError):
     """Raised when an approved style reference cannot be registered or verified."""
+
+
+class VisualQAError(RuntimeError):
+    """Raised when a vision model cannot return a safe structured QA decision."""
+
+
+class ImagePromptBuildError(ValueError):
+    """Raised when semantic visual data cannot form a safe concise image prompt."""

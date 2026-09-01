@@ -94,6 +94,9 @@ and source visual must use an ID declared in this plan. A source beat must occur
 earlier. Keep all descriptions semantic: this plan decides what viewers understand,
 not the wording of future image prompts.
 
+For each beat, use visual_focus for the one action/object viewers should notice first,
+and must_not_show for story mistakes or distracting elements that must be excluded.
+
 Return exactly one JSON object matching the supplied JSON Schema. Return no markdown,
 code fences, commentary, or image prompts.
 

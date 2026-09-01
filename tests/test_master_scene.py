@@ -9,16 +9,21 @@ from sqlalchemy.orm import Session
 
 import app.generators.master_scene as master_scene_module
 from app.database import create_session_factory, create_sqlite_engine, init_database
-from app.errors import MasterSceneError
+from app.errors import ImagePromptBuildError, MasterSceneError
+from app.generators.image_prompt import ImagePromptBuilder
 from app.generators.master_scene import (
     build_continuity_generation_request,
+    build_structured_continuity_generation_request,
     build_style_version,
     generate_continuity_image,
+    generate_continuity_image_with_qa,
     generate_required_master_scenes,
 )
 from app.generators.style_reference import register_approved_style_reference
 from app.models.visual_plan import VisualOperation, VisualPlan
+from app.models.visual_qa import VisualQADecision
 from app.pipeline.visual_operation_engine import VisualProviderCapabilities
+from app.pipeline.visual_qa import VisualQAContext
 from app.providers import ImageReference, ImageReferenceRole
 from app.repositories import (
     create_master_scene_asset,
@@ -533,3 +538,237 @@ def test_master_generation_attaches_approved_style_reference(
     assert client.prompt is not None
     assert "REFERENCE 1 [STYLE]" in client.prompt
     assert asset.reference_hashes == [style_asset.file_sha256]
+
+
+def test_continuity_generation_feeds_qa_correction_into_retry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class Client:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        async def generate(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            return f"https://example.com/candidate-{len(self.prompts)}.png"
+
+    async def fake_download(url: str, output_path: str) -> str:
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        Path(output_path).write_bytes(url.encode())
+        return output_path
+
+    class QA:
+        calls = 0
+
+        async def evaluate(
+            self,
+            image_path: str,
+            context: VisualQAContext,
+        ) -> VisualQADecision:
+            del image_path, context
+            self.calls += 1
+            if self.calls == 1:
+                return VisualQADecision(
+                    result="REGENERATE",
+                    problem_categories=["COMPOSITION"],
+                    reasons=["The broken ladder is too small"],
+                    correction_instruction="Crop closer to the broken ladder",
+                )
+            return VisualQADecision(
+                result="PASS",
+                problem_categories=[],
+                reasons=[],
+                correction_instruction=None,
+            )
+
+    monkeypatch.setattr(master_scene_module, "download_file", fake_download)
+    client = Client()
+    request = master_scene_module.ContinuityGenerationRequest(
+        operation=VisualOperation.NEW_IMAGE,
+        prompt="A blocked mine shaft",
+        style_version="rough_explainer_v1",
+    )
+    context = VisualQAContext(
+        visual_purpose="Show the blocked route",
+        what_viewer_should_understand="The ladder is unusable",
+        required_objects=("ladder",),
+        important_physical_action="The ladder broke",
+        location_id="shaft",
+        expected_physical_state="Broken ladder",
+    )
+
+    outcome = asyncio.run(
+        generate_continuity_image_with_qa(
+            request,
+            str(tmp_path / "final.png"),
+            client,
+            context,
+            QA(),  # type: ignore[arg-type]
+            max_retries=2,
+        )
+    )
+
+    assert outcome.attempts == 2
+    assert len(client.prompts) == 2
+    assert "VISUAL QA CORRECTION FOR REGENERATION" in client.prompts[1]
+    assert "Crop closer to the broken ladder" in client.prompts[1]
+
+
+def test_master_generation_is_qa_checked_and_keeps_correction_provenance(
+    session: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(session)
+    generation_calls = _install_fake_generation(monkeypatch)
+
+    class QA:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def evaluate(
+            self,
+            image_path: str,
+            context: VisualQAContext,
+        ) -> VisualQADecision:
+            del image_path, context
+            self.calls += 1
+            if self.calls == 1:
+                return VisualQADecision(
+                    result="REGENERATE",
+                    problem_categories=["STYLE_DRIFT"],
+                    reasons=["Mine walls contain realistic texture"],
+                    correction_instruction="Remove rock texture and simplify the walls",
+                )
+            return VisualQADecision(
+                result="PASS",
+                problem_categories=[],
+                reasons=[],
+                correction_instruction=None,
+            )
+
+    qa = QA()
+    asset = asyncio.run(
+        generate_required_master_scenes(
+            session,
+            project,
+            _plan(),
+            client=object(),  # type: ignore[arg-type]
+            projects_root=tmp_path / "projects",
+            qa_service=qa,  # type: ignore[arg-type]
+            max_qa_retries=1,
+        )
+    )[0]
+
+    assert qa.calls == 2
+    assert len(generation_calls) == 2
+    assert "VISUAL QA CORRECTION FOR REGENERATION" in asset.generation_prompt
+    assert "Remove rock texture and simplify the walls" in asset.generation_prompt
+
+    unused_qa = QA()
+    reused = asyncio.run(
+        generate_required_master_scenes(
+            session,
+            project,
+            _plan(),
+            client=object(),  # type: ignore[arg-type]
+            projects_root=tmp_path / "projects",
+            qa_service=unused_qa,  # type: ignore[arg-type]
+            max_qa_retries=1,
+        )
+    )[0]
+
+    assert reused.id == asset.id
+    assert unused_qa.calls == 0
+    assert len(generation_calls) == 2
+
+
+def test_image_prompt_builder_uses_semantics_and_never_narration() -> None:
+    plan = _plan()
+    beat = plan.visual_beats[0].model_copy(
+        update={
+            "narration_segment": "UNIQUE NARRATION MUST NEVER REACH IMAGE API",
+            "visual_focus": "The blocked vertical escape route",
+            "must_not_show": ["injured people", "a different mine layout"],
+        }
+    )
+
+    prompt = ImagePromptBuilder().build(
+        plan,
+        beat,
+        VisualOperation.EDIT_EXISTING,
+    )
+
+    assert "UNIQUE NARRATION MUST NEVER REACH IMAGE API" not in prompt
+    assert "Same shaft_master environment" in prompt
+    assert "Vertical shaft, surface above, side tunnel below" in prompt
+    assert "Ladder: Main escape ladder" in prompt
+    assert "VISUAL FOCUS:" in prompt
+    assert "First notice: The blocked vertical escape route" in prompt
+    assert "DO NOT SHOW:\ninjured people; a different mine layout" in prompt
+    assert prompt.rstrip().endswith(
+        "This contract overrides any conflicting style instruction elsewhere in the request."
+    )
+
+
+def test_image_prompt_sections_have_concise_semantic_order() -> None:
+    prompt = ImagePromptBuilder().build(
+        _plan(),
+        _plan().visual_beats[0],
+        VisualOperation.NEW_IMAGE,
+    )
+    headings = [
+        "REFERENCE INSTRUCTIONS:",
+        "LOCATION CONTINUITY:",
+        "CHARACTER CONTINUITY:",
+        "OBJECT CONTINUITY:",
+        "CURRENT CAMERA / COMPOSITION:",
+        "CURRENT PHYSICAL STATE:",
+        "WHAT CHANGED:",
+        "SIMPLIFICATION RULE:",
+        "STYLE CONTRACT [rough_explainer_v1]",
+    ]
+
+    positions = [prompt.index(heading) for heading in headings]
+    assert positions == sorted(positions)
+
+
+def test_prompt_builder_rejects_semantic_instruction_overload() -> None:
+    with pytest.raises(ImagePromptBuildError, match="too long"):
+        ImagePromptBuilder(max_semantic_characters=50).build(
+            _plan(),
+            _plan().visual_beats[0],
+            VisualOperation.NEW_IMAGE,
+        )
+
+
+def test_structured_continuity_request_does_not_need_manual_beat_prompt(
+    session: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(session)
+    _install_fake_generation(monkeypatch)
+    plan = _plan()
+    master_asset = asyncio.run(
+        generate_required_master_scenes(
+            session,
+            project,
+            plan,
+            client=object(),  # type: ignore[arg-type]
+            projects_root=tmp_path / "projects",
+        )
+    )[0]
+
+    request = build_structured_continuity_generation_request(
+        plan,
+        plan.visual_beats[0],
+        VisualOperation.NEW_IMAGE,
+        {master_asset.master_scene_id: master_asset},
+        VisualProviderCapabilities(),
+    )
+
+    assert plan.visual_beats[0].narration_segment not in request.prompt
+    assert "LOCATION CONTINUITY:" in request.prompt
+    assert "CURRENT PHYSICAL STATE:" in request.prompt
+    assert request.prompt.count("STYLE CONTRACT [rough_explainer_v1]") == 1
