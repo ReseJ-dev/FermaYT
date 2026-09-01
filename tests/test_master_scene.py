@@ -139,8 +139,11 @@ def _install_fake_generation(
         prompt: str,
         output_path: str,
         client: object,
+        *,
+        style_id: str,
     ) -> str:
         del client
+        assert style_id == "rough_explainer_v1"
         calls.append((prompt, output_path))
         path = Path(output_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -174,15 +177,14 @@ def test_generates_only_referenced_masters_and_persists_metadata(
     assert asset.master_scene_id == "shaft_master"
     assert Path(asset.file_path).is_file()
     assert len(asset.file_sha256) == 64
-    assert asset.style_version == build_style_version(
-        project.global_image_style_prompt
-    )
+    assert asset.style_version == build_style_version()
     assert asset.provider == "qwen"
     assert asset.model == "qwen-image-3.0"
     assert asset.seed is None
     assert asset.reference_hashes == []
     assert "Stable geometry:" in asset.generation_prompt
     assert "Overall color palette:" in asset.generation_prompt
+    assert "STYLE CONTRACT [rough_explainer_v1]" in asset.generation_prompt
     assert len(calls) == 1
     assert [item.master_scene_id for item in list_master_scene_assets(session, project.id)] == [
         "shaft_master"
@@ -371,7 +373,8 @@ def test_reference_provider_receives_verified_master_image(
     assert request.reference_image_paths == (asset.file_path,)
     assert request.reference_hashes == (asset.file_sha256,)
     assert request.master_scene_id == "shaft_master"
-    assert "IMMUTABLE MASTER" not in request.prompt
+    assert "IMMUTABLE MASTER SCENE CONTINUITY" not in request.prompt
+    assert "STYLE CONTRACT [rough_explainer_v1]" in request.prompt
 
 
 def test_continuity_executor_passes_references_to_capable_client(
@@ -409,7 +412,7 @@ def test_continuity_executor_passes_references_to_capable_client(
     result = asyncio.run(generate_continuity_image(request, "frame.png", client))
 
     assert result == "frame.png"
-    assert client.received == (
-        "Same environment, new composition",
-        ("master.png",),
-    )
+    assert client.received is not None
+    assert client.received[0].startswith("Same environment, new composition")
+    assert "STYLE CONTRACT [rough_explainer_v1]" in client.received[0]
+    assert client.received[1] == ("master.png",)

@@ -18,6 +18,7 @@ from app.persistence import MasterSceneAsset, Project
 from app.pipeline.visual_operation_engine import VisualProviderCapabilities
 from app.repositories import create_master_scene_asset, get_master_scene_asset
 from app.storage import ProjectMediaPaths
+from app.style_contracts import DEFAULT_IMAGE_STYLE_ID, apply_image_style_contract
 from app.utils.download import download_file
 
 
@@ -59,37 +60,50 @@ async def generate_required_master_scenes(
     client: MasterSceneImageClient,
     *,
     projects_root: str | Path = "data/projects",
+    style_id: str = DEFAULT_IMAGE_STYLE_ID,
 ) -> list[MasterSceneAsset]:
     """Generate referenced masters in plan order before dependent visual beats."""
     required_ids = _required_master_scene_ids(plan)
     definitions = {master.id: master for master in plan.possible_master_scenes}
-    style_version = build_style_version(project.global_image_style_prompt)
+    style_version = build_style_version(style_id)
     paths = ProjectMediaPaths(project.id, projects_root)
     assets: list[MasterSceneAsset] = []
 
     for master_scene_id in required_ids:
         definition = definitions[master_scene_id]
+        prompt = apply_image_style_contract(
+            build_master_scene_generation_prompt(
+                definition,
+                project.global_image_style_prompt,
+            ),
+            style_id,
+        )
         existing = get_master_scene_asset(session, project.id, master_scene_id)
         if existing is not None:
             if existing.style_version != style_version:
                 raise MasterSceneError(
                     "Master scene style changed; create an explicit new master version"
                 )
+            if existing.generation_prompt != prompt:
+                raise MasterSceneError(
+                    "Master scene inputs changed; create an explicit new master version"
+                )
             await verify_master_scene_asset(existing)
             assets.append(existing)
             continue
 
-        prompt = build_master_scene_generation_prompt(
-            definition,
-            project.global_image_style_prompt,
-        )
         output_path = str(paths.master_scene_path(master_scene_id, style_version))
         if Path(output_path).exists():
             raise MasterSceneError(
                 f"Untracked master scene file already exists: {master_scene_id}"
             )
         try:
-            generated_path = await generate_image(prompt, output_path, client)  # type: ignore[arg-type]
+            generated_path = await generate_image(
+                prompt,
+                output_path,
+                client,  # type: ignore[arg-type]
+                style_id=style_id,
+            )
             file_sha256 = await asyncio.to_thread(_sha256_file, generated_path)
             asset = create_master_scene_asset(
                 session,
@@ -144,11 +158,17 @@ def build_continuity_generation_request(
     beat_prompt: str,
     master_assets: Mapping[str, MasterSceneAsset],
     capabilities: VisualProviderCapabilities,
+    *,
+    style_id: str = DEFAULT_IMAGE_STYLE_ID,
 ) -> ContinuityGenerationRequest:
     """Use a master image when supported, otherwise inject its stable description."""
     normalized_prompt = validate_image_prompt(beat_prompt)
     if beat.master_scene_id is None:
-        return ContinuityGenerationRequest(operation=operation, prompt=normalized_prompt)
+        return ContinuityGenerationRequest(
+            operation=operation,
+            prompt=apply_image_style_contract(normalized_prompt, style_id),
+            style_version=style_id,
+        )
 
     master = next(
         (
@@ -171,7 +191,10 @@ def build_continuity_generation_request(
     if can_use_image:
         return ContinuityGenerationRequest(
             operation=operation,
-            prompt=normalized_prompt,
+            prompt=apply_image_style_contract(
+                normalized_prompt,
+                asset.style_version,
+            ),
             master_scene_id=master.id,
             master_image_path=asset.file_path,
             style_version=asset.style_version,
@@ -182,7 +205,10 @@ def build_continuity_generation_request(
     continuity_description = _structured_master_description(master, asset.style_version)
     return ContinuityGenerationRequest(
         operation=operation,
-        prompt=f"{normalized_prompt}\n\n{continuity_description}",
+        prompt=apply_image_style_contract(
+            f"{normalized_prompt}\n\n{continuity_description}",
+            asset.style_version,
+        ),
         master_scene_id=master.id,
         master_image_path=asset.file_path,
         style_version=asset.style_version,
@@ -196,21 +222,28 @@ async def generate_continuity_image(
     client: MasterSceneImageClient,
 ) -> str:
     """Execute a prepared request without silently ignoring reference images."""
+    contracted_prompt = apply_image_style_contract(
+        request.prompt,
+        request.style_version or DEFAULT_IMAGE_STYLE_ID,
+    )
     if request.operation is VisualOperation.EDIT_EXISTING:
         if not request.reference_image_paths or not isinstance(client, ImageEditingClient):
             raise MasterSceneError("Selected image provider cannot execute master edit")
-        image_url = await client.edit(request.prompt, request.reference_image_paths[0])
+        image_url = await client.edit(
+            contracted_prompt,
+            request.reference_image_paths[0],
+        )
     elif request.reference_image_paths:
         if not isinstance(client, ReferenceImageClient):
             raise MasterSceneError(
                 "Selected image provider cannot execute reference generation"
             )
         image_url = await client.generate_with_references(
-            request.prompt,
+            contracted_prompt,
             request.reference_image_paths,
         )
     else:
-        image_url = await client.generate(request.prompt)
+        image_url = await client.generate(contracted_prompt)
     return await download_file(image_url, output_path)
 
 
@@ -218,9 +251,9 @@ async def verify_master_scene_asset(asset: MasterSceneAsset) -> None:
     await asyncio.to_thread(_verify_master_scene_asset_sync, asset)
 
 
-def build_style_version(global_style_prompt: str | None) -> str:
-    normalized_style = (global_style_prompt or "").strip().encode()
-    return hashlib.sha256(normalized_style).hexdigest()[:12]
+def build_style_version(style_id: str = DEFAULT_IMAGE_STYLE_ID) -> str:
+    """Return the permanent contract ID stored with generated master assets."""
+    return style_id.strip()
 
 
 def _required_master_scene_ids(plan: VisualPlan) -> list[str]:

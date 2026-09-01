@@ -19,3 +19,7 @@ class VisualDirectorError(RuntimeError):
 
 class MasterSceneError(RuntimeError):
     """Raised when an immutable master cannot be generated or verified."""
+
+
+class StyleContractError(ValueError):
+    """Raised when an image prompt attempts to override its style contract."""

@@ -93,7 +93,9 @@ def test_generate_image_runs_complete_workflow(
         )
     )
 
-    assert client.received_prompt == "cinematic mountain"
+    assert client.received_prompt is not None
+    assert client.received_prompt.startswith("cinematic mountain\n\n")
+    assert "STYLE CONTRACT [rough_explainer_v1]" in client.received_prompt
     assert download_call == (
         "https://example.com/generated.png",
         "output/image.png",
@@ -114,5 +116,7 @@ def test_generate_image_creates_default_client(
 
     result = asyncio.run(generate_image("A forest", "output/default.png"))
 
-    assert client.received_prompt == "A forest"
+    assert client.received_prompt is not None
+    assert client.received_prompt.startswith("A forest\n\n")
+    assert "STYLE CONTRACT [rough_explainer_v1]" in client.received_prompt
     assert result == "output/default.png"
