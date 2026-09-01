@@ -11,3 +11,7 @@ class MediaProbeError(RuntimeError):
 
 class VideoRenderError(RuntimeError):
     """Raised when FFmpeg cannot render video output."""
+
+
+class VisualDirectorError(RuntimeError):
+    """Raised when a safe, validated visual plan cannot be produced."""
