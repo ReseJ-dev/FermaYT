@@ -2,6 +2,7 @@
 
 import os
 from typing import ClassVar
+from urllib.parse import quote
 
 import httpx
 
@@ -123,6 +124,93 @@ class QwenTTSApiClient:
             )
 
         return audio_url.strip()
+
+
+class ElevenLabsTTSApiClient:
+    """Direct HTTP client for ElevenLabs text-to-speech."""
+
+    API_URL: ClassVar[str] = "https://api.elevenlabs.io/v1/text-to-speech"
+    MODEL_ID: ClassVar[str] = "eleven_multilingual_v2"
+    OUTPUT_FORMAT: ClassVar[str] = "mp3_44100_128"
+    TIMEOUT_SECONDS: ClassVar[float] = 60.0
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        endpoint: str | None = None,
+        model: str = MODEL_ID,
+        voice: str = "JBFqnCBsd6RMkjVDRZzb",
+        output_format: str = OUTPUT_FORMAT,
+    ) -> None:
+        self.api_key = api_key
+        self.endpoint = endpoint if endpoint is not None else self.API_URL
+        self.model = model
+        self.voice = voice
+        self.output_format = output_format
+
+    async def generate(self, text: str) -> bytes:
+        """Generate speech and return the audio response bytes."""
+        from app.generators.voice import validate_tts_text
+
+        try:
+            validated_text = validate_tts_text(text)
+        except ValueError as exc:
+            raise TTSGenerationError("Invalid TTS text") from exc
+
+        api_key = (
+            self.api_key
+            if self.api_key is not None
+            else os.getenv("ELEVENLABS_API_KEY")
+        )
+        if not api_key or not api_key.strip():
+            raise TTSGenerationError(
+                "ELEVENLABS_API_KEY environment variable is not set"
+            )
+        voice = self.voice.strip()
+        if not voice:
+            raise TTSGenerationError("ElevenLabs voice ID must not be empty")
+        model = self.model.strip()
+        if not model:
+            raise TTSGenerationError("ElevenLabs model must not be empty")
+
+        url = f"{self.endpoint.rstrip('/')}/{quote(voice, safe='')}"
+        headers = {
+            "xi-api-key": api_key.strip(),
+            "Content-Type": "application/json",
+            "Accept": "audio/mpeg",
+        }
+        payload = {"text": validated_text, "model_id": model}
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.TIMEOUT_SECONDS
+            ) as client:
+                response = await client.post(
+                    url,
+                    params={"output_format": self.output_format},
+                    headers=headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+        except httpx.TimeoutException as exc:
+            raise TTSGenerationError(
+                "ElevenLabs API request timed out"
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            raise TTSGenerationError(
+                f"ElevenLabs API returned HTTP {exc.response.status_code}"
+            ) from exc
+        except httpx.RequestError as exc:
+            raise TTSGenerationError("ElevenLabs API request failed") from exc
+
+        content_type = response.headers.get("content-type", "").lower()
+        if not content_type.startswith(("audio/", "application/octet-stream")):
+            raise TTSGenerationError(
+                "ElevenLabs API returned an unexpected response"
+            )
+        if not response.content:
+            raise TTSGenerationError("ElevenLabs API returned empty audio")
+        return response.content
 
 
 TTSApiClient = QwenTTSApiClient

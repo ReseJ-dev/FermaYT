@@ -82,3 +82,19 @@ def test_generate_voice_creates_default_client(
 
     assert client.received_text == "Welcome"
     assert result == "output/default.wav"
+
+
+def test_generate_voice_saves_raw_audio_bytes(tmp_path) -> None:
+    class FakeRawAudioClient:
+        async def generate(self, text: str) -> bytes:
+            assert text == "Привет"
+            return b"raw-mp3-data"
+
+    output_path = tmp_path / "nested" / "voice.mp3"
+
+    result = asyncio.run(
+        generate_voice(" Привет ", str(output_path), FakeRawAudioClient())
+    )
+
+    assert result == str(output_path)
+    assert output_path.read_bytes() == b"raw-mp3-data"

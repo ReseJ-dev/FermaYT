@@ -3,7 +3,7 @@
 import pytest
 
 from app.clients.image_api import QwenImageProvider, SeedreamImageProvider
-from app.clients.tts_api import QwenTTSApiClient
+from app.clients.tts_api import ElevenLabsTTSApiClient, QwenTTSApiClient
 from app.providers import (
     ImageProvider,
     TTSProvider,
@@ -48,6 +48,18 @@ def test_get_qwen_tts_provider_with_config() -> None:
     assert isinstance(provider, QwenTTSApiClient)
     assert isinstance(provider, TTSProvider)
     assert provider.api_key == "key"
+
+
+def test_get_elevenlabs_tts_provider_with_config() -> None:
+    provider = get_tts_provider(
+        "elevenlabs",
+        {"api_key": "key", "voice": "voice-id"},
+    )
+
+    assert isinstance(provider, ElevenLabsTTSApiClient)
+    assert isinstance(provider, TTSProvider)
+    assert provider.api_key == "key"
+    assert provider.voice == "voice-id"
 
 
 @pytest.mark.parametrize("factory", [get_image_provider, get_tts_provider])

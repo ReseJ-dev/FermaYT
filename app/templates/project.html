@@ -28,19 +28,36 @@
         <label>Общий визуальный стиль<textarea name="global_image_style_prompt" rows="3" placeholder="Например: layered cardboard, warm colors, soft cinematic light">{{ project.global_image_style_prompt or '' }}</textarea><small>Стиль добавляется к промпту при генерации и не изменяет промпты сцен.</small></label>
 
         <details class="settings-details">
-          <summary>Провайдеры и параметры видео</summary>
-          <div class="form-grid two-columns details-content">
-            <label>Провайдер изображений
-              <select name="image_provider">
-                <option value="seedream" {% if project.image_provider == 'seedream' %}selected{% endif %}>BytePlus Seedream</option>
-                <option value="qwen" {% if project.image_provider == 'qwen' %}selected{% endif %}>Alibaba Qwen Image</option>
-              </select>
-            </label>
-            <label>Модель изображений<input name="image_model" value="{{ project.image_model or '' }}" placeholder="По умолчанию провайдера"></label>
-            <label>Провайдер озвучки<select name="tts_provider"><option value="qwen" selected>Alibaba Qwen TTS</option></select></label>
-            <label>Модель TTS<input name="tts_model" value="{{ project.tts_model or '' }}" placeholder="qwen3-tts-flash"></label>
-            <label>Голос<input name="tts_voice" required value="{{ project.tts_voice }}"></label>
-            <label>Язык<input name="tts_language" required value="{{ project.tts_language }}"></label>
+          <summary>Нейросети и параметры видео</summary>
+          <div class="details-content">
+            <div class="provider-selection-grid">
+              <section class="provider-selection-card">
+                <div class="provider-selection-heading"><span class="provider-step">01</span><div><h3>Генерация изображения</h3><p>Выбранный оператор создаёт картинки для всех сцен проекта.</p></div></div>
+                <label>Оператор нейросети
+                  <select name="image_provider" id="image-provider">
+                    <option value="seedream" {% if project.image_provider == 'seedream' %}selected{% endif %}>BytePlus · Seedream</option>
+                    <option value="qwen" {% if project.image_provider == 'qwen' %}selected{% endif %}>Alibaba · Qwen Image</option>
+                  </select>
+                </label>
+                <label>Модель<input id="image-model" name="image_model" value="{{ project.image_model or '' }}" placeholder="По умолчанию провайдера"><small id="image-provider-help"></small></label>
+              </section>
+
+              <section class="provider-selection-card">
+                <div class="provider-selection-heading"><span class="provider-step">02</span><div><h3>Генерация озвучки</h3><p>Выбранный оператор озвучивает текст каждой сцены.</p></div></div>
+                <label>Оператор нейросети
+                  <select name="tts_provider" id="tts-provider">
+                    <option value="qwen" {% if project.tts_provider == 'qwen' %}selected{% endif %}>Alibaba · Qwen TTS</option>
+                    <option value="elevenlabs" {% if project.tts_provider == 'elevenlabs' %}selected{% endif %}>ElevenLabs</option>
+                  </select>
+                </label>
+                <label>Модель<input id="tts-model" name="tts_model" value="{{ project.tts_model or '' }}" placeholder="qwen3-tts-flash"></label>
+                <label><span id="tts-voice-label">Голос</span><input id="tts-voice" name="tts_voice" required value="{{ project.tts_voice }}"><small id="tts-voice-help"></small></label>
+                <label id="tts-language-field">Язык<input name="tts_language" required value="{{ project.tts_language }}"></label>
+              </section>
+            </div>
+
+            <h3 class="render-settings-title">Параметры финального видео</h3>
+            <div class="form-grid two-columns">
             <label>Формат видео
               <select name="output_preset">
                 <option value="vertical" {% if project.width == 1080 and project.height == 1920 %}selected{% endif %}>Вертикальный 9:16 — 1080×1920</option>
@@ -50,6 +67,7 @@
             </label>
             <label>FPS<select name="fps">{% for fps in [24, 30, 60] %}<option value="{{ fps }}" {% if project.fps == fps %}selected{% endif %}>{{ fps }}</option>{% endfor %}</select></label>
             <label>Масштаб изображения<select name="image_fit"><option value="cover" {% if project.image_fit == 'cover' %}selected{% endif %}>Заполнить кадр (cover)</option><option value="contain" {% if project.image_fit == 'contain' %}selected{% endif %}>Показать целиком (contain)</option></select></label>
+            </div>
           </div>
         </details>
       </form>
@@ -86,12 +104,12 @@
                         <div class="asset-card">
                           <div class="asset-label">Изображение</div>
                           {% if card.image_url %}<img src="{{ card.image_url }}" alt="Изображение сцены {{ loop.index }}">{% else %}<div class="asset-placeholder"><span>▧</span><small>Изображения пока нет</small></div>{% endif %}
-                          <button class="button button-secondary button-full" type="button" disabled title="Будет подключено на следующем этапе">{{ 'Перегенерировать' if card.image_url else 'Создать изображение' }}</button>
+                          <button class="button button-secondary button-full" type="submit" formaction="/api/projects/{{ project.id }}/scenes/{{ scene.id }}/generate-image" formmethod="post">{{ 'Перегенерировать' if card.image_url else 'Создать изображение' }}</button>
                         </div>
                         <div class="asset-card asset-audio">
                           <div class="asset-label">Озвучка{% if scene.duration %}<span>{{ '%.1f' | format(scene.duration) }} сек.</span>{% endif %}</div>
                           {% if card.audio_url %}<audio controls preload="metadata" src="{{ card.audio_url }}"></audio>{% else %}<div class="audio-placeholder">Озвучки пока нет</div>{% endif %}
-                          <button class="button button-secondary button-full" type="button" disabled title="Будет подключено на следующем этапе">{{ 'Перегенерировать голос' if card.audio_url else 'Создать озвучку' }}</button>
+                          <button class="button button-secondary button-full" type="submit" formaction="/api/projects/{{ project.id }}/scenes/{{ scene.id }}/generate-audio" formmethod="post">{{ 'Перегенерировать голос' if card.audio_url else 'Создать озвучку' }}</button>
                         </div>
                       </div>
                     </div>

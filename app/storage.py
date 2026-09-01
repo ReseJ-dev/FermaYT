@@ -4,7 +4,6 @@ import re
 from pathlib import Path
 from uuid import uuid4
 
-
 _SAFE_EXTENSION = re.compile(r"^\.[A-Za-z0-9]+$")
 
 
@@ -56,9 +55,11 @@ class ProjectMediaPaths:
         scene_name = _safe_component(scene_id, "scene_id")
         return self.images_dir / f"{scene_name}.png"
 
-    def audio_path(self, scene_id: str) -> Path:
+    def audio_path(self, scene_id: str, extension: str = ".wav") -> Path:
         scene_name = _safe_component(scene_id, "scene_id")
-        return self.audio_dir / f"{scene_name}.wav"
+        if not _SAFE_EXTENSION.fullmatch(extension):
+            raise ValueError("invalid audio file extension")
+        return self.audio_dir / f"{scene_name}{extension.lower()}"
 
     def scene_video_path(self, scene_id: str) -> Path:
         scene_name = _safe_component(scene_id, "scene_id")

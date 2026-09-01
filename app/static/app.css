@@ -94,6 +94,15 @@ label small, .helper-text { color: #8a94a7; font-size: .7rem; font-weight: 500; 
 .settings-details { margin-top: .8rem; border-top: 1px solid #e9ecf2; }
 .settings-details summary { padding: 1rem 0 0; cursor: pointer; color: #59657b; font-size: .82rem; font-weight: 750; }
 .details-content { padding-top: 1.2rem; }
+.provider-selection-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+.provider-selection-card { padding: 1rem; border: 1px solid #dfe4ed; border-radius: .85rem; background: #f8f9fc; }
+.provider-selection-card label:last-child { margin-bottom: 0; }
+.provider-selection-heading { display: flex; gap: .7rem; min-height: 4rem; margin-bottom: 1rem; }
+.provider-selection-heading h3, .provider-selection-heading p { margin: 0; }
+.provider-selection-heading h3 { font-size: .95rem; }
+.provider-selection-heading p { margin-top: .25rem; color: var(--muted); font-size: .7rem; line-height: 1.4; }
+.provider-step { display: grid; flex: 0 0 2rem; height: 2rem; place-items: center; border-radius: .55rem; color: white; background: var(--primary); font-size: .65rem; font-weight: 800; }
+.render-settings-title { margin: 1.5rem 0 1rem; padding-top: 1.25rem; border-top: 1px solid #e2e6ee; font-size: .95rem; }
 
 .scenes-section { margin-top: 2.5rem; }
 .scene-list { display: grid; gap: 1rem; }
@@ -143,7 +152,7 @@ label small, .helper-text { color: #8a94a7; font-size: .7rem; font-weight: 500; 
 .modal-heading h2 { margin: .25rem 0 0; }
 .modal-actions { display: flex; justify-content: flex-end; gap: .6rem; margin-top: 1.2rem; }
 
-.settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+.settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 22rem), 1fr)); gap: 1rem; }
 .provider-card { padding: 1.3rem; }
 .provider-heading { display: grid; grid-template-columns: auto 1fr auto; gap: .8rem; align-items: center; }
 .provider-heading h2, .provider-heading p { margin: 0; }
@@ -152,6 +161,7 @@ label small, .helper-text { color: #8a94a7; font-size: .7rem; font-weight: 500; 
 .provider-logo { display: grid; width: 2.6rem; height: 2.6rem; place-items: center; border-radius: .7rem; color: white; font-weight: 850; }
 .provider-logo.seedream { background: linear-gradient(135deg, #5660d8, #9b6de1); }
 .provider-logo.qwen { background: linear-gradient(135deg, #e37542, #cc3f70); }
+.provider-logo.elevenlabs { color: #111; background: #efefef; font-size: .75rem; }
 .config-status { padding: .3rem .55rem; border-radius: 2rem; color: #985050; background: #fff0f0; font-size: .65rem; font-weight: 750; }
 .config-status.configured { color: #18704a; background: #e7f8ef; }
 .settings-list { margin: 1.2rem 0 0; }
@@ -162,6 +172,11 @@ label small, .helper-text { color: #8a94a7; font-size: .7rem; font-weight: 500; 
 .settings-note h2 { margin-top: 0; }
 .settings-note p { color: var(--muted); line-height: 1.6; }
 .settings-note pre { overflow: auto; padding: 1rem; border-radius: .7rem; color: #dbe2ff; background: #20263d; }
+.secret-field { margin-top: 1.25rem; }
+.delete-secret { display: flex; grid-template-columns: auto 1fr; align-items: center; width: max-content; max-width: 100%; color: #8b4444; font-size: .7rem; font-weight: 600; }
+.delete-secret input { width: 1rem; height: 1rem; margin: 0; accent-color: var(--danger); }
+.settings-save { display: flex; align-items: center; justify-content: flex-end; gap: 1rem; margin-top: 1rem; }
+.settings-save p { color: var(--muted); font-size: .75rem; }
 
 @media (max-width: 70rem) {
   .workspace-layout { grid-template-columns: 1fr; }
@@ -180,7 +195,7 @@ label small, .helper-text { color: #8a94a7; font-size: .7rem; font-weight: 500; 
   .local-badge { display: none; }
   .page-heading { align-items: flex-start; flex-direction: column; }
   .page-heading .button { width: 100%; }
-  .two-columns, .settings-grid, .scene-editor-grid { grid-template-columns: 1fr; }
+  .two-columns, .settings-grid, .scene-editor-grid, .provider-selection-grid { grid-template-columns: 1fr; }
   .asset-stack { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .scene-card { grid-template-columns: 3rem minmax(0, 1fr); }
   .scene-content { padding: 1rem; }

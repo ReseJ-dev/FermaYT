@@ -12,7 +12,34 @@ from app.database import (
     create_sqlite_engine,
     init_database,
 )
-from app.repositories import get_project, list_scenes
+from app.repositories import (
+    create_scene,
+    get_project,
+    list_scenes,
+    update_project,
+)
+from app.secret_store import (
+    BYTEPLUS_API_KEY,
+    DASHSCOPE_API_KEY,
+    ELEVENLABS_API_KEY,
+)
+
+
+class FakeSecretStore:
+    def __init__(self) -> None:
+        self.values: dict[str, str] = {}
+
+    def set_secret(self, name: str, value: str) -> None:
+        self.values[name] = value
+
+    def get_secret(self, name: str) -> str | None:
+        return self.values.get(name)
+
+    def has_secret(self, name: str) -> bool:
+        return name in self.values
+
+    def delete_secret(self, name: str) -> None:
+        self.values.pop(name, None)
 
 
 @pytest.fixture
@@ -169,3 +196,208 @@ def test_settings_never_render_secret_values(
     assert "Настроено" in response.text
     assert "byteplus-secret" not in response.text
     assert "dashscope-secret" not in response.text
+
+
+def test_settings_save_preserve_and_delete_api_keys(
+    web_app: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _, _ = web_app
+    store = FakeSecretStore()
+    monkeypatch.setattr(main_module, "secret_store", store)
+
+    saved = client.post(
+        "/settings",
+        data={
+            "byteplus_api_key": "byteplus-private",
+            "dashscope_api_key": "dashscope-private",
+            "elevenlabs_api_key": "elevenlabs-private",
+        },
+        follow_redirects=False,
+    )
+    page = client.get("/settings")
+    preserved = client.post(
+        "/settings",
+        data={"byteplus_api_key": "", "dashscope_api_key": ""},
+        follow_redirects=False,
+    )
+    deleted = client.post(
+        "/settings",
+        data={"delete_byteplus_api_key": "on"},
+        follow_redirects=False,
+    )
+
+    assert saved.status_code == preserved.status_code == deleted.status_code == 303
+    assert store.values == {
+        DASHSCOPE_API_KEY: "dashscope-private",
+        ELEVENLABS_API_KEY: "elevenlabs-private",
+    }
+    assert "byteplus-private" not in page.text
+    assert "dashscope-private" not in page.text
+    assert "elevenlabs-private" not in page.text
+    assert page.text.count("Настроено") >= 3
+    assert BYTEPLUS_API_KEY not in store.values
+
+
+def test_project_can_select_elevenlabs_and_generate_scene_audio(
+    web_app: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_factory, projects_root = web_app
+    project_id = _create_project(client)
+    store = FakeSecretStore()
+    store.set_secret(ELEVENLABS_API_KEY, "elevenlabs-private")
+    monkeypatch.setattr(main_module, "secret_store", store)
+
+    with session_factory() as session:
+        update_project(
+            session,
+            project_id,
+            tts_provider="elevenlabs",
+            tts_model="eleven_multilingual_v2",
+            tts_voice="voice-123",
+        )
+        scene = create_scene(
+            session,
+            project_id=project_id,
+            text="Текст для озвучки",
+            image_prompt="Изображение",
+        )
+        scene_id = scene.id
+
+    provider_call: tuple[str, dict[str, str]] | None = None
+
+    def fake_provider(name: str, config: dict[str, str]) -> object:
+        nonlocal provider_call
+        provider_call = (name, config)
+        return object()
+
+    async def fake_generate_voice(
+        text: str,
+        output_path: str,
+        client: object,
+    ) -> str:
+        del client
+        assert text == "Обновлённый текст для озвучки"
+        path = Path(output_path)
+        path.write_bytes(b"mp3")
+        return output_path
+
+    monkeypatch.setattr(main_module, "get_tts_provider", fake_provider)
+    monkeypatch.setattr(main_module, "generate_voice", fake_generate_voice)
+    monkeypatch.setattr(main_module, "get_media_duration", lambda path: 2.75)
+
+    response = client.post(
+        f"/api/projects/{project_id}/scenes/{scene_id}/generate-audio",
+        data={
+            "text": "Обновлённый текст для озвучки",
+            "image_prompt": "Обновлённое изображение",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    assert provider_call == (
+        "elevenlabs",
+        {
+            "api_key": "elevenlabs-private",
+            "model": "eleven_multilingual_v2",
+            "voice": "voice-123",
+        },
+    )
+    with session_factory() as session:
+        saved_scene = list_scenes(session, project_id)[0]
+        assert saved_scene.audio_path == str(
+            projects_root / project_id / "audio" / f"{scene_id}.mp3"
+        )
+        assert saved_scene.duration == 2.75
+        assert saved_scene.text == "Обновлённый текст для озвучки"
+
+    page = client.get(f"/projects/{project_id}")
+    assert "ElevenLabs" in page.text
+    assert "Перегенерировать голос" in page.text
+
+
+def test_selected_image_provider_receives_scene_and_global_style(
+    web_app: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_factory, projects_root = web_app
+    project_id = _create_project(client)
+    store = FakeSecretStore()
+    store.set_secret(DASHSCOPE_API_KEY, "dashscope-private")
+    monkeypatch.setattr(main_module, "secret_store", store)
+    monkeypatch.setenv("QWEN_IMAGE_ENDPOINT", "https://qwen.example/image")
+
+    with session_factory() as session:
+        update_project(
+            session,
+            project_id,
+            image_provider="qwen",
+            image_model="qwen-image-3.0",
+            global_image_style_prompt="layered cardboard, warm colors",
+        )
+        scene = create_scene(
+            session,
+            project_id=project_id,
+            text="Scene narration",
+            image_prompt="Old image prompt",
+        )
+        scene_id = scene.id
+
+    provider_call: tuple[str, dict[str, str]] | None = None
+    generation_call: tuple[str, str] | None = None
+
+    def fake_provider(name: str, config: dict[str, str]) -> object:
+        nonlocal provider_call
+        provider_call = (name, config)
+        return object()
+
+    async def fake_generate_image(
+        prompt: str,
+        output_path: str,
+        client: object,
+    ) -> str:
+        nonlocal generation_call
+        del client
+        generation_call = (prompt, output_path)
+        path = Path(output_path)
+        path.write_bytes(b"png")
+        return output_path
+
+    monkeypatch.setattr(main_module, "get_image_provider", fake_provider)
+    monkeypatch.setattr(main_module, "generate_image", fake_generate_image)
+
+    response = client.post(
+        f"/api/projects/{project_id}/scenes/{scene_id}/generate-image",
+        data={
+            "text": "Updated narration",
+            "image_prompt": "A boy opening a magic book",
+        },
+        follow_redirects=False,
+    )
+
+    expected_path = str(
+        projects_root / project_id / "images" / f"{scene_id}.png"
+    )
+    assert response.status_code == 303
+    assert provider_call == (
+        "qwen",
+        {
+            "api_key": "dashscope-private",
+            "endpoint": "https://qwen.example/image",
+            "model": "qwen-image-3.0",
+        },
+    )
+    assert generation_call == (
+        "A boy opening a magic book\n\nlayered cardboard, warm colors",
+        expected_path,
+    )
+    with session_factory() as session:
+        saved_scene = list_scenes(session, project_id)[0]
+        assert saved_scene.image_path == expected_path
+        assert saved_scene.image_prompt == "A boy opening a magic book"
+
+    page = client.get(f"/projects/{project_id}")
+    assert "Alibaba · Qwen Image" in page.text
+    assert "Перегенерировать" in page.text

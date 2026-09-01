@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from typing import Any, Protocol, runtime_checkable
 
 from app.clients.image_api import QwenImageProvider, SeedreamImageProvider
-from app.clients.tts_api import QwenTTSApiClient
+from app.clients.tts_api import ElevenLabsTTSApiClient, QwenTTSApiClient
 
 
 @runtime_checkable
@@ -14,7 +14,7 @@ class ImageProvider(Protocol):
 
 @runtime_checkable
 class TTSProvider(Protocol):
-    async def generate(self, text: str) -> str: ...
+    async def generate(self, text: str) -> str | bytes: ...
 
 
 def get_image_provider(
@@ -37,6 +37,9 @@ def get_tts_provider(
 ) -> TTSProvider:
     """Create a configured TTS provider by its public ID."""
     options = dict(config or {})
-    if name.strip().lower() == "qwen":
+    provider_name = name.strip().lower()
+    if provider_name == "qwen":
         return QwenTTSApiClient(**options)
+    if provider_name == "elevenlabs":
+        return ElevenLabsTTSApiClient(**options)
     raise ValueError(f"Unknown TTS provider: {name}")

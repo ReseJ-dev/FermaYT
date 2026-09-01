@@ -21,6 +21,15 @@ def test_shell_launcher_has_valid_syntax() -> None:
     assert launcher.stat().st_mode & 0o111
 
 
+def test_shell_launcher_handles_existing_server_and_runtime_failure() -> None:
+    content = (PROJECT_ROOT / "start_fermayt.sh").read_text(encoding="utf-8")
+
+    assert 'http://127.0.0.1:8000/health' in content
+    assert "already running" in content
+    assert "server stopped unexpectedly" in content
+    assert 'exec "$PYTHON_BIN" "$APP_DIR/run.py"' not in content
+
+
 def test_desktop_launcher_is_local_and_uses_terminal() -> None:
     desktop_file = PROJECT_ROOT / "FermaYT.desktop"
     content = desktop_file.read_text(encoding="utf-8")

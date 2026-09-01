@@ -2,11 +2,29 @@
 
 {% block content %}
   <div class="page-heading"><div><p class="eyebrow">Configuration</p><h1>Настройки провайдеров</h1><p class="lead">Секретные ключи не отображаются и не передаются браузеру.</p></div></div>
+  {% if keyring_error %}<div class="flash flash-error" role="alert">{{ keyring_error }} Проверьте, что системное хранилище паролей разблокировано.</div>{% endif %}
+  <form action="/settings" method="post" autocomplete="off">
   <div class="settings-grid">
-    <section class="panel provider-card"><div class="provider-heading"><div class="provider-logo seedream">S</div><div><h2>BytePlus Seedream</h2><p>Генерация изображений</p></div><span class="config-status {{ 'configured' if byteplus_configured else '' }}">{{ 'Настроено' if byteplus_configured else 'Не настроено' }}</span></div><dl class="settings-list"><div><dt>Переменная</dt><dd><code>BYTEPLUS_ARK_API_KEY</code></dd></div><div><dt>Модель</dt><dd>seedream-5-0-260128</dd></div></dl></section>
-    <section class="panel provider-card"><div class="provider-heading"><div class="provider-logo qwen">Q</div><div><h2>Alibaba Qwen</h2><p>Изображения и озвучка</p></div><span class="config-status {{ 'configured' if dashscope_configured else '' }}">{{ 'Настроено' if dashscope_configured else 'Не настроено' }}</span></div><dl class="settings-list"><div><dt>Ключ</dt><dd><code>DASHSCOPE_API_KEY</code></dd></div><div><dt>Image endpoint</dt><dd>{{ 'Настроен' if qwen_image_endpoint_configured else 'Не настроен' }}</dd></div><div><dt>TTS</dt><dd>qwen3-tts-flash · Cherry · Russian</dd></div></dl></section>
+    <section class="panel provider-card">
+      <div class="provider-heading"><div class="provider-logo seedream">S</div><div><h2>BytePlus Seedream</h2><p>Генерация изображений</p></div><span class="config-status {{ 'configured' if byteplus_configured else '' }}">{{ 'Настроено' if byteplus_configured else 'Не настроено' }}</span></div>
+      <label class="secret-field">API key<input name="byteplus_api_key" type="password" value="" autocomplete="new-password" placeholder="{{ 'Введите новый ключ для замены' if byteplus_configured else 'Введите BytePlus API key' }}"></label>
+      {% if byteplus_configured %}<label class="delete-secret"><input name="delete_byteplus_api_key" type="checkbox"> Удалить сохранённый BytePlus key</label>{% endif %}
+      <dl class="settings-list"><div><dt>Модель</dt><dd>seedream-5-0-260128</dd></div></dl>
+    </section>
+    <section class="panel provider-card">
+      <div class="provider-heading"><div class="provider-logo qwen">Q</div><div><h2>Alibaba Qwen</h2><p>Изображения и озвучка</p></div><span class="config-status {{ 'configured' if dashscope_configured else '' }}">{{ 'Настроено' if dashscope_configured else 'Не настроено' }}</span></div>
+      <label class="secret-field">DashScope API key<input name="dashscope_api_key" type="password" value="" autocomplete="new-password" placeholder="{{ 'Введите новый ключ для замены' if dashscope_configured else 'Введите DashScope API key' }}"></label>
+      {% if dashscope_configured %}<label class="delete-secret"><input name="delete_dashscope_api_key" type="checkbox"> Удалить сохранённый DashScope key</label>{% endif %}
+      <dl class="settings-list"><div><dt>Image endpoint</dt><dd>{{ 'Настроен' if qwen_image_endpoint_configured else 'Нужно настроить отдельно' }}</dd></div><div><dt>TTS</dt><dd>qwen3-tts-flash · Cherry · Russian</dd></div></dl>
+    </section>
+    <section class="panel provider-card">
+      <div class="provider-heading"><div class="provider-logo elevenlabs">11</div><div><h2>ElevenLabs</h2><p>Многоязычная озвучка</p></div><span class="config-status {{ 'configured' if elevenlabs_configured else '' }}">{{ 'Настроено' if elevenlabs_configured else 'Не настроено' }}</span></div>
+      <label class="secret-field">ElevenLabs API key<input name="elevenlabs_api_key" type="password" value="" autocomplete="new-password" placeholder="{{ 'Введите новый ключ для замены' if elevenlabs_configured else 'Введите ElevenLabs API key' }}"></label>
+      {% if elevenlabs_configured %}<label class="delete-secret"><input name="delete_elevenlabs_api_key" type="checkbox"> Удалить сохранённый ElevenLabs key</label>{% endif %}
+      <dl class="settings-list"><div><dt>Endpoint</dt><dd>api.elevenlabs.io</dd></div><div><dt>Модель</dt><dd>eleven_multilingual_v2</dd></div></dl>
+    </section>
   </div>
-  <section class="panel settings-note"><h2>Как добавить ключи</h2><p>В текущем MVP клиенты читают ключи из environment variables. Перезапустите FermaYT после их изменения. Сохранение ключей из браузера появится после подключения безопасного OS keyring.</p><pre>export BYTEPLUS_ARK_API_KEY="..."
-export DASHSCOPE_API_KEY="..."
-export QWEN_IMAGE_ENDPOINT="https://..."</pre></section>
+  <div class="settings-save"><p>Пустое поле не изменяет уже сохранённый ключ.</p><button class="button button-primary" type="submit">Сохранить API-ключи</button></div>
+  </form>
+  <section class="panel settings-note"><h2>Где хранятся ключи</h2><p>Ключи сохраняются в защищённом системном хранилище паролей Linux под именем FermaYT. Они не записываются в SQLite, исходный код или HTML и остаются доступными после перезапуска приложения.</p><p>Переменные окружения продолжают работать как резервный вариант для CLI.</p></section>
 {% endblock %}

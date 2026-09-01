@@ -7,16 +7,26 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode
 
+import httpx
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
+from app.clients.image_api import ImageGenerationError
 from app.database import SessionLocal, init_database
 from app.database import engine as database_engine
+from app.errors import MediaProbeError, TTSGenerationError
+from app.generators.image import (
+    build_image_generation_prompt,
+    generate_image,
+)
+from app.generators.voice import generate_voice
 from app.jobs import GenerationJobManager
-from app.persistence import Scene
+from app.media.probe import get_media_duration
+from app.persistence import Project, Scene
+from app.providers import get_image_provider, get_tts_provider
 from app.repositories import (
     create_project,
     create_scene,
@@ -30,10 +40,19 @@ from app.repositories import (
     update_project,
     update_scene,
 )
+from app.secret_store import (
+    BYTEPLUS_API_KEY,
+    DASHSCOPE_API_KEY,
+    ELEVENLABS_API_KEY,
+    SecretStore,
+    SecretStoreError,
+)
+from app.storage import ProjectMediaPaths
 
 APP_DIR = Path(__file__).resolve().parent
 PROJECTS_ROOT = Path("data/projects").resolve()
 job_manager = GenerationJobManager()
+secret_store = SecretStore()
 
 
 @asynccontextmanager
@@ -172,7 +191,7 @@ async def update_project_route(
                 tts_provider=_choice(
                     form,
                     "tts_provider",
-                    {"qwen"},
+                    {"qwen", "elevenlabs"},
                     "Провайдер озвучки",
                 ),
                 tts_model=form.get("tts_model", "").strip() or None,
@@ -294,6 +313,148 @@ async def move_scene_route(
     return _project_redirect(project_id)
 
 
+@app.post("/api/projects/{project_id}/scenes/{scene_id}/generate-audio")
+async def generate_scene_audio_route(
+    request: Request,
+    project_id: str,
+    scene_id: str,
+) -> RedirectResponse:
+    """Generate and persist audio for one scene using its project provider."""
+    form = await _read_optional_form(request)
+    with SessionLocal() as session:
+        project = get_project(session, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        scene = _project_scene(session, project_id, scene_id)
+        if form:
+            try:
+                update_scene(
+                    session,
+                    scene.id,
+                    text=_required(form, "text", "Текст сцены"),
+                    image_prompt=_required(
+                        form,
+                        "image_prompt",
+                        "Промпт изображения",
+                    ),
+                )
+            except ValueError as exc:
+                return _project_redirect(
+                    project_id,
+                    error=_safe_validation_message(exc),
+                )
+            scene = _project_scene(session, project_id, scene_id)
+        provider_name = project.tts_provider
+        scene_text = scene.text
+
+    extension = ".mp3" if provider_name == "elevenlabs" else ".wav"
+    output_path = str(
+        ProjectMediaPaths(project_id, PROJECTS_ROOT).audio_path(
+            scene_id,
+            extension,
+        )
+    )
+    try:
+        provider_config = _tts_provider_config(project)
+        provider = get_tts_provider(provider_name, provider_config)
+        audio_path = await generate_voice(scene_text, output_path, provider)
+        duration = await asyncio.to_thread(get_media_duration, audio_path)
+    except (
+        TTSGenerationError,
+        MediaProbeError,
+        SecretStoreError,
+        httpx.HTTPError,
+        OSError,
+        ValueError,
+    ) as exc:
+        return _project_redirect(
+            project_id,
+            error=f"Не удалось создать озвучку: {_safe_validation_message(exc)}",
+        )
+
+    with SessionLocal() as session:
+        updated_scene = _project_scene(session, project_id, scene_id)
+        update_scene(
+            session,
+            updated_scene.id,
+            audio_path=audio_path,
+            duration=duration,
+            video_path=None,
+        )
+    return _project_redirect(project_id, notice="Озвучка сцены готова.")
+
+
+@app.post("/api/projects/{project_id}/scenes/{scene_id}/generate-image")
+async def generate_scene_image_route(
+    request: Request,
+    project_id: str,
+    scene_id: str,
+) -> RedirectResponse:
+    """Generate an image with the provider selected for this project."""
+    form = await _read_optional_form(request)
+    with SessionLocal() as session:
+        project = get_project(session, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        scene = _project_scene(session, project_id, scene_id)
+        if form:
+            try:
+                update_scene(
+                    session,
+                    scene.id,
+                    text=_required(form, "text", "Текст сцены"),
+                    image_prompt=_required(
+                        form,
+                        "image_prompt",
+                        "Промпт изображения",
+                    ),
+                )
+            except ValueError as exc:
+                return _project_redirect(
+                    project_id,
+                    error=_safe_validation_message(exc),
+                )
+            scene = _project_scene(session, project_id, scene_id)
+        provider_name = project.image_provider
+        scene_prompt = scene.image_prompt
+        style_prompt = project.global_image_style_prompt
+
+    output_path = str(
+        ProjectMediaPaths(project_id, PROJECTS_ROOT).image_path(scene_id)
+    )
+    try:
+        final_prompt = build_image_generation_prompt(
+            scene_prompt,
+            style_prompt,
+        )
+        provider = get_image_provider(
+            provider_name,
+            _image_provider_config(project),
+        )
+        image_path = await generate_image(final_prompt, output_path, provider)
+    except (
+        ImageGenerationError,
+        SecretStoreError,
+        httpx.HTTPError,
+        OSError,
+        ValueError,
+    ) as exc:
+        return _project_redirect(
+            project_id,
+            error=f"Не удалось создать изображение: {_safe_validation_message(exc)}",
+        )
+
+    with SessionLocal() as session:
+        updated_scene = _project_scene(session, project_id, scene_id)
+        update_scene(
+            session,
+            updated_scene.id,
+            image_path=image_path,
+            video_path=None,
+        )
+    return _project_redirect(project_id, notice="Изображение сцены готово.")
+
+
 @app.get("/media/{project_id}/{media_path:path}")
 async def project_media(project_id: str, media_path: str) -> FileResponse:
     """Serve only files located inside the requested project media root."""
@@ -311,22 +472,66 @@ async def project_media(project_id: str, media_path: str) -> FileResponse:
 @app.get("/settings", response_class=HTMLResponse)
 async def settings(request: Request) -> HTMLResponse:
     """Show provider configuration status without exposing secrets."""
+    byteplus_configured, byteplus_store_error = _secret_status(
+        BYTEPLUS_API_KEY,
+        "BYTEPLUS_ARK_API_KEY",
+    )
+    dashscope_configured, dashscope_store_error = _secret_status(
+        DASHSCOPE_API_KEY,
+        "DASHSCOPE_API_KEY",
+    )
+    elevenlabs_configured, elevenlabs_store_error = _secret_status(
+        ELEVENLABS_API_KEY,
+        "ELEVENLABS_API_KEY",
+    )
     return templates.TemplateResponse(
         request=request,
         name="settings.html",
         context={
             "title": "Настройки — FermaYT",
-            "byteplus_configured": bool(
-                os.getenv("BYTEPLUS_ARK_API_KEY", "").strip()
-            ),
-            "dashscope_configured": bool(
-                os.getenv("DASHSCOPE_API_KEY", "").strip()
-            ),
+            "byteplus_configured": byteplus_configured,
+            "dashscope_configured": dashscope_configured,
+            "elevenlabs_configured": elevenlabs_configured,
             "qwen_image_endpoint_configured": bool(
                 os.getenv("QWEN_IMAGE_ENDPOINT", "").strip()
             ),
+            "keyring_error": (
+                byteplus_store_error
+                or dashscope_store_error
+                or elevenlabs_store_error
+            ),
+            "notice": request.query_params.get("notice"),
+            "error": request.query_params.get("error"),
         },
     )
+
+
+@app.post("/settings")
+async def update_settings(request: Request) -> RedirectResponse:
+    """Save or explicitly remove API keys in the operating-system keyring."""
+    form = await _read_form(request)
+    try:
+        _update_secret_from_form(
+            form,
+            field="byteplus_api_key",
+            delete_field="delete_byteplus_api_key",
+            secret_name=BYTEPLUS_API_KEY,
+        )
+        _update_secret_from_form(
+            form,
+            field="dashscope_api_key",
+            delete_field="delete_dashscope_api_key",
+            secret_name=DASHSCOPE_API_KEY,
+        )
+        _update_secret_from_form(
+            form,
+            field="elevenlabs_api_key",
+            delete_field="delete_elevenlabs_api_key",
+            secret_name=ELEVENLABS_API_KEY,
+        )
+    except (SecretStoreError, ValueError) as exc:
+        return _redirect("/settings", error=_safe_validation_message(exc))
+    return _redirect("/settings", notice="API-ключи сохранены безопасно.")
 
 
 @app.get("/health")
@@ -344,6 +549,12 @@ async def _read_form(request: Request) -> dict[str, str]:
         key: values[-1]
         for key, values in parse_qs(body, keep_blank_values=True).items()
     }
+
+
+async def _read_optional_form(request: Request) -> dict[str, str]:
+    if not await request.body():
+        return {}
+    return await _read_form(request)
 
 
 def _required(form: dict[str, str], field: str, label: str) -> str:
@@ -393,9 +604,91 @@ def _project_redirect(project_id: str, **query: str) -> RedirectResponse:
     return _redirect(f"/projects/{project_id}", **query)
 
 
-def _safe_validation_message(error: ValueError) -> str:
+def _safe_validation_message(error: Exception) -> str:
     message = str(error).strip()
     return message[:300] if message else "Проверьте введённые данные."
+
+
+def _tts_provider_config(project: Project) -> dict[str, str]:
+    provider_name = project.tts_provider
+    if provider_name == "qwen":
+        api_key = _configured_secret(DASHSCOPE_API_KEY, "DASHSCOPE_API_KEY")
+        return {
+            "api_key": api_key,
+            "model": project.tts_model or "qwen3-tts-flash",
+            "voice": project.tts_voice,
+            "language": project.tts_language,
+        }
+    if provider_name == "elevenlabs":
+        api_key = _configured_secret(
+            ELEVENLABS_API_KEY,
+            "ELEVENLABS_API_KEY",
+        )
+        return {
+            "api_key": api_key,
+            "model": project.tts_model or "eleven_multilingual_v2",
+            "voice": project.tts_voice,
+        }
+    raise ValueError("Неизвестный провайдер озвучки.")
+
+
+def _image_provider_config(project: Project) -> dict[str, str]:
+    if project.image_provider == "seedream":
+        return {
+            "api_key": _configured_secret(
+                BYTEPLUS_API_KEY,
+                "BYTEPLUS_ARK_API_KEY",
+            ),
+            "model": project.image_model or "seedream-5-0-260128",
+        }
+    if project.image_provider == "qwen":
+        endpoint = os.getenv("QWEN_IMAGE_ENDPOINT", "").strip()
+        if not endpoint:
+            raise ValueError(
+                "Для Qwen Image настройте QWEN_IMAGE_ENDPOINT."
+            )
+        return {
+            "api_key": _configured_secret(
+                DASHSCOPE_API_KEY,
+                "DASHSCOPE_API_KEY",
+            ),
+            "endpoint": endpoint,
+            "model": project.image_model or "qwen-image-3.0",
+        }
+    raise ValueError("Неизвестный провайдер изображений.")
+
+
+def _configured_secret(secret_name: str, environment_name: str) -> str:
+    value = secret_store.get_secret(secret_name)
+    if value:
+        return value
+    environment_value = os.getenv(environment_name, "").strip()
+    if environment_value:
+        return environment_value
+    raise ValueError("Добавьте API-ключ провайдера в Настройках.")
+
+
+def _secret_status(secret_name: str, environment_name: str) -> tuple[bool, str | None]:
+    environment_configured = bool(os.getenv(environment_name, "").strip())
+    try:
+        return secret_store.has_secret(secret_name) or environment_configured, None
+    except SecretStoreError as exc:
+        return environment_configured, str(exc)
+
+
+def _update_secret_from_form(
+    form: dict[str, str],
+    *,
+    field: str,
+    delete_field: str,
+    secret_name: str,
+) -> None:
+    if form.get(delete_field) == "on":
+        secret_store.delete_secret(secret_name)
+        return
+    value = form.get(field, "").strip()
+    if value:
+        secret_store.set_secret(secret_name, value)
 
 
 def _stored_media_url(project_id: str, stored_path: str | None) -> str | None:
