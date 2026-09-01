@@ -240,11 +240,13 @@ class VisualPlan(_VisualModel):
             if beat.source_visual_id is not None:
                 valid_sources = master_scene_ids | previous_beat_ids
                 _require_known(beat.source_visual_id, valid_sources, "source visual")
-            if beat.camera_framing in {ShotFraming.CLOSE, ShotFraming.DETAIL}:
-                if beat.geography_established_by is None:
-                    raise ValueError(
-                        "CLOSE and DETAIL beats require geography_established_by"
-                    )
+            if (
+                beat.camera_framing in {ShotFraming.CLOSE, ShotFraming.DETAIL}
+                and beat.geography_established_by is None
+            ):
+                raise ValueError(
+                    "CLOSE and DETAIL beats require geography_established_by"
+                )
             if beat.geography_established_by is not None:
                 valid_geography = master_scene_ids | previous_beat_ids
                 _require_known(

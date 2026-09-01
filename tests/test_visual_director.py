@@ -62,11 +62,25 @@ def valid_plan_payload() -> dict[str, object]:
                 "location_id": "shaft",
                 "characters_visible": ["miners"],
                 "important_objects": ["ladder"],
+                "camera_framing": "WIDE",
                 "camera_view": "Wide vertical cutaway",
+                "framing_reason": "Establish distance and the complete escape route.",
+                "camera_movement": "SUBTLE_ZOOM",
+                "geography_established_by": None,
                 "physical_state": "Ladder connects miners to the open surface route.",
+                "progressive_change": None,
+                "safety_geography": {
+                    "current_position": "Miners at the bottom of the shaft",
+                    "exit_or_safe_area": "Surface opening",
+                    "distance_or_scale": "The miners appear small far below",
+                    "obstacle_between": "No obstacle yet; ladder is continuous",
+                },
+                "anticipated_consequence": "The ladder is visibly the only main route.",
                 "change_from_previous_beat": "Initial spatial establishment.",
+                "information_added_beyond_narration": "Shows vertical scale and route.",
                 "preferred_visual_operation": "NEW_IMAGE",
                 "source_visual_id": None,
+                "overlay_description": None,
                 "estimated_duration_seconds": 4.5,
             },
             {
@@ -77,11 +91,30 @@ def valid_plan_payload() -> dict[str, object]:
                 "location_id": "shaft",
                 "characters_visible": ["miners"],
                 "important_objects": ["ladder"],
+                "camera_framing": "CLOSE",
                 "camera_view": "Same cutaway, closer on the broken middle section",
+                "framing_reason": "Make the exact failed connection readable.",
+                "camera_movement": "HIGHLIGHT",
+                "geography_established_by": "beat_1",
                 "physical_state": "The ladder is broken and no longer spans the shaft.",
+                "progressive_change": {
+                    "subject_id": "ladder",
+                    "previous_state": "Connected from miners to surface",
+                    "current_state": "Broken in the middle",
+                    "progression": "Open escape route becomes blocked",
+                },
+                "safety_geography": {
+                    "current_position": "Miners below the break",
+                    "exit_or_safe_area": "Surface opening above",
+                    "distance_or_scale": "Most of the shaft remains above them",
+                    "obstacle_between": "Missing ladder section",
+                },
+                "anticipated_consequence": None,
                 "change_from_previous_beat": "The established ladder connection breaks.",
+                "information_added_beyond_narration": "Locates the break between miners and safety.",
                 "preferred_visual_operation": "EDIT_EXISTING",
                 "source_visual_id": "beat_1",
+                "overlay_description": None,
                 "estimated_duration_seconds": 4.0,
             },
         ],
@@ -107,6 +140,11 @@ def test_director_sends_complete_narration_and_returns_validated_plan() -> None:
     assert client.prompt is not None
     assert narration in client.prompt
     assert "do not write image\ngeneration prompts" in client.prompt
+    assert "ESTABLISH GEOGRAPHY BEFORE DETAIL" in client.prompt
+    assert "VISUAL ANTICIPATION" in client.prompt
+    assert "DISTANCE FROM SAFETY" in client.prompt
+    assert "REUSE STRONG IMAGES" in client.prompt
+    assert "ADD INFORMATION" in client.prompt
     assert len(plan.visual_beats) == 2
     assert plan.visual_beats[1].preferred_visual_operation is VisualOperation.EDIT_EXISTING
 
@@ -143,6 +181,18 @@ def test_director_rejects_unknown_and_forward_source_references() -> None:
     assert isinstance(beats[0], dict)
     beats[0]["preferred_visual_operation"] = "REUSE"
     beats[0]["source_visual_id"] = "beat_2"
+    client = FakePlanningClient(json.dumps(payload))
+
+    with pytest.raises(VisualDirectorError, match="invalid structured visual plan"):
+        asyncio.run(VisualDirector(client).create_plan("Complete narration"))
+
+
+def test_director_rejects_close_view_without_established_geography() -> None:
+    payload = valid_plan_payload()
+    beats = payload["visual_beats"]
+    assert isinstance(beats, list)
+    assert isinstance(beats[1], dict)
+    beats[1]["geography_established_by"] = None
     client = FakePlanningClient(json.dumps(payload))
 
     with pytest.raises(VisualDirectorError, match="invalid structured visual plan"):
