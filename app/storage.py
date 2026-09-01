@@ -21,6 +21,7 @@ class ProjectMediaPaths:
         for directory in (
             self.images_dir,
             self.master_scenes_dir,
+            self.style_references_dir,
             self.audio_dir,
             self.scenes_dir,
             self.uploads_dir,
@@ -39,6 +40,10 @@ class ProjectMediaPaths:
     @property
     def master_scenes_dir(self) -> Path:
         return self.project_dir / "master_scenes"
+
+    @property
+    def style_references_dir(self) -> Path:
+        return self.project_dir / "style_references"
 
     @property
     def audio_dir(self) -> Path:
@@ -64,6 +69,10 @@ class ProjectMediaPaths:
         master_name = _safe_component(master_scene_id, "master_scene_id")
         version = _safe_component(style_version, "style_version")
         return self.master_scenes_dir / f"{master_name}-{version}.png"
+
+    def style_reference_path(self, style_id: str) -> Path:
+        style_name = _safe_component(style_id, "style_id")
+        return self.style_references_dir / f"{style_name}.png"
 
     def audio_path(self, scene_id: str, extension: str = ".wav") -> Path:
         scene_name = _safe_component(scene_id, "scene_id")

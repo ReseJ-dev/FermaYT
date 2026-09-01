@@ -7,15 +7,26 @@ import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Protocol, runtime_checkable
+from typing import Protocol
 
 from sqlalchemy.orm import Session
 
 from app.errors import MasterSceneError
 from app.generators.image import generate_image, validate_image_prompt
+from app.generators.style_reference import (
+    build_reference_role_instruction,
+    to_style_image_reference,
+    verify_style_reference_asset,
+)
 from app.models.visual_plan import MasterScene, VisualBeat, VisualOperation, VisualPlan
-from app.persistence import MasterSceneAsset, Project
+from app.persistence import MasterSceneAsset, Project, StyleReferenceAsset
 from app.pipeline.visual_operation_engine import VisualProviderCapabilities
+from app.providers import (
+    ImageEditingProvider,
+    ImageReference,
+    ImageReferenceRole,
+    ReferenceImageProvider,
+)
 from app.repositories import create_master_scene_asset, get_master_scene_asset
 from app.storage import ProjectMediaPaths
 from app.style_contracts import DEFAULT_IMAGE_STYLE_ID, apply_image_style_contract
@@ -24,20 +35,6 @@ from app.utils.download import download_file
 
 class MasterSceneImageClient(Protocol):
     async def generate(self, prompt: str) -> str: ...
-
-
-@runtime_checkable
-class ReferenceImageClient(Protocol):
-    async def generate_with_references(
-        self,
-        prompt: str,
-        reference_image_paths: tuple[str, ...],
-    ) -> str: ...
-
-
-@runtime_checkable
-class ImageEditingClient(Protocol):
-    async def edit(self, prompt: str, source_image_path: str) -> str: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -49,8 +46,15 @@ class ContinuityGenerationRequest:
     master_scene_id: str | None = None
     master_image_path: str | None = None
     style_version: str | None = None
-    reference_image_paths: tuple[str, ...] = ()
-    reference_hashes: tuple[str, ...] = ()
+    references: tuple[ImageReference, ...] = ()
+
+    @property
+    def reference_image_paths(self) -> tuple[str, ...]:
+        return tuple(reference.file_path for reference in self.references)
+
+    @property
+    def reference_hashes(self) -> tuple[str, ...]:
+        return tuple(reference.sha256 for reference in self.references)
 
 
 async def generate_required_master_scenes(
@@ -61,6 +65,8 @@ async def generate_required_master_scenes(
     *,
     projects_root: str | Path = "data/projects",
     style_id: str = DEFAULT_IMAGE_STYLE_ID,
+    style_reference: StyleReferenceAsset | None = None,
+    capabilities: VisualProviderCapabilities | None = None,
 ) -> list[MasterSceneAsset]:
     """Generate referenced masters in plan order before dependent visual beats."""
     required_ids = _required_master_scene_ids(plan)
@@ -68,14 +74,25 @@ async def generate_required_master_scenes(
     style_version = build_style_version(style_id)
     paths = ProjectMediaPaths(project.id, projects_root)
     assets: list[MasterSceneAsset] = []
+    style_references = _usable_style_references(
+        style_reference,
+        style_id,
+        capabilities is not None and capabilities.reference_generation,
+    )
 
     for master_scene_id in required_ids:
         definition = definitions[master_scene_id]
+        base_prompt = build_master_scene_generation_prompt(
+            definition,
+            project.global_image_style_prompt,
+        )
+        if style_references:
+            base_prompt = (
+                f"{base_prompt}\n\n"
+                f"{build_reference_role_instruction(style_references)}"
+            )
         prompt = apply_image_style_contract(
-            build_master_scene_generation_prompt(
-                definition,
-                project.global_image_style_prompt,
-            ),
+            base_prompt,
             style_id,
         )
         existing = get_master_scene_asset(session, project.id, master_scene_id)
@@ -98,12 +115,24 @@ async def generate_required_master_scenes(
                 f"Untracked master scene file already exists: {master_scene_id}"
             )
         try:
-            generated_path = await generate_image(
-                prompt,
-                output_path,
-                client,  # type: ignore[arg-type]
-                style_id=style_id,
-            )
+            if style_references:
+                generated_path = await generate_continuity_image(
+                    ContinuityGenerationRequest(
+                        operation=VisualOperation.REFERENCE_GENERATION,
+                        prompt=prompt,
+                        style_version=style_id,
+                        references=style_references,
+                    ),
+                    output_path,
+                    client,
+                )
+            else:
+                generated_path = await generate_image(
+                    prompt,
+                    output_path,
+                    client,  # type: ignore[arg-type]
+                    style_id=style_id,
+                )
             file_sha256 = await asyncio.to_thread(_sha256_file, generated_path)
             asset = create_master_scene_asset(
                 session,
@@ -116,7 +145,9 @@ async def generate_required_master_scenes(
                 provider=project.image_provider,
                 model=project.image_model,
                 seed=None,
-                reference_hashes=[],
+                reference_hashes=[
+                    reference.sha256 for reference in style_references
+                ],
             )
         except MasterSceneError:
             raise
@@ -160,14 +191,25 @@ def build_continuity_generation_request(
     capabilities: VisualProviderCapabilities,
     *,
     style_id: str = DEFAULT_IMAGE_STYLE_ID,
+    style_reference: StyleReferenceAsset | None = None,
 ) -> ContinuityGenerationRequest:
     """Use a master image when supported, otherwise inject its stable description."""
     normalized_prompt = validate_image_prompt(beat_prompt)
+    can_use_references = (
+        operation is VisualOperation.EDIT_EXISTING and capabilities.image_editing
+    ) or capabilities.reference_generation
+    style_references = _usable_style_references(
+        style_reference,
+        style_id,
+        can_use_references,
+    )
     if beat.master_scene_id is None:
+        prompt = _prompt_with_reference_roles(normalized_prompt, style_references)
         return ContinuityGenerationRequest(
             operation=operation,
-            prompt=apply_image_style_contract(normalized_prompt, style_id),
+            prompt=apply_image_style_contract(prompt, style_id),
             style_version=style_id,
+            references=style_references,
         )
 
     master = next(
@@ -185,21 +227,25 @@ def build_continuity_generation_request(
         )
     _verify_master_scene_asset_sync(asset)
 
-    can_use_image = (
-        operation is VisualOperation.EDIT_EXISTING and capabilities.image_editing
-    ) or capabilities.reference_generation
-    if can_use_image:
+    if can_use_references:
+        continuity_reference = ImageReference(
+            reference_id=master.id,
+            file_path=asset.file_path,
+            sha256=asset.file_sha256,
+            role=ImageReferenceRole.CONTENT_CONTINUITY,
+        )
+        references = (*style_references, continuity_reference)
+        prompt = _prompt_with_reference_roles(normalized_prompt, references)
         return ContinuityGenerationRequest(
             operation=operation,
             prompt=apply_image_style_contract(
-                normalized_prompt,
+                prompt,
                 asset.style_version,
             ),
             master_scene_id=master.id,
             master_image_path=asset.file_path,
             style_version=asset.style_version,
-            reference_image_paths=(asset.file_path,),
-            reference_hashes=(asset.file_sha256,),
+            references=references,
         )
 
     continuity_description = _structured_master_description(master, asset.style_version)
@@ -212,7 +258,6 @@ def build_continuity_generation_request(
         master_scene_id=master.id,
         master_image_path=asset.file_path,
         style_version=asset.style_version,
-        reference_hashes=(asset.file_sha256,),
     )
 
 
@@ -227,20 +272,20 @@ async def generate_continuity_image(
         request.style_version or DEFAULT_IMAGE_STYLE_ID,
     )
     if request.operation is VisualOperation.EDIT_EXISTING:
-        if not request.reference_image_paths or not isinstance(client, ImageEditingClient):
+        if not request.references or not isinstance(client, ImageEditingProvider):
             raise MasterSceneError("Selected image provider cannot execute master edit")
         image_url = await client.edit(
             contracted_prompt,
-            request.reference_image_paths[0],
+            request.references,
         )
-    elif request.reference_image_paths:
-        if not isinstance(client, ReferenceImageClient):
+    elif request.references:
+        if not isinstance(client, ReferenceImageProvider):
             raise MasterSceneError(
                 "Selected image provider cannot execute reference generation"
             )
         image_url = await client.generate_with_references(
             contracted_prompt,
-            request.reference_image_paths,
+            request.references,
         )
     else:
         image_url = await client.generate(contracted_prompt)
@@ -289,6 +334,28 @@ def _structured_master_description(master: MasterScene, style_version: str) -> s
             ),
         )
     )
+
+
+def _usable_style_references(
+    style_reference: StyleReferenceAsset | None,
+    style_id: str,
+    provider_accepts_references: bool,
+) -> tuple[ImageReference, ...]:
+    if style_reference is None or not provider_accepts_references:
+        return ()
+    if style_reference.style_id != style_id:
+        raise MasterSceneError("Style reference version does not match generation style")
+    verify_style_reference_asset(style_reference)
+    return (to_style_image_reference(style_reference),)
+
+
+def _prompt_with_reference_roles(
+    prompt: str,
+    references: tuple[ImageReference, ...],
+) -> str:
+    if not references:
+        return prompt
+    return f"{prompt}\n\n{build_reference_role_instruction(references)}"
 
 
 def _verify_master_scene_asset_sync(asset: MasterSceneAsset) -> None:

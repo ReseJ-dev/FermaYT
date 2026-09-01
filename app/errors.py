@@ -23,3 +23,7 @@ class MasterSceneError(RuntimeError):
 
 class StyleContractError(ValueError):
     """Raised when an image prompt attempts to override its style contract."""
+
+
+class StyleReferenceError(RuntimeError):
+    """Raised when an approved style reference cannot be registered or verified."""

@@ -6,7 +6,13 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.persistence import ApplicationSettings, MasterSceneAsset, Project, Scene
+from app.persistence import (
+    ApplicationSettings,
+    MasterSceneAsset,
+    Project,
+    Scene,
+    StyleReferenceAsset,
+)
 
 PROJECT_UPDATE_FIELDS = frozenset(
     {
@@ -207,6 +213,44 @@ def list_master_scene_assets(
         .order_by(MasterSceneAsset.master_scene_id)
     )
     return list(session.scalars(statement))
+
+
+def create_style_reference_asset(
+    session: Session,
+    *,
+    project_id: str,
+    style_id: str,
+    file_path: str,
+    file_sha256: str,
+) -> StyleReferenceAsset:
+    """Persist an explicitly approved style reference without replacement."""
+    project = get_project(session, project_id)
+    if project is None:
+        raise ValueError(f"Project not found: {project_id}")
+    if get_style_reference_asset(session, project_id, style_id) is not None:
+        raise ValueError(f"Style reference already exists: {style_id}")
+    asset = StyleReferenceAsset(
+        project=project,
+        style_id=style_id,
+        file_path=file_path,
+        file_sha256=file_sha256,
+    )
+    session.add(asset)
+    session.commit()
+    session.refresh(asset)
+    return asset
+
+
+def get_style_reference_asset(
+    session: Session,
+    project_id: str,
+    style_id: str,
+) -> StyleReferenceAsset | None:
+    statement = select(StyleReferenceAsset).where(
+        StyleReferenceAsset.project_id == project_id,
+        StyleReferenceAsset.style_id == style_id,
+    )
+    return session.scalar(statement)
 
 
 def create_scene(

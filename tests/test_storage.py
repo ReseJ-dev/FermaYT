@@ -17,6 +17,9 @@ def test_project_media_paths_create_expected_directories(
     assert paths.master_scene_path("mine", "style-v1") == (
         paths.master_scenes_dir / "mine-style-v1.png"
     )
+    assert paths.style_reference_path("rough_explainer_v1") == (
+        paths.style_references_dir / "rough_explainer_v1.png"
+    )
     assert paths.audio_path("scene-1") == paths.audio_dir / "scene-1.wav"
     assert paths.scene_video_path("scene-1") == (
         paths.scenes_dir / "scene-1.mp4"
@@ -27,6 +30,7 @@ def test_project_media_paths_create_expected_directories(
         for directory in (
             paths.images_dir,
             paths.master_scenes_dir,
+            paths.style_references_dir,
             paths.audio_dir,
             paths.scenes_dir,
             paths.uploads_dir,

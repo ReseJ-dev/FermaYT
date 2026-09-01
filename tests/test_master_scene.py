@@ -16,8 +16,10 @@ from app.generators.master_scene import (
     generate_continuity_image,
     generate_required_master_scenes,
 )
+from app.generators.style_reference import register_approved_style_reference
 from app.models.visual_plan import VisualOperation, VisualPlan
 from app.pipeline.visual_operation_engine import VisualProviderCapabilities
+from app.providers import ImageReference, ImageReferenceRole
 from app.repositories import (
     create_master_scene_asset,
     create_project,
@@ -381,7 +383,7 @@ def test_continuity_executor_passes_references_to_capable_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     class ReferenceClient:
-        received: tuple[str, tuple[str, ...]] | None = None
+        received: tuple[str, tuple[ImageReference, ...]] | None = None
 
         async def generate(self, prompt: str) -> str:
             raise AssertionError("text-only generation must not be used")
@@ -389,9 +391,9 @@ def test_continuity_executor_passes_references_to_capable_client(
         async def generate_with_references(
             self,
             prompt: str,
-            reference_image_paths: tuple[str, ...],
+            references: tuple[ImageReference, ...],
         ) -> str:
-            self.received = (prompt, reference_image_paths)
+            self.received = (prompt, references)
             return "https://example.com/frame.png"
 
     async def fake_download(url: str, output_path: str) -> str:
@@ -405,8 +407,14 @@ def test_continuity_executor_passes_references_to_capable_client(
         prompt="Same environment, new composition",
         master_scene_id="shaft_master",
         master_image_path="master.png",
-        reference_image_paths=("master.png",),
-        reference_hashes=("hash",),
+        references=(
+            ImageReference(
+                reference_id="shaft_master",
+                file_path="master.png",
+                sha256="0" * 64,
+                role=ImageReferenceRole.CONTENT_CONTINUITY,
+            ),
+        ),
     )
 
     result = asyncio.run(generate_continuity_image(request, "frame.png", client))
@@ -415,4 +423,113 @@ def test_continuity_executor_passes_references_to_capable_client(
     assert client.received is not None
     assert client.received[0].startswith("Same environment, new composition")
     assert "STYLE CONTRACT [rough_explainer_v1]" in client.received[0]
-    assert client.received[1] == ("master.png",)
+    assert tuple(reference.file_path for reference in client.received[1]) == (
+        "master.png",
+    )
+
+
+def test_style_reference_precedes_master_continuity_reference(
+    session: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(session)
+    _install_fake_generation(monkeypatch)
+    plan = _plan()
+    master_asset = asyncio.run(
+        generate_required_master_scenes(
+            session,
+            project,
+            plan,
+            client=object(),  # type: ignore[arg-type]
+            projects_root=tmp_path / "projects",
+        )
+    )[0]
+    style_source = tmp_path / "STYLE_REFERENCE.png"
+    style_source.write_bytes(b"\x89PNG\r\n\x1a\napproved-style")
+    style_asset = register_approved_style_reference(
+        session,
+        project.id,
+        style_source,
+        projects_root=tmp_path / "projects",
+    )
+
+    request = build_continuity_generation_request(
+        plan,
+        plan.visual_beats[0],
+        VisualOperation.REFERENCE_GENERATION,
+        "A new composition in the same shaft",
+        {master_asset.master_scene_id: master_asset},
+        VisualProviderCapabilities(reference_generation=True),
+        style_reference=style_asset,
+    )
+
+    assert [reference.role for reference in request.references] == [
+        ImageReferenceRole.STYLE,
+        ImageReferenceRole.CONTENT_CONTINUITY,
+    ]
+    assert request.references[0].reference_id == "rough_explainer_v1"
+    assert request.references[1].reference_id == "shaft_master"
+    assert "REFERENCE 1 [STYLE]" in request.prompt
+    assert "REFERENCE 2 [CONTENT_CONTINUITY]" in request.prompt
+
+
+def test_master_generation_attaches_approved_style_reference(
+    session: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(session)
+    style_source = tmp_path / "STYLE_REFERENCE.png"
+    style_source.write_bytes(b"\x89PNG\r\n\x1a\napproved-style")
+    style_asset = register_approved_style_reference(
+        session,
+        project.id,
+        style_source,
+        projects_root=tmp_path / "projects",
+    )
+
+    class ReferenceClient:
+        references: tuple[ImageReference, ...] = ()
+        prompt: str | None = None
+
+        async def generate(self, prompt: str) -> str:
+            raise AssertionError("text-only generation must not be used")
+
+        async def generate_with_references(
+            self,
+            prompt: str,
+            references: tuple[ImageReference, ...],
+        ) -> str:
+            self.prompt = prompt
+            self.references = references
+            return "https://example.com/master.png"
+
+    async def fake_download(url: str, output_path: str) -> str:
+        assert url == "https://example.com/master.png"
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"generated-master")
+        return output_path
+
+    monkeypatch.setattr(master_scene_module, "download_file", fake_download)
+    client = ReferenceClient()
+
+    asset = asyncio.run(
+        generate_required_master_scenes(
+            session,
+            project,
+            _plan(),
+            client,
+            projects_root=tmp_path / "projects",
+            style_reference=style_asset,
+            capabilities=VisualProviderCapabilities(reference_generation=True),
+        )
+    )[0]
+
+    assert [reference.role for reference in client.references] == [
+        ImageReferenceRole.STYLE
+    ]
+    assert client.prompt is not None
+    assert "REFERENCE 1 [STYLE]" in client.prompt
+    assert asset.reference_hashes == [style_asset.file_sha256]

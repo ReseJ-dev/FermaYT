@@ -130,6 +130,11 @@ class Project(Base):
         cascade="all, delete-orphan",
         order_by="MasterSceneAsset.master_scene_id",
     )
+    style_reference_assets: Mapped[list[StyleReferenceAsset]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="StyleReferenceAsset.style_id",
+    )
 
     @validates("story_text")
     def validate_story_text(self, key: str, value: str) -> str:
@@ -311,6 +316,40 @@ class MasterSceneAsset(Base):
     project: Mapped[Project] = relationship(back_populates="master_scene_assets")
 
 
+class StyleReferenceAsset(Base):
+    """Explicitly approved immutable style reference for a project style version."""
+
+    __tablename__ = "style_reference_assets"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "style_id",
+            name="uq_style_reference_assets_project_style",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36),
+        primary_key=True,
+        default=_generate_uuid,
+    )
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    style_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    file_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        default=_utc_now,
+        nullable=False,
+    )
+
+    project: Mapped[Project] = relationship(back_populates="style_reference_assets")
+
+
 @event.listens_for(MasterSceneAsset, "before_update")
 def _prevent_master_scene_update(
     mapper: object,
@@ -319,3 +358,13 @@ def _prevent_master_scene_update(
 ) -> None:
     del mapper, connection, target
     raise ValueError("Master scene assets are immutable")
+
+
+@event.listens_for(StyleReferenceAsset, "before_update")
+def _prevent_style_reference_update(
+    mapper: object,
+    connection: object,
+    target: StyleReferenceAsset,
+) -> None:
+    del mapper, connection, target
+    raise ValueError("Style reference assets are immutable")
