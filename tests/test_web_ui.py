@@ -239,6 +239,39 @@ def test_settings_save_preserve_and_delete_api_keys(
     assert BYTEPLUS_API_KEY not in store.values
 
 
+def test_global_provider_selection_is_visible_and_used_for_new_project(
+    web_app: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_factory, _ = web_app
+    monkeypatch.setattr(main_module, "secret_store", FakeSecretStore())
+
+    settings_page = client.get("/settings")
+    saved = client.post(
+        "/settings",
+        data={
+            "default_image_provider": "qwen",
+            "default_tts_provider": "elevenlabs",
+            "qwen_image_endpoint": "https://example.com/qwen",
+        },
+        follow_redirects=False,
+    )
+    project_id = _create_project(client)
+
+    assert "Генерация изображения" in settings_page.text
+    assert "Генерация озвучки" in settings_page.text
+    assert "BytePlus · Seedream" in settings_page.text
+    assert "ElevenLabs" in settings_page.text
+    assert saved.status_code == 303
+    with session_factory() as session:
+        project = get_project(session, project_id)
+        assert project is not None
+        assert project.image_provider == "qwen"
+        assert project.image_model == "qwen-image-3.0"
+        assert project.tts_provider == "elevenlabs"
+        assert project.tts_model == "eleven_multilingual_v2"
+
+
 def test_project_can_select_elevenlabs_and_generate_scene_audio(
     web_app: tuple,
     monkeypatch: pytest.MonkeyPatch,

@@ -4,6 +4,32 @@
   <div class="page-heading"><div><p class="eyebrow">Configuration</p><h1>Настройки провайдеров</h1><p class="lead">Секретные ключи не отображаются и не передаются браузеру.</p></div></div>
   {% if keyring_error %}<div class="flash flash-error" role="alert">{{ keyring_error }} Проверьте, что системное хранилище паролей разблокировано.</div>{% endif %}
   <form action="/settings" method="post" autocomplete="off">
+  <section class="settings-provider-section">
+    <div class="section-heading"><div><p class="eyebrow">Default providers</p><h2>Выбор нейросетей</h2><p class="lead">Нажмите на название оператора и выберите сервис. Этот выбор применяется ко всем новым проектам.</p></div></div>
+    <div class="provider-selection-grid">
+      <article class="panel provider-default-card">
+        <div class="provider-selection-heading"><span class="provider-step">01</span><div><h3>Генерация изображения</h3><p>Какая нейросеть будет создавать изображения сцен.</p></div></div>
+        <label>Оператор нейросети
+          <select name="default_image_provider" id="default-image-provider">
+            <option value="seedream" {% if application_settings.image_provider == 'seedream' %}selected{% endif %}>BytePlus · Seedream</option>
+            <option value="qwen" {% if application_settings.image_provider == 'qwen' %}selected{% endif %}>Alibaba · Qwen Image</option>
+          </select>
+        </label>
+        <label>Qwen Image endpoint<input name="qwen_image_endpoint" value="{{ application_settings.qwen_image_endpoint or '' }}" placeholder="https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/..."><small>Нужен только при выборе Alibaba Qwen Image.</small></label>
+      </article>
+      <article class="panel provider-default-card">
+        <div class="provider-selection-heading"><span class="provider-step">02</span><div><h3>Генерация озвучки</h3><p>Какая нейросеть будет озвучивать текст сцен.</p></div></div>
+        <label>Оператор нейросети
+          <select name="default_tts_provider" id="default-tts-provider">
+            <option value="qwen" {% if application_settings.tts_provider == 'qwen' %}selected{% endif %}>Alibaba · Qwen TTS</option>
+            <option value="elevenlabs" {% if application_settings.tts_provider == 'elevenlabs' %}selected{% endif %}>ElevenLabs</option>
+          </select>
+        </label>
+        <p class="provider-explanation">Для каждого проекта выбор можно изменить отдельно. Именно сохранённый в проекте оператор получает запрос при нажатии «Создать».</p>
+      </article>
+    </div>
+  </section>
+  <div class="section-heading settings-keys-heading"><div><p class="eyebrow">Credentials</p><h2>API-ключи операторов</h2></div></div>
   <div class="settings-grid">
     <section class="panel provider-card">
       <div class="provider-heading"><div class="provider-logo seedream">S</div><div><h2>BytePlus Seedream</h2><p>Генерация изображений</p></div><span class="config-status {{ 'configured' if byteplus_configured else '' }}">{{ 'Настроено' if byteplus_configured else 'Не настроено' }}</span></div>

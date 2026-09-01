@@ -32,11 +32,13 @@ from app.repositories import (
     create_scene,
     delete_project,
     delete_scene,
+    get_application_settings,
     get_project,
     get_scene,
     list_projects,
     list_scenes,
     move_scene,
+    update_application_settings,
     update_project,
     update_scene,
 )
@@ -109,11 +111,30 @@ async def create_project_route(request: Request) -> RedirectResponse:
 
     try:
         with SessionLocal() as session:
+            application_settings = get_application_settings(session)
+            default_tts_provider = application_settings.tts_provider
             project = create_project(
                 session,
                 name=name,
                 story_text=story_text,
                 scene_count=_optional_int(form.get("scene_count")),
+                image_provider=application_settings.image_provider,
+                image_model=(
+                    "qwen-image-3.0"
+                    if application_settings.image_provider == "qwen"
+                    else "seedream-5-0-260128"
+                ),
+                tts_provider=default_tts_provider,
+                tts_model=(
+                    "eleven_multilingual_v2"
+                    if default_tts_provider == "elevenlabs"
+                    else "qwen3-tts-flash"
+                ),
+                tts_voice=(
+                    "JBFqnCBsd6RMkjVDRZzb"
+                    if default_tts_provider == "elevenlabs"
+                    else "Cherry"
+                ),
             )
     except ValueError as exc:
         return _redirect("/", error=_safe_validation_message(exc))
@@ -484,6 +505,8 @@ async def settings(request: Request) -> HTMLResponse:
         ELEVENLABS_API_KEY,
         "ELEVENLABS_API_KEY",
     )
+    with SessionLocal() as session:
+        application_settings = get_application_settings(session)
     return templates.TemplateResponse(
         request=request,
         name="settings.html",
@@ -493,8 +516,10 @@ async def settings(request: Request) -> HTMLResponse:
             "dashscope_configured": dashscope_configured,
             "elevenlabs_configured": elevenlabs_configured,
             "qwen_image_endpoint_configured": bool(
-                os.getenv("QWEN_IMAGE_ENDPOINT", "").strip()
+                application_settings.qwen_image_endpoint
+                or os.getenv("QWEN_IMAGE_ENDPOINT", "").strip()
             ),
+            "application_settings": application_settings,
             "keyring_error": (
                 byteplus_store_error
                 or dashscope_store_error
@@ -510,6 +535,17 @@ async def settings(request: Request) -> HTMLResponse:
 async def update_settings(request: Request) -> RedirectResponse:
     """Save or explicitly remove API keys in the operating-system keyring."""
     form = await _read_form(request)
+    with SessionLocal() as session:
+        current_settings = get_application_settings(session)
+        form.setdefault(
+            "default_image_provider",
+            current_settings.image_provider,
+        )
+        form.setdefault("default_tts_provider", current_settings.tts_provider)
+        form.setdefault(
+            "qwen_image_endpoint",
+            current_settings.qwen_image_endpoint or "",
+        )
     try:
         _update_secret_from_form(
             form,
@@ -529,6 +565,23 @@ async def update_settings(request: Request) -> RedirectResponse:
             delete_field="delete_elevenlabs_api_key",
             secret_name=ELEVENLABS_API_KEY,
         )
+        with SessionLocal() as session:
+            update_application_settings(
+                session,
+                image_provider=_choice(
+                    form,
+                    "default_image_provider",
+                    {"seedream", "qwen"},
+                    "Нейросеть изображений",
+                ),
+                tts_provider=_choice(
+                    form,
+                    "default_tts_provider",
+                    {"qwen", "elevenlabs"},
+                    "Нейросеть озвучки",
+                ),
+                qwen_image_endpoint=form.get("qwen_image_endpoint"),
+            )
     except (SecretStoreError, ValueError) as exc:
         return _redirect("/settings", error=_safe_validation_message(exc))
     return _redirect("/settings", notice="API-ключи сохранены безопасно.")
@@ -642,7 +695,12 @@ def _image_provider_config(project: Project) -> dict[str, str]:
             "model": project.image_model or "seedream-5-0-260128",
         }
     if project.image_provider == "qwen":
-        endpoint = os.getenv("QWEN_IMAGE_ENDPOINT", "").strip()
+        with SessionLocal() as session:
+            application_settings = get_application_settings(session)
+            endpoint = (
+                application_settings.qwen_image_endpoint
+                or os.getenv("QWEN_IMAGE_ENDPOINT", "").strip()
+            )
         if not endpoint:
             raise ValueError(
                 "Для Qwen Image настройте QWEN_IMAGE_ENDPOINT."

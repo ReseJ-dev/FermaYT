@@ -27,8 +27,8 @@
         <label>История<textarea name="story_text" rows="7" required>{{ project.story_text }}</textarea></label>
         <label>Общий визуальный стиль<textarea name="global_image_style_prompt" rows="3" placeholder="Например: layered cardboard, warm colors, soft cinematic light">{{ project.global_image_style_prompt or '' }}</textarea><small>Стиль добавляется к промпту при генерации и не изменяет промпты сцен.</small></label>
 
-        <details class="settings-details">
-          <summary>Нейросети и параметры видео</summary>
+        <section class="project-provider-settings" aria-labelledby="project-providers-title">
+          <div class="section-heading provider-section-heading"><div><p class="eyebrow">AI providers</p><h2 id="project-providers-title">Нейросети проекта</h2><p class="provider-section-note">Нажмите на название оператора, выберите нейросеть и сохраните проект.</p></div></div>
           <div class="details-content">
             <div class="provider-selection-grid">
               <section class="provider-selection-card">
@@ -69,7 +69,7 @@
             <label>Масштаб изображения<select name="image_fit"><option value="cover" {% if project.image_fit == 'cover' %}selected{% endif %}>Заполнить кадр (cover)</option><option value="contain" {% if project.image_fit == 'contain' %}selected{% endif %}>Показать целиком (contain)</option></select></label>
             </div>
           </div>
-        </details>
+        </section>
       </form>
 
       <section class="scenes-section">

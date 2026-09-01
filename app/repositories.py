@@ -6,7 +6,7 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
-from app.persistence import Project, Scene
+from app.persistence import ApplicationSettings, Project, Scene
 
 PROJECT_UPDATE_FIELDS = frozenset(
     {
@@ -38,6 +38,33 @@ SCENE_UPDATE_FIELDS = frozenset(
         "duration",
     }
 )
+
+
+def get_application_settings(session: Session) -> ApplicationSettings:
+    settings = session.get(ApplicationSettings, 1)
+    if settings is None:
+        settings = ApplicationSettings(id=1)
+        session.add(settings)
+        session.commit()
+        session.refresh(settings)
+    return settings
+
+
+def update_application_settings(
+    session: Session,
+    *,
+    image_provider: str,
+    tts_provider: str,
+    qwen_image_endpoint: str | None,
+) -> ApplicationSettings:
+    settings = get_application_settings(session)
+    settings.image_provider = image_provider
+    settings.tts_provider = tts_provider
+    settings.qwen_image_endpoint = qwen_image_endpoint
+    settings.updated_at = datetime.now(UTC)
+    session.commit()
+    session.refresh(settings)
+    return settings
 
 
 def create_project(

@@ -156,6 +156,61 @@ class Project(Base):
         return value
 
 
+class ApplicationSettings(Base):
+    """Global non-secret defaults for newly created projects."""
+
+    __tablename__ = "application_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
+    image_provider: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="seedream",
+    )
+    tts_provider: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="qwen",
+    )
+    qwen_image_endpoint: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        default=None,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(),
+        default=_utc_now,
+        onupdate=_utc_now,
+        nullable=False,
+    )
+
+    @validates("image_provider")
+    def validate_image_provider(self, key: str, value: str) -> str:
+        del key
+        if value not in {"seedream", "qwen"}:
+            raise ValueError("unsupported image provider")
+        return value
+
+    @validates("tts_provider")
+    def validate_tts_provider(self, key: str, value: str) -> str:
+        del key
+        if value not in {"qwen", "elevenlabs"}:
+            raise ValueError("unsupported TTS provider")
+        return value
+
+    @validates("qwen_image_endpoint")
+    def normalize_qwen_endpoint(
+        self,
+        key: str,
+        value: str | None,
+    ) -> str | None:
+        del key
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
+
+
 class Scene(Base):
     """A scene persisted as part of a Project."""
 

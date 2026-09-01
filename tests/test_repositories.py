@@ -18,11 +18,13 @@ from app.repositories import (
     create_scene,
     delete_project,
     delete_scene,
+    get_application_settings,
     get_project,
     get_scene,
     list_projects,
     list_scenes,
     move_scene,
+    update_application_settings,
     update_project,
     update_scene,
 )
@@ -62,6 +64,26 @@ def test_create_project_with_uuid_and_defaults(session: Session) -> None:
     assert project.created_at.tzinfo is UTC
     assert project.updated_at.tzinfo is UTC
     assert project.rendered_at is None
+
+
+def test_application_provider_defaults_are_persisted(session: Session) -> None:
+    defaults = get_application_settings(session)
+
+    assert defaults.image_provider == "seedream"
+    assert defaults.tts_provider == "qwen"
+    assert defaults.qwen_image_endpoint is None
+
+    updated = update_application_settings(
+        session,
+        image_provider="qwen",
+        tts_provider="elevenlabs",
+        qwen_image_endpoint="  https://example.com/qwen  ",
+    )
+
+    assert updated.image_provider == "qwen"
+    assert updated.tts_provider == "elevenlabs"
+    assert updated.qwen_image_endpoint == "https://example.com/qwen"
+    assert get_application_settings(session).id == updated.id
 
 
 @pytest.mark.parametrize("story_text", ["", "   ", "\t\n"])
