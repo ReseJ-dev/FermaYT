@@ -6,6 +6,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode
+from uuid import uuid4
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request
@@ -22,8 +23,9 @@ from app.generators.image import (
     build_image_generation_prompt,
     generate_image,
 )
+from app.generators.style_reference import register_approved_style_reference
 from app.generators.voice import generate_voice
-from app.jobs import GenerationJobManager
+from app.jobs import GenerationJob, GenerationJobManager, GenerationJobType
 from app.media.probe import get_media_duration
 from app.persistence import Project, Scene
 from app.providers import get_image_provider, get_tts_provider
@@ -35,6 +37,8 @@ from app.repositories import (
     get_application_settings,
     get_project,
     get_scene,
+    get_style_reference_asset,
+    list_project_video_renders,
     list_projects,
     list_scenes,
     move_scene,
@@ -49,6 +53,8 @@ from app.secret_store import (
     SecretStore,
     SecretStoreError,
 )
+from app.services.pipeline_production import build_production_pipeline_dependencies
+from app.services.project_pipeline import run_project_video_pipeline
 from app.storage import ProjectMediaPaths
 
 APP_DIR = Path(__file__).resolve().parent
@@ -117,9 +123,7 @@ async def create_project_route(request: Request) -> RedirectResponse:
                 session,
                 name=name,
                 story_text=story_text,
-                global_image_style_prompt=form.get(
-                    "global_image_style_prompt"
-                ),
+                global_image_style_prompt=form.get("global_image_style_prompt"),
                 scene_count=_optional_int(form.get("scene_count")),
                 image_provider=application_settings.image_provider,
                 image_model=(
@@ -164,6 +168,15 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
             project_id,
             project.final_video_path,
         )
+        style_reference = get_style_reference_asset(
+            session, project_id, project.style_id
+        )
+        renders = list_project_video_renders(session, project_id)
+        final_render = next(
+            (item for item in reversed(renders) if item.status == "SUCCEEDED"),
+            None,
+        )
+        latest_job = await job_manager.get_latest_project_job(project_id)
         return templates.TemplateResponse(
             request=request,
             name="project.html",
@@ -172,6 +185,9 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
                 "project": project,
                 "scene_cards": scene_cards,
                 "final_video_url": final_video_url,
+                "final_render": final_render,
+                "style_reference": style_reference,
+                "latest_job": latest_job,
                 "notice": request.query_params.get("notice"),
                 "error": request.query_params.get("error"),
             },
@@ -185,60 +201,105 @@ async def update_project_route(
 ) -> RedirectResponse:
     """Update editable project settings."""
     form = await _read_form(request)
-    preset = form.get("output_preset", "vertical")
-    dimensions = {
-        "vertical": (1080, 1920),
-        "horizontal": (1920, 1080),
-        "square": (1080, 1080),
-    }.get(preset)
-    if dimensions is None:
-        return _project_redirect(project_id, error="Неизвестный формат видео.")
-
     try:
         with SessionLocal() as session:
-            project = update_project(
-                session,
-                project_id,
-                name=_required(form, "name", "Название проекта"),
-                story_text=_required(form, "story_text", "История"),
-                global_image_style_prompt=form.get(
-                    "global_image_style_prompt"
-                ),
-                scene_count=_optional_int(form.get("scene_count")),
-                image_provider=_choice(
-                    form,
-                    "image_provider",
-                    {"seedream", "qwen"},
-                    "Провайдер изображений",
-                ),
-                image_model=form.get("image_model", "").strip() or None,
-                tts_provider=_choice(
-                    form,
-                    "tts_provider",
-                    {"qwen", "elevenlabs"},
-                    "Провайдер озвучки",
-                ),
-                tts_model=form.get("tts_model", "").strip() or None,
-                tts_voice=_required(form, "tts_voice", "Голос"),
-                tts_language=_required(form, "tts_language", "Язык"),
-                width=dimensions[0],
-                height=dimensions[1],
-                fps=int(_choice(form, "fps", {"24", "30", "60"}, "FPS")),
-                image_fit=_choice(
-                    form,
-                    "image_fit",
-                    {"cover", "contain"},
-                    "Масштаб изображения",
-                ),
-            )
-            if project is None:
-                raise HTTPException(status_code=404, detail="Project not found")
+            _update_project_from_form(session, project_id, form)
     except ValueError as exc:
         return _project_redirect(
             project_id,
             error=_safe_validation_message(exc),
         )
     return _project_redirect(project_id, notice="Настройки проекта сохранены.")
+
+
+@app.post("/api/projects/{project_id}/generate-video")
+async def generate_project_video_route(
+    request: Request,
+    project_id: str,
+) -> dict[str, object]:
+    """Save settings and immediately enqueue the resumable full pipeline."""
+    active = await job_manager.get_active_project_job(project_id)
+    if active is not None:
+        return _job_payload(active)
+    form = await _read_optional_form(request)
+    with SessionLocal() as session:
+        project = get_project(session, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if form:
+            try:
+                project = _update_project_from_form(session, project_id, form)
+            except ValueError as exc:
+                raise HTTPException(
+                    status_code=422, detail=_safe_validation_message(exc)
+                ) from exc
+        try:
+            dependencies = build_production_pipeline_dependencies(
+                session,
+                project_id,
+                secret_store,
+                projects_root=PROJECTS_ROOT,
+            )
+        except (SecretStoreError, ValueError) as exc:
+            raise HTTPException(
+                status_code=422, detail=_safe_validation_message(exc)
+            ) from exc
+
+    async def operation(job_id: str) -> None:
+        await asyncio.to_thread(
+            _run_pipeline_worker,
+            job_id,
+            project_id,
+            dependencies,
+        )
+
+    job = await job_manager.enqueue(
+        project_id,
+        GenerationJobType.GENERATE_VIDEO,
+        operation,
+    )
+    return _job_payload(job)
+
+
+@app.get("/api/jobs/{job_id}")
+async def generation_job(job_id: str) -> dict[str, object]:
+    job = await job_manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _job_payload(job)
+
+
+@app.post("/api/projects/{project_id}/style-reference")
+async def upload_style_reference(request: Request, project_id: str) -> dict[str, str]:
+    """Register one approved PNG without trusting a browser filename."""
+    if request.headers.get("content-type", "").split(";", 1)[0] != "image/png":
+        raise HTTPException(status_code=415, detail="Style reference must be PNG")
+    body = await request.body()
+    if not body or len(body) > 10 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Style reference must be 1–10 MB")
+    with SessionLocal() as session:
+        project = get_project(session, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        staging = (
+            ProjectMediaPaths(project_id, PROJECTS_ROOT).uploads_dir / f"{uuid4()}.png"
+        )
+        try:
+            await asyncio.to_thread(staging.write_bytes, body)
+            asset = register_approved_style_reference(
+                session,
+                project_id,
+                staging,
+                style_id=project.style_id,
+                projects_root=PROJECTS_ROOT,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422, detail=_safe_validation_message(exc)
+            ) from exc
+        finally:
+            staging.unlink(missing_ok=True)
+    return {"status": "registered", "style_id": asset.style_id}
 
 
 @app.post("/projects/{project_id}/delete")
@@ -443,9 +504,7 @@ async def generate_scene_image_route(
         scene_prompt = scene.image_prompt
         style_prompt = project.global_image_style_prompt
 
-    output_path = str(
-        ProjectMediaPaths(project_id, PROJECTS_ROOT).image_path(scene_id)
-    )
+    output_path = str(ProjectMediaPaths(project_id, PROJECTS_ROOT).image_path(scene_id))
     try:
         final_prompt = build_image_generation_prompt(
             scene_prompt,
@@ -524,9 +583,7 @@ async def settings(request: Request) -> HTMLResponse:
             ),
             "application_settings": application_settings,
             "keyring_error": (
-                byteplus_store_error
-                or dashscope_store_error
-                or elevenlabs_store_error
+                byteplus_store_error or dashscope_store_error or elevenlabs_store_error
             ),
             "notice": request.query_params.get("notice"),
             "error": request.query_params.get("error"),
@@ -705,9 +762,7 @@ def _image_provider_config(project: Project) -> dict[str, str]:
                 or os.getenv("QWEN_IMAGE_ENDPOINT", "").strip()
             )
         if not endpoint:
-            raise ValueError(
-                "Для Qwen Image настройте QWEN_IMAGE_ENDPOINT."
-            )
+            raise ValueError("Для Qwen Image настройте QWEN_IMAGE_ENDPOINT.")
         return {
             "api_key": _configured_secret(
                 DASHSCOPE_API_KEY,
@@ -767,6 +822,127 @@ def _stored_media_url(project_id: str, stored_path: str | None) -> str | None:
         return None
     encoded_path = quote(relative_path.as_posix(), safe="/")
     return f"/media/{quote(project_id)}/{encoded_path}"
+
+
+def _update_project_from_form(
+    session: Session,
+    project_id: str,
+    form: dict[str, str],
+) -> Project:
+    dimensions = {
+        "vertical": (1080, 1920),
+        "horizontal": (1920, 1080),
+        "square": (1080, 1080),
+    }.get(form.get("output_preset", "vertical"))
+    if dimensions is None:
+        raise ValueError("Неизвестный формат видео.")
+    current = get_project(session, project_id)
+    if current is None:
+        raise HTTPException(status_code=404, detail="Project not found")
+    if "planning_provider" not in form:
+        form.setdefault("planning_provider", current.planning_provider)
+        form.setdefault("planning_model", current.planning_model)
+        form.setdefault("visual_qa_enabled", "1" if current.visual_qa_enabled else "0")
+        form.setdefault("visual_qa_provider", current.visual_qa_provider)
+        form.setdefault("visual_qa_model", current.visual_qa_model)
+        form.setdefault("style_id", current.style_id)
+    project = update_project(
+        session,
+        project_id,
+        name=_required(form, "name", "Название проекта"),
+        story_text=_required(form, "story_text", "История"),
+        global_image_style_prompt=form.get("global_image_style_prompt"),
+        scene_count=_optional_int(form.get("scene_count")),
+        planning_provider=_choice(
+            form, "planning_provider", {"dashscope"}, "Planning provider"
+        ),
+        planning_model=_required(form, "planning_model", "Planning model"),
+        visual_qa_enabled=form.get("visual_qa_enabled", "0") == "1",
+        visual_qa_provider=_choice(
+            form, "visual_qa_provider", {"dashscope"}, "Visual QA provider"
+        ),
+        visual_qa_model=_required(form, "visual_qa_model", "Visual QA model"),
+        style_id=_required(form, "style_id", "Style ID"),
+        image_provider=_choice(
+            form, "image_provider", {"seedream", "qwen"}, "Провайдер изображений"
+        ),
+        image_model=form.get("image_model", "").strip() or None,
+        tts_provider=_choice(
+            form, "tts_provider", {"qwen", "elevenlabs"}, "Провайдер озвучки"
+        ),
+        tts_model=form.get("tts_model", "").strip() or None,
+        tts_voice=_required(form, "tts_voice", "Голос"),
+        tts_language=_required(form, "tts_language", "Язык"),
+        width=dimensions[0],
+        height=dimensions[1],
+        fps=int(_choice(form, "fps", {"24", "30", "60"}, "FPS")),
+        image_fit=_choice(
+            form, "image_fit", {"cover", "contain"}, "Масштаб изображения"
+        ),
+    )
+    assert project is not None
+    return project
+
+
+def _run_pipeline_worker(job_id: str, project_id: str, dependencies: object) -> None:
+    async def runner() -> None:
+        async def progress(
+            stage: object,
+            overall: int,
+            stage_progress: int,
+            message: str,
+            current_beat: int | None,
+            total_beats: int | None,
+            failed_beat: str | None,
+        ) -> None:
+            await job_manager.update_pipeline_state(
+                job_id,
+                stage=getattr(stage, "value", str(stage)),
+                progress=overall,
+                stage_progress=stage_progress,
+                message=message,
+                current_beat=current_beat,
+                total_beats=total_beats,
+                failed_beat=failed_beat,
+            )
+
+        with SessionLocal() as session:
+            report = await run_project_video_pipeline(
+                session,
+                project_id,
+                dependencies,  # type: ignore[arg-type]
+                progress=progress,
+            )
+            await job_manager.set_pipeline_result(
+                job_id,
+                final_render_id=report.final_render_id,
+                report=report.as_dict(),
+            )
+
+    asyncio.run(runner())
+
+
+def _job_payload(job: GenerationJob) -> dict[str, object]:
+    return {
+        "id": job.id,
+        "project_id": job.project_id,
+        "type": job.type.value,
+        "status": job.status.value,
+        "progress": job.progress,
+        "stage_progress": job.stage_progress,
+        "current_stage": job.current_stage,
+        "current_beat": job.current_beat,
+        "total_beats": job.total_beats,
+        "message": job.message,
+        "error": job.error,
+        "failed_stage": job.failed_stage,
+        "failed_beat": job.failed_beat,
+        "final_render_id": job.final_render_id,
+        "report": job.report,
+        "created_at": job.created_at.isoformat(),
+        "updated_at": job.updated_at.isoformat(),
+        "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+    }
 
 
 if __name__ == "__main__":

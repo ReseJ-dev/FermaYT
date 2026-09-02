@@ -12,6 +12,7 @@ from app.database import (
     create_sqlite_engine,
     init_database,
 )
+from app.jobs import GenerationJobManager
 from app.repositories import (
     create_scene,
     get_project,
@@ -54,6 +55,11 @@ def web_app(
     projects_root.mkdir()
     monkeypatch.setattr(main_module, "SessionLocal", session_factory)
     monkeypatch.setattr(main_module, "PROJECTS_ROOT", projects_root)
+    monkeypatch.setattr(
+        main_module,
+        "job_manager",
+        GenerationJobManager(tmp_path / "jobs.db"),
+    )
     with TestClient(main_module.app) as client:
         yield client, session_factory, projects_root
     engine.dispose()
@@ -85,6 +91,9 @@ def test_dashboard_creates_and_opens_project(web_app: tuple) -> None:
     assert "Magic Book" in dashboard.text
     assert "История и стиль" in editor.text
     assert "Сцены" in editor.text
+    assert "Сгенерировать видео" in editor.text
+    assert "Visual Director" in editor.text
+    assert "Manual / Legacy tools" in editor.text
     with session_factory() as session:
         project = get_project(session, project_id)
         assert project is not None
@@ -435,9 +444,7 @@ def test_selected_image_provider_receives_scene_and_global_style(
         follow_redirects=False,
     )
 
-    expected_path = str(
-        projects_root / project_id / "images" / f"{scene_id}.png"
-    )
+    expected_path = str(projects_root / project_id / "images" / f"{scene_id}.png")
     assert response.status_code == 303
     assert provider_call == (
         "qwen",
@@ -459,3 +466,55 @@ def test_selected_image_provider_receives_scene_and_global_style(
     page = client.get(f"/projects/{project_id}")
     assert "Alibaba · Qwen Image" in page.text
     assert "Перегенерировать" in page.text
+
+
+def test_generate_video_preflight_rejects_missing_keys_without_starting_job(
+    web_app: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _, _ = web_app
+    project_id = _create_project(client)
+    monkeypatch.setattr(main_module, "secret_store", FakeSecretStore())
+    monkeypatch.delenv("DASHSCOPE_API_KEY", raising=False)
+    monkeypatch.delenv("BYTEPLUS_ARK_API_KEY", raising=False)
+
+    response = client.post(f"/api/projects/{project_id}/generate-video")
+
+    assert response.status_code == 422
+    assert "DASHSCOPE_API_KEY" in response.json()["detail"]
+
+
+def test_style_reference_upload_is_png_only_and_immutable(web_app: tuple) -> None:
+    client, session_factory, projects_root = web_app
+    project_id = _create_project(client)
+    first_png = b"\x89PNG\r\n\x1a\napproved-style"
+    another_png = b"\x89PNG\r\n\x1a\ndifferent-style"
+
+    wrong_type = client.post(
+        f"/api/projects/{project_id}/style-reference",
+        content=first_png,
+        headers={"content-type": "image/jpeg"},
+    )
+    registered = client.post(
+        f"/api/projects/{project_id}/style-reference",
+        content=first_png,
+        headers={"content-type": "image/png"},
+    )
+    replacement = client.post(
+        f"/api/projects/{project_id}/style-reference",
+        content=another_png,
+        headers={"content-type": "image/png"},
+    )
+
+    assert wrong_type.status_code == 415
+    assert registered.status_code == 200
+    assert replacement.status_code == 422
+    with session_factory() as session:
+        project = get_project(session, project_id)
+        assert project is not None
+        reference = main_module.get_style_reference_asset(
+            session, project_id, project.style_id
+        )
+        assert reference is not None
+        assert Path(reference.file_path).read_bytes() == first_png
+        assert Path(reference.file_path).is_relative_to(projects_root)

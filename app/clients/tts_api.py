@@ -7,6 +7,7 @@ from urllib.parse import quote
 import httpx
 
 from app.errors import TTSGenerationError
+from app.tts_capabilities import TTSProviderCapabilities
 
 
 class QwenTTSApiClient:
@@ -20,6 +21,7 @@ class QwenTTSApiClient:
     VOICE: ClassVar[str] = "Cherry"
     LANGUAGE_TYPE: ClassVar[str] = "Russian"
     TIMEOUT_SECONDS: ClassVar[float] = 30.0
+    capabilities: ClassVar[TTSProviderCapabilities] = TTSProviderCapabilities()
 
     def __init__(
         self,
@@ -133,6 +135,7 @@ class ElevenLabsTTSApiClient:
     MODEL_ID: ClassVar[str] = "eleven_multilingual_v2"
     OUTPUT_FORMAT: ClassVar[str] = "mp3_44100_128"
     TIMEOUT_SECONDS: ClassVar[float] = 60.0
+    capabilities: ClassVar[TTSProviderCapabilities] = TTSProviderCapabilities()
 
     def __init__(
         self,

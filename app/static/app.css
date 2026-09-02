@@ -49,6 +49,15 @@ button, input, textarea, select { font: inherit; }
 .button-small { min-height: 2rem; padding: .4rem .65rem; font-size: .75rem; }
 .button-full { width: 100%; }
 .button:disabled { cursor: not-allowed; opacity: .48; box-shadow: none; }
+.pipeline-progress { margin-top: 16px; padding: 14px; border-radius: 12px; background: #f5f7fb; }
+.pipeline-progress-head { display: flex; justify-content: space-between; gap: 12px; }
+.pipeline-progress progress { width: 100%; height: 12px; margin: 10px 0 4px; accent-color: var(--primary); }
+.pipeline-progress p { margin: 5px 0 0; font-size: .88rem; }
+.pipeline-error { color: #b42318; }
+.style-reference-control, .final-video-result { display: grid; gap: 8px; margin-top: 18px; }
+.style-reference-control small, .final-video-result small { color: var(--muted); }
+.qa-toggle { display: flex !important; flex-direction: row !important; align-items: center; gap: 8px; }
+.qa-toggle input { width: auto; }
 .icon-button { display: grid; width: 2rem; height: 2rem; padding: 0; place-items: center; border: 1px solid var(--line); border-radius: .55rem; color: #59657b; background: white; cursor: pointer; font-size: 1.15rem; }
 .icon-button:disabled { cursor: not-allowed; opacity: .35; }
 

@@ -10,6 +10,7 @@ from app.providers import (
     get_image_provider,
     get_image_provider_capabilities,
     get_tts_provider,
+    get_tts_provider_capabilities,
 )
 
 
@@ -80,6 +81,17 @@ def test_get_elevenlabs_tts_provider_with_config() -> None:
     assert isinstance(provider, TTSProvider)
     assert provider.api_key == "key"
     assert provider.voice == "voice-id"
+
+
+@pytest.mark.parametrize("provider_name", ["qwen", "elevenlabs"])
+def test_current_tts_integrations_do_not_claim_unimplemented_timestamps(
+    provider_name: str,
+) -> None:
+    capabilities = get_tts_provider_capabilities(get_tts_provider(provider_name))
+    assert capabilities.supports_word_timestamps is False
+    assert capabilities.supports_character_timestamps is False
+    assert capabilities.supports_sentence_timestamps is False
+    assert capabilities.supports_speech_marks is False
 
 
 @pytest.mark.parametrize("factory", [get_image_provider, get_tts_provider])

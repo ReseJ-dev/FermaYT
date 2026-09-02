@@ -354,6 +354,15 @@ class VisualBeatAssetExecutor:
                 "prompt": prompt,
                 "transform": transform,
                 "overlay": overlay,
+                "visual_qa_policy": {
+                    "enabled": self.qa_service is not None,
+                    "provider": self.qa_service.provider if self.qa_service else None,
+                    "model": self.qa_service.model if self.qa_service else None,
+                    "prompt_version": (
+                        self.qa_service.prompt_version if self.qa_service else None
+                    ),
+                    "max_attempts": self.max_visual_qa_attempts,
+                },
             }
         )
         existing = get_successful_beat_visual_result(

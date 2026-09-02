@@ -13,8 +13,16 @@ class VideoRenderError(RuntimeError):
     """Raised when FFmpeg cannot render video output."""
 
 
+class ProjectTimelineRenderError(VideoRenderError):
+    """Raised when a persisted ProjectTimeline cannot be rendered safely."""
+
+
 class VisualDirectorError(RuntimeError):
     """Raised when a safe, validated visual plan cannot be produced."""
+
+
+class StructuredAIProviderError(RuntimeError):
+    """Raised when a structured planning or vision provider call fails safely."""
 
 
 class ProjectVisualPlanError(RuntimeError):

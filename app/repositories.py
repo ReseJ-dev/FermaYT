@@ -14,12 +14,122 @@ from app.persistence import (
     BeatVisualResult,
     MasterSceneAsset,
     Project,
+    ProjectNarrationAlignment,
+    ProjectNarrationAsset,
+    ProjectTimeline,
+    ProjectVideoRender,
     ProjectVisualExecutionPlan,
     ProjectVisualPlan,
     Scene,
     StyleReferenceAsset,
+    VisualBeatTiming,
     VisualOperationDecisionRecord,
 )
+
+
+def get_successful_video_render(
+    session: Session,
+    render_revision: str,
+) -> ProjectVideoRender | None:
+    return session.scalar(
+        select(ProjectVideoRender)
+        .where(
+            ProjectVideoRender.render_revision == render_revision,
+            ProjectVideoRender.status == "SUCCEEDED",
+        )
+        .order_by(ProjectVideoRender.attempt.desc())
+    )
+
+
+def list_project_video_renders(
+    session: Session,
+    project_id: str,
+) -> list[ProjectVideoRender]:
+    return list(
+        session.scalars(
+            select(ProjectVideoRender)
+            .where(ProjectVideoRender.project_id == project_id)
+            .order_by(ProjectVideoRender.created_at, ProjectVideoRender.id)
+        )
+    )
+
+
+def create_pending_video_render(
+    session: Session,
+    **values: Any,
+) -> ProjectVideoRender:
+    revision = str(values["render_revision"])
+    previous_attempt = session.scalar(
+        select(func.max(ProjectVideoRender.attempt)).where(
+            ProjectVideoRender.render_revision == revision
+        )
+    )
+    record = ProjectVideoRender(
+        **values,
+        attempt=(previous_attempt or 0) + 1,
+        status="PENDING",
+    )
+    session.add(record)
+    session.commit()
+    session.refresh(record)
+    return record
+
+
+def fail_video_render(
+    session: Session,
+    record: ProjectVideoRender,
+    *,
+    safe_error: str,
+    failed_stage: str,
+    failed_entry_id: str | None = None,
+    failed_beat_id: str | None = None,
+    diagnostics: dict[str, Any] | None = None,
+) -> ProjectVideoRender:
+    record.status = "FAILED"
+    record.safe_error = safe_error
+    record.failed_stage = failed_stage
+    record.failed_entry_id = failed_entry_id
+    record.failed_beat_id = failed_beat_id
+    record.diagnostics = diagnostics
+    record.completed_at = datetime.now(UTC)
+    record.updated_at = record.completed_at
+    session.commit()
+    session.refresh(record)
+    return record
+
+
+def succeed_video_render(
+    session: Session,
+    record: ProjectVideoRender,
+    *,
+    output_path: str,
+    output_sha256: str,
+    duration: float,
+    width: int,
+    height: int,
+    fps: float,
+    diagnostics: dict[str, Any],
+) -> ProjectVideoRender:
+    now = datetime.now(UTC)
+    record.status = "SUCCEEDED"
+    record.output_path = output_path
+    record.output_sha256 = output_sha256
+    record.duration = duration
+    record.width = width
+    record.height = height
+    record.fps = fps
+    record.has_video = True
+    record.has_audio = True
+    record.safe_error = None
+    record.diagnostics = diagnostics
+    record.completed_at = now
+    record.updated_at = now
+    record.project.final_video_path = output_path
+    record.project.rendered_at = now
+    record.project.updated_at = now
+    session.commit()
+    session.refresh(record)
+    return record
 
 PROJECT_UPDATE_FIELDS = frozenset(
     {
@@ -27,6 +137,12 @@ PROJECT_UPDATE_FIELDS = frozenset(
         "story_text",
         "global_image_style_prompt",
         "scene_count",
+        "planning_provider",
+        "planning_model",
+        "visual_qa_enabled",
+        "visual_qa_provider",
+        "visual_qa_model",
+        "style_id",
         "image_provider",
         "image_model",
         "tts_provider",
@@ -87,6 +203,12 @@ def create_project(
     story_text: str,
     global_image_style_prompt: str | None = None,
     scene_count: int | None = None,
+    planning_provider: str = "dashscope",
+    planning_model: str = "qwen-plus",
+    visual_qa_enabled: bool = True,
+    visual_qa_provider: str = "dashscope",
+    visual_qa_model: str = "qwen-vl-max",
+    style_id: str = "rough_explainer_v1",
     image_provider: str = "seedream",
     image_model: str | None = None,
     tts_provider: str = "qwen",
@@ -105,6 +227,12 @@ def create_project(
         story_text=story_text,
         global_image_style_prompt=global_image_style_prompt,
         scene_count=scene_count,
+        planning_provider=planning_provider,
+        planning_model=planning_model,
+        visual_qa_enabled=visual_qa_enabled,
+        visual_qa_provider=visual_qa_provider,
+        visual_qa_model=visual_qa_model,
+        style_id=style_id,
         image_provider=image_provider,
         image_model=image_model,
         tts_provider=tts_provider,
@@ -498,6 +626,106 @@ def set_manual_visual_qa_override(
     session.commit()
     session.refresh(result)
     return result
+
+
+def get_project_narration_asset_by_revision(
+    session: Session,
+    generation_revision: str,
+) -> ProjectNarrationAsset | None:
+    return session.scalar(
+        select(ProjectNarrationAsset).where(
+            ProjectNarrationAsset.generation_revision == generation_revision
+        )
+    )
+
+
+def list_project_narration_assets(
+    session: Session,
+    project_id: str,
+) -> list[ProjectNarrationAsset]:
+    return list(
+        session.scalars(
+            select(ProjectNarrationAsset)
+            .where(ProjectNarrationAsset.project_id == project_id)
+            .order_by(ProjectNarrationAsset.created_at, ProjectNarrationAsset.id)
+        )
+    )
+
+
+def create_project_narration_asset(
+    session: Session,
+    **values: Any,
+) -> ProjectNarrationAsset:
+    asset = ProjectNarrationAsset(**values)
+    session.add(asset)
+    session.commit()
+    session.refresh(asset)
+    return asset
+
+
+def get_narration_alignment_by_revision(
+    session: Session,
+    alignment_revision: str,
+) -> ProjectNarrationAlignment | None:
+    return session.scalar(
+        select(ProjectNarrationAlignment).where(
+            ProjectNarrationAlignment.alignment_revision == alignment_revision
+        )
+    )
+
+
+def create_narration_alignment(
+    session: Session,
+    *,
+    beat_timings: list[dict[str, Any]],
+    **values: Any,
+) -> ProjectNarrationAlignment:
+    alignment = ProjectNarrationAlignment(**values)
+    alignment.beat_timings = [VisualBeatTiming(**item) for item in beat_timings]
+    session.add(alignment)
+    session.commit()
+    session.refresh(alignment)
+    return alignment
+
+
+def get_project_timeline_by_revision(
+    session: Session,
+    timeline_revision: str,
+) -> ProjectTimeline | None:
+    return session.scalar(
+        select(ProjectTimeline).where(
+            ProjectTimeline.timeline_revision == timeline_revision
+        )
+    )
+
+
+def list_project_timelines(
+    session: Session,
+    project_id: str,
+) -> list[ProjectTimeline]:
+    return list(
+        session.scalars(
+            select(ProjectTimeline)
+            .where(ProjectTimeline.project_id == project_id)
+            .order_by(ProjectTimeline.created_at, ProjectTimeline.id)
+        )
+    )
+
+
+def create_project_timeline(
+    session: Session,
+    *,
+    entries: list[dict[str, Any]],
+    **values: Any,
+) -> ProjectTimeline:
+    from app.persistence import TimelineEntry
+
+    timeline = ProjectTimeline(**values)
+    timeline.entries = [TimelineEntry(**item) for item in entries]
+    session.add(timeline)
+    session.commit()
+    session.refresh(timeline)
+    return timeline
 
 
 def mark_beat_visual_result_failed(

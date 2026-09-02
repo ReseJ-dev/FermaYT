@@ -138,3 +138,37 @@ def test_update_progress_rejects_out_of_range_value(
             await manager.update_progress(job.id, progress)
 
     asyncio.run(scenario())
+
+
+def test_pipeline_state_and_report_survive_manager_restart(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        db_path = tmp_path / "app.db"
+        manager = GenerationJobManager(db_path)
+        job = await manager.create_job("project-1", GenerationJobType.GENERATE_VIDEO)
+        await manager.update_pipeline_state(
+            job.id,
+            stage="GENERATING_VISUALS",
+            progress=42,
+            stage_progress=50,
+            message="Generating visual beat 3 of 6",
+            current_beat=3,
+            total_beats=6,
+        )
+        await manager.set_pipeline_result(
+            job.id,
+            final_render_id="render-1",
+            report={"visual_beats": 6, "final_mp4": "safe.mp4"},
+        )
+
+        restarted = GenerationJobManager(db_path)
+        stored = await restarted.get_job(job.id)
+        latest = await restarted.get_latest_project_job("project-1")
+        assert stored is not None and latest is not None
+        assert stored.current_stage == "COMPLETED"
+        assert stored.current_beat == 3
+        assert stored.total_beats == 6
+        assert stored.final_render_id == "render-1"
+        assert stored.report == {"visual_beats": 6, "final_mp4": "safe.mp4"}
+        assert latest.id == job.id
+
+    asyncio.run(scenario())

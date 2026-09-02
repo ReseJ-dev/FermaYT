@@ -97,4 +97,94 @@ document.addEventListener("DOMContentLoaded", () => {
       updateImageProviderFields(true);
     });
   }
+
+  const generateVideo = document.getElementById("generate-video");
+  const projectForm = document.getElementById("project-settings-form");
+  const progressBox = document.getElementById("pipeline-progress");
+  const progressBar = document.getElementById("pipeline-progress-bar");
+  const progressStage = document.getElementById("pipeline-stage");
+  const progressPercent = document.getElementById("pipeline-percent");
+  const progressMessage = document.getElementById("pipeline-message");
+  const progressError = document.getElementById("pipeline-error");
+  let pollingTimer = null;
+
+  const renderJob = (job) => {
+    if (progressBox) progressBox.hidden = false;
+    if (progressBar instanceof HTMLProgressElement) progressBar.value = job.progress || 0;
+    if (progressStage) progressStage.textContent = job.current_stage || job.status;
+    if (progressPercent) progressPercent.textContent = `${job.progress || 0}%`;
+    if (progressMessage) progressMessage.textContent = job.message || "";
+    if (progressError) progressError.textContent = job.error || "";
+    if (generateVideo instanceof HTMLButtonElement) {
+      generateVideo.disabled = ["queued", "running"].includes(job.status);
+      generateVideo.textContent = job.status === "failed" ? "Продолжить / повторить" : "Сгенерировать видео";
+    }
+  };
+
+  const pollJob = async (jobId) => {
+    if (!jobId) return;
+    try {
+      const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}`);
+      if (!response.ok) return;
+      const job = await response.json();
+      renderJob(job);
+      if (["completed", "failed"].includes(job.status)) {
+        window.clearInterval(pollingTimer);
+        pollingTimer = null;
+        if (job.status === "completed") window.location.reload();
+      }
+    } catch (_) {
+      // A later poll can recover from a transient local connection error.
+    }
+  };
+
+  if (generateVideo instanceof HTMLButtonElement && projectForm instanceof HTMLFormElement) {
+    const existingJob = generateVideo.dataset.jobId;
+    if (existingJob) {
+      pollJob(existingJob);
+      pollingTimer = window.setInterval(() => pollJob(existingJob), 1500);
+    }
+    generateVideo.addEventListener("click", async () => {
+      generateVideo.disabled = true;
+      if (progressError) progressError.textContent = "";
+      const body = new URLSearchParams(new FormData(projectForm));
+      const response = await fetch(`/api/projects/${generateVideo.dataset.projectId}/generate-video`, {
+        method: "POST",
+        headers: {"Content-Type": "application/x-www-form-urlencoded"},
+        body,
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        if (progressBox) progressBox.hidden = false;
+        if (progressError) progressError.textContent = payload.detail || "Не удалось запустить pipeline";
+        generateVideo.disabled = false;
+        return;
+      }
+      renderJob(payload);
+      generateVideo.dataset.jobId = payload.id;
+      if (pollingTimer) window.clearInterval(pollingTimer);
+      pollingTimer = window.setInterval(() => pollJob(payload.id), 1500);
+    });
+  }
+
+  const uploadStyle = document.getElementById("upload-style-reference");
+  const styleFile = document.getElementById("style-reference-file");
+  if (uploadStyle instanceof HTMLButtonElement && styleFile instanceof HTMLInputElement) {
+    uploadStyle.addEventListener("click", async () => {
+      const file = styleFile.files?.[0];
+      if (!file) return;
+      uploadStyle.disabled = true;
+      const response = await fetch(`/api/projects/${uploadStyle.dataset.projectId}/style-reference`, {
+        method: "POST",
+        headers: {"Content-Type": "image/png"},
+        body: file,
+      });
+      if (response.ok) window.location.reload();
+      else {
+        const payload = await response.json();
+        window.alert(payload.detail || "Не удалось сохранить style reference");
+        uploadStyle.disabled = false;
+      }
+    });
+  }
 });

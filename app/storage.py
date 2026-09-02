@@ -94,6 +94,17 @@ class ProjectMediaPaths:
             raise ValueError("invalid audio file extension")
         return self.audio_dir / f"{scene_name}{extension.lower()}"
 
+    def narration_audio_path(
+        self,
+        generation_revision: str,
+        extension: str = ".wav",
+    ) -> Path:
+        revision = _safe_component(generation_revision, "generation_revision")
+        if not _SAFE_EXTENSION.fullmatch(extension):
+            raise ValueError("invalid audio file extension")
+        self.audio_dir.mkdir(parents=True, exist_ok=True)
+        return self.audio_dir / f"narration-{revision[:20]}{extension.lower()}"
+
     def scene_video_path(self, scene_id: str) -> Path:
         scene_name = _safe_component(scene_id, "scene_id")
         return self.scenes_dir / f"{scene_name}.mp4"
@@ -106,6 +117,16 @@ class ProjectMediaPaths:
     @property
     def final_video_path(self) -> Path:
         return self.output_dir / "final.mp4"
+
+    def timeline_render_path(self, render_revision: str) -> Path:
+        revision = _safe_component(render_revision, "render_revision")
+        return self.output_dir / f"final-{revision[:20]}.mp4"
+
+    def timeline_render_cache_dir(self, render_revision: str) -> Path:
+        revision = _safe_component(render_revision, "render_revision")
+        directory = self.scenes_dir / "timeline" / revision[:20]
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory
 
 
 def _safe_component(value: str, field_name: str) -> str:

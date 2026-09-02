@@ -91,6 +91,25 @@ class Project(Base):
         default=None,
     )
 
+    planning_provider: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="dashscope"
+    )
+    planning_model: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="qwen-plus"
+    )
+    visual_qa_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True
+    )
+    visual_qa_provider: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="dashscope"
+    )
+    visual_qa_model: Mapped[str] = mapped_column(
+        String(255), nullable=False, default="qwen-vl-max"
+    )
+    style_id: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="rough_explainer_v1"
+    )
+
     image_provider: Mapped[str] = mapped_column(String(50), nullable=False)
     image_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     tts_provider: Mapped[str] = mapped_column(String(50), nullable=False)
@@ -151,6 +170,26 @@ class Project(Base):
         cascade="all, delete-orphan",
         order_by="StyleReferenceAsset.style_id",
     )
+    narration_assets: Mapped[list[ProjectNarrationAsset]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="ProjectNarrationAsset.created_at",
+    )
+    narration_alignments: Mapped[list[ProjectNarrationAlignment]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="ProjectNarrationAlignment.created_at",
+    )
+    timelines: Mapped[list[ProjectTimeline]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="ProjectTimeline.created_at",
+    )
+    video_renders: Mapped[list[ProjectVideoRender]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="ProjectVideoRender.created_at",
+    )
 
     @validates("story_text")
     def validate_story_text(self, key: str, value: str) -> str:
@@ -182,6 +221,21 @@ class Project(Base):
         if value is not None and not 1 <= value <= 50:
             raise ValueError("scene_count must be between 1 and 50")
         return value
+
+    @validates("planning_provider", "visual_qa_provider")
+    def validate_structured_provider(self, key: str, value: str) -> str:
+        del key
+        normalized = value.strip().lower()
+        if normalized != "dashscope":
+            raise ValueError("unsupported structured AI provider")
+        return normalized
+
+    @validates("planning_model", "visual_qa_model", "style_id")
+    def validate_pipeline_identifier(self, key: str, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(f"{key} must not be empty")
+        return normalized
 
 
 class ApplicationSettings(Base):
@@ -631,6 +685,273 @@ class BeatVisualQAEvaluation(Base):
     candidate: Mapped[BeatVisualResult] = relationship(
         back_populates="qa_evaluations"
     )
+
+
+class ProjectNarrationAsset(Base):
+    """One immutable successful story-level narration audio revision."""
+
+    __tablename__ = "project_narration_assets"
+    __table_args__ = (
+        UniqueConstraint(
+            "generation_revision",
+            name="uq_project_narration_assets_revision",
+        ),
+        CheckConstraint("duration > 0", name="ck_project_narration_duration"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    story_text_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    voice: Mapped[str] = mapped_column(String(100), nullable=False)
+    language: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    capability_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    audio_path: Mapped[str] = mapped_column(Text, nullable=False)
+    audio_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    duration: Mapped[float] = mapped_column(Float, nullable=False)
+    generation_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    timestamp_source: Mapped[str] = mapped_column(String(50), nullable=False)
+    timing_granularity: Mapped[str] = mapped_column(String(32), nullable=False)
+    timing_confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    timing_data: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
+    timing_warnings: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utc_now, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="narration_assets")
+    alignments: Mapped[list[ProjectNarrationAlignment]] = relationship(
+        back_populates="narration_asset"
+    )
+    timelines: Mapped[list[ProjectTimeline]] = relationship(
+        back_populates="narration_asset"
+    )
+
+
+class ProjectNarrationAlignment(Base):
+    """Runtime mapping of semantic beats onto one narration audio revision."""
+
+    __tablename__ = "project_narration_alignments"
+    __table_args__ = (
+        UniqueConstraint(
+            "alignment_revision",
+            name="uq_project_narration_alignments_revision",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    visual_plan_id: Mapped[str] = mapped_column(
+        ForeignKey("project_visual_plans.id", ondelete="CASCADE"), nullable=False
+    )
+    visual_plan_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    narration_asset_id: Mapped[str] = mapped_column(
+        ForeignKey("project_narration_assets.id", ondelete="CASCADE"), nullable=False
+    )
+    alignment_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    alignment_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    warnings: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    average_confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utc_now, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="narration_alignments")
+    narration_asset: Mapped[ProjectNarrationAsset] = relationship(
+        back_populates="alignments"
+    )
+    beat_timings: Mapped[list[VisualBeatTiming]] = relationship(
+        back_populates="alignment",
+        cascade="all, delete-orphan",
+        order_by="VisualBeatTiming.position",
+    )
+    timelines: Mapped[list[ProjectTimeline]] = relationship(
+        back_populates="alignment"
+    )
+
+
+class VisualBeatTiming(Base):
+    __tablename__ = "visual_beat_timings"
+    __table_args__ = (
+        UniqueConstraint(
+            "alignment_id", "beat_id", name="uq_visual_beat_timings_alignment_beat"
+        ),
+        UniqueConstraint(
+            "alignment_id", "position", name="uq_visual_beat_timings_alignment_position"
+        ),
+        CheckConstraint("audio_start >= 0", name="ck_visual_beat_timing_start"),
+        CheckConstraint("audio_end > audio_start", name="ck_visual_beat_timing_range"),
+        CheckConstraint(
+            "source_start_char >= 0",
+            name="ck_visual_beat_timing_source_start",
+        ),
+        CheckConstraint(
+            "source_end_char > source_start_char",
+            name="ck_visual_beat_timing_source_range",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    alignment_id: Mapped[str] = mapped_column(
+        ForeignKey("project_narration_alignments.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    beat_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    source_text: Mapped[str] = mapped_column(Text, nullable=False)
+    source_start_char: Mapped[int] = mapped_column(Integer, nullable=False)
+    source_end_char: Mapped[int] = mapped_column(Integer, nullable=False)
+    audio_start: Mapped[float] = mapped_column(Float, nullable=False)
+    audio_end: Mapped[float] = mapped_column(Float, nullable=False)
+    alignment_method: Mapped[str] = mapped_column(String(50), nullable=False)
+    alignment_confidence: Mapped[float] = mapped_column(Float, nullable=False)
+    warning: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utc_now, nullable=False
+    )
+
+    alignment: Mapped[ProjectNarrationAlignment] = relationship(
+        back_populates="beat_timings"
+    )
+
+
+class ProjectTimeline(Base):
+    """Versioned executable edit specification; it contains no rendered video."""
+
+    __tablename__ = "project_timelines"
+    __table_args__ = (
+        UniqueConstraint("timeline_revision", name="uq_project_timelines_revision"),
+        CheckConstraint("duration > 0", name="ck_project_timeline_duration"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    visual_plan_id: Mapped[str] = mapped_column(
+        ForeignKey("project_visual_plans.id", ondelete="CASCADE"), nullable=False
+    )
+    visual_plan_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    execution_plan_id: Mapped[str] = mapped_column(
+        ForeignKey("project_visual_execution_plans.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    execution_plan_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    narration_asset_id: Mapped[str] = mapped_column(
+        ForeignKey("project_narration_assets.id", ondelete="CASCADE"), nullable=False
+    )
+    alignment_id: Mapped[str] = mapped_column(
+        ForeignKey("project_narration_alignments.id", ondelete="CASCADE"), nullable=False
+    )
+    rhythm_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    timeline_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    duration: Mapped[float] = mapped_column(Float, nullable=False)
+    warnings: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utc_now, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="timelines")
+    narration_asset: Mapped[ProjectNarrationAsset] = relationship(
+        back_populates="timelines"
+    )
+    alignment: Mapped[ProjectNarrationAlignment] = relationship(
+        back_populates="timelines"
+    )
+    entries: Mapped[list[TimelineEntry]] = relationship(
+        back_populates="timeline",
+        cascade="all, delete-orphan",
+        order_by="TimelineEntry.position",
+    )
+
+
+class TimelineEntry(Base):
+    __tablename__ = "timeline_entries"
+    __table_args__ = (
+        UniqueConstraint("timeline_id", "beat_id", name="uq_timeline_entries_beat"),
+        UniqueConstraint("timeline_id", "position", name="uq_timeline_entries_position"),
+        CheckConstraint("start_time >= 0", name="ck_timeline_entry_start"),
+        CheckConstraint("end_time > start_time", name="ck_timeline_entry_range"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    timeline_id: Mapped[str] = mapped_column(
+        ForeignKey("project_timelines.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    position: Mapped[int] = mapped_column(Integer, nullable=False)
+    beat_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    beat_visual_result_id: Mapped[str | None] = mapped_column(
+        ForeignKey("beat_visual_results.id", ondelete="SET NULL"), nullable=True
+    )
+    operation: Mapped[str] = mapped_column(String(32), nullable=False)
+    asset_path: Mapped[str] = mapped_column(Text, nullable=False)
+    source_result_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    master_scene_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    start_time: Mapped[float] = mapped_column(Float, nullable=False)
+    end_time: Mapped[float] = mapped_column(Float, nullable=False)
+    transform_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    overlay_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    transition_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utc_now, nullable=False
+    )
+
+    timeline: Mapped[ProjectTimeline] = relationship(back_populates="entries")
+
+
+class ProjectVideoRender(Base):
+    """One persisted attempt to deterministically execute a ProjectTimeline."""
+
+    __tablename__ = "project_video_renders"
+    __table_args__ = (
+        UniqueConstraint(
+            "render_revision", "attempt", name="uq_project_video_render_attempt"
+        ),
+        CheckConstraint("attempt >= 1", name="ck_project_video_render_attempt"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    timeline_id: Mapped[str] = mapped_column(
+        ForeignKey("project_timelines.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    timeline_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    render_config_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    render_config_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    renderer_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    render_revision: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    output_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    output_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    duration: Mapped[float | None] = mapped_column(Float, nullable=True)
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    has_video: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    has_audio: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    safe_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    failed_entry_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    failed_beat_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    failed_stage: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    diagnostics: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utc_now, nullable=False
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utc_now, onupdate=_utc_now, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="video_renders")
 
 
 class MasterSceneAsset(Base):
