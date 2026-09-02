@@ -21,6 +21,8 @@ from app.models.visual_qa import (
     VisualQADecision,
     VisualQAProblemCategory,
     VisualQAResult,
+    VisualQAScores,
+    VisualQASeverity,
 )
 
 __all__ = [
@@ -43,4 +45,6 @@ __all__ = [
     "VisualQADecision",
     "VisualQAProblemCategory",
     "VisualQAResult",
+    "VisualQAScores",
+    "VisualQASeverity",
 ]

@@ -65,6 +65,20 @@ class ProjectMediaPaths:
         scene_name = _safe_component(scene_id, "scene_id")
         return self.images_dir / f"{scene_name}.png"
 
+    def visual_beat_path(
+        self,
+        beat_id: str,
+        generation_revision: str,
+        attempt: int,
+    ) -> Path:
+        beat_name = _safe_component(beat_id, "beat_id")
+        revision = _safe_component(generation_revision, "generation_revision")
+        if attempt < 1:
+            raise ValueError("attempt must be positive")
+        directory = self.images_dir / "visual_beats"
+        directory.mkdir(parents=True, exist_ok=True)
+        return directory / f"{beat_name}-{revision[:16]}-a{attempt}.png"
+
     def master_scene_path(self, master_scene_id: str, style_version: str) -> Path:
         master_name = _safe_component(master_scene_id, "master_scene_id")
         version = _safe_component(style_version, "style_version")

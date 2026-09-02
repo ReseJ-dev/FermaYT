@@ -151,6 +151,19 @@ def test_director_sends_complete_narration_and_returns_validated_plan() -> None:
     assert "DISTANCE FROM SAFETY" in client.prompt
     assert "REUSE STRONG IMAGES" in client.prompt
     assert "ADD INFORMATION" in client.prompt
+    assert "automated visual storytelling system" in client.prompt
+    priorities = [
+        "1. storytelling clarity",
+        "2. spatial continuity",
+        "3. visual progression",
+        "4. readability",
+        "5. consistent style",
+        "6. generation efficiency",
+        "7. image beauty",
+    ]
+    assert [client.prompt.index(priority) for priority in priorities] == sorted(
+        client.prompt.index(priority) for priority in priorities
+    )
     assert len(plan.visual_beats) == 2
     assert plan.visual_beats[1].preferred_visual_operation is VisualOperation.EDIT_EXISTING
 

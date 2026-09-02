@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -73,6 +74,17 @@ def test_regenerate_requires_actionable_correction() -> None:
         )
 
 
+def test_pass_with_warning_cannot_accept_a_hard_story_failure() -> None:
+    with pytest.raises(ValidationError, match="hard failures"):
+        VisualQADecision(
+            result="PASS_WITH_WARNING",
+            problem_categories=["MISSING_REQUIRED_OBJECT"],
+            reasons=["The only required object is absent"],
+            correction_instruction=None,
+            severity="minor",
+        )
+
+
 def test_qa_service_sends_candidate_style_and_master_in_fixed_order(
     tmp_path: Path,
 ) -> None:
@@ -110,6 +122,42 @@ def test_qa_service_sends_candidate_style_and_master_in_fixed_order(
     assert "CONTINUITY" in client.prompt
     assert "VIDEO READABILITY" in client.prompt
     assert "STYLE CONTRACT [rough_explainer_v1]" in client.prompt
+
+
+def test_qa_compares_previous_frame_for_progression(tmp_path: Path) -> None:
+    class Client:
+        prompt: str | None = None
+        paths: tuple[str, ...] = ()
+
+        async def evaluate(self, prompt: str, image_paths: tuple[str, ...]) -> str:
+            self.prompt = prompt
+            self.paths = image_paths
+            return json.dumps(
+                {
+                    "result": "PASS",
+                    "problem_categories": [],
+                    "reasons": [],
+                    "correction_instruction": None,
+                }
+            )
+
+    client = Client()
+    context = replace(
+        _context(tmp_path),
+        previous_frame_path=str(tmp_path / "previous.png"),
+        information_added_beyond_narration=(
+            "Shows that the route now stops at the blockage"
+        ),
+    )
+
+    asyncio.run(VisualQAService(client).evaluate("candidate.png", context))
+
+    assert client.paths[-1] == context.previous_frame_path
+    assert client.prompt is not None
+    assert "PREVIOUS VIDEO FRAME" in client.prompt
+    assert "CHECK VISUAL PROGRESSION" in client.prompt
+    assert "storytelling clarity, spatial continuity" in client.prompt
+    assert "Shows that the route now stops at the blockage" in client.prompt
 
 
 def test_invalid_vision_json_fails_safely(tmp_path: Path) -> None:
@@ -223,8 +271,10 @@ def test_retry_limit_keeps_best_candidate_and_records_warning(
     assert outcome.attempts == 3
     assert outcome.warning is not None
     assert "kept the best candidate" in outcome.warning
-    assert outcome.decision == decisions[1]
-    assert output.read_bytes() == b"candidate-2"
+    # A slightly rougher frame is preferable to one where the story object is too
+    # small to read. Clarity and readability outrank style polish.
+    assert outcome.decision == decisions[2]
+    assert output.read_bytes() == b"candidate-3"
 
 
 def test_missing_vision_model_generates_once_and_records_warning(

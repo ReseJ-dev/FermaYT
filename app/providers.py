@@ -7,10 +7,13 @@ from typing import Any, Protocol, runtime_checkable
 
 from app.clients.image_api import QwenImageProvider, SeedreamImageProvider
 from app.clients.tts_api import ElevenLabsTTSApiClient, QwenTTSApiClient
+from app.provider_capabilities import ImageProviderCapabilities
 
 
 @runtime_checkable
 class ImageProvider(Protocol):
+    capabilities: ImageProviderCapabilities
+
     async def generate(self, prompt: str) -> str: ...
 
 
@@ -58,6 +61,16 @@ class ImageEditingProvider(Protocol):
 @runtime_checkable
 class TTSProvider(Protocol):
     async def generate(self, text: str) -> str | bytes: ...
+
+
+def get_image_provider_capabilities(
+    provider: ImageProvider,
+) -> ImageProviderCapabilities:
+    """Discover capabilities from the concrete selected provider instance."""
+    capabilities = getattr(provider, "capabilities", None)
+    if not isinstance(capabilities, ImageProviderCapabilities):
+        raise TypeError("Image provider does not declare validated capabilities")
+    return capabilities
 
 
 def get_image_provider(

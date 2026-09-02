@@ -706,6 +706,8 @@ def test_image_prompt_builder_uses_semantics_and_never_narration() -> None:
     assert "VISUAL FOCUS:" in prompt
     assert "First notice: The blocked vertical escape route" in prompt
     assert "DO NOT SHOW:\ninjured people; a different mine layout" in prompt
+    assert "clearly advances the story" in prompt
+    assert "only decorates the narration" in prompt
     assert prompt.rstrip().endswith(
         "This contract overrides any conflicting style instruction elsewhere in the request."
     )

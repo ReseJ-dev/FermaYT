@@ -81,6 +81,7 @@ async def generate_required_master_scenes(
     capabilities: VisualProviderCapabilities | None = None,
     qa_service: VisualQAService | None = None,
     max_qa_retries: int = 2,
+    downloader: Callable[[str, str], Awaitable[str]] | None = None,
 ) -> list[MasterSceneAsset]:
     """Generate referenced masters in plan order before dependent visual beats."""
     required_ids = _required_master_scene_ids(plan)
@@ -140,6 +141,8 @@ async def generate_required_master_scenes(
                 style_references,
                 client,
                 prompts_by_candidate,
+                downloader or download_file,
+                use_direct_download=downloader is not None,
             )
 
             if qa_service is not None:
@@ -364,6 +367,8 @@ async def generate_continuity_image(
     request: ContinuityGenerationRequest,
     output_path: str,
     client: MasterSceneImageClient,
+    *,
+    downloader: Callable[[str, str], Awaitable[str]] | None = None,
 ) -> str:
     """Execute a prepared request without silently ignoring reference images."""
     contracted_prompt = apply_image_style_contract(
@@ -388,7 +393,7 @@ async def generate_continuity_image(
         )
     else:
         image_url = await client.generate(contracted_prompt)
-    return await download_file(image_url, output_path)
+    return await (downloader or download_file)(image_url, output_path)
 
 
 async def generate_continuity_image_with_qa(
@@ -505,6 +510,9 @@ def _build_master_candidate_generator(
     style_references: tuple[ImageReference, ...],
     client: MasterSceneImageClient,
     prompts_by_candidate: dict[str, str],
+    downloader: Callable[[str, str], Awaitable[str]],
+    *,
+    use_direct_download: bool,
 ) -> Callable[[str | None, str], Awaitable[str]]:
     async def generate_candidate(
         correction_instruction: str | None,
@@ -526,7 +534,13 @@ def _build_master_candidate_generator(
                 ),
                 candidate_path,
                 client,
+                downloader=downloader,
             )
+        if use_direct_download:
+            image_url = await client.generate(
+                apply_image_style_contract(candidate_prompt, style_id)
+            )
+            return await downloader(image_url, candidate_path)
         return await generate_image(
             candidate_prompt,
             candidate_path,

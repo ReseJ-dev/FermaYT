@@ -31,6 +31,7 @@ class ImagePromptBuilder:
         *,
         references: tuple[ImageReference, ...] = (),
         style_id: str = DEFAULT_IMAGE_STYLE_ID,
+        project_style_prompt: str | None = None,
     ) -> str:
         location = next(
             (item for item in plan.locations if item.id == beat.location_id),
@@ -76,6 +77,11 @@ class ImagePromptBuilder:
                 ),
             ),
         ]
+        if project_style_prompt is not None and project_style_prompt.strip():
+            sections.insert(
+                1,
+                ("PROJECT STYLE DIRECTION", project_style_prompt.strip()),
+            )
         if beat.must_not_show:
             sections.append(("DO NOT SHOW", "; ".join(beat.must_not_show)))
         sections.append(
@@ -84,7 +90,9 @@ class ImagePromptBuilder:
                 (
                     "Use only the shapes needed to understand this beat. Keep one "
                     "obvious focal action, remove unrelated background clutter, and "
-                    "preserve factual layout over decorative detail."
+                    "preserve factual layout over decorative detail. A simple frame "
+                    "that clearly advances the story is better than a beautiful "
+                    "frame that only decorates the narration."
                 ),
             )
         )
@@ -100,6 +108,80 @@ class ImagePromptBuilder:
                 "Semantic image prompt is too long; simplify the visual plan"
             )
         return apply_image_style_contract(semantic_prompt, style_id)
+
+    def build_edit(
+        self,
+        plan: VisualPlan,
+        beat: VisualBeat,
+        *,
+        references: tuple[ImageReference, ...],
+        style_id: str = DEFAULT_IMAGE_STYLE_ID,
+        project_style_prompt: str | None = None,
+    ) -> str:
+        """Build a concise state delta while protecting existing composition."""
+        if not references:
+            raise ImagePromptBuildError("Image editing requires a source reference")
+        location = next(
+            (item for item in plan.locations if item.id == beat.location_id),
+            None,
+        )
+        if location is None:
+            raise ImagePromptBuildError(f"Unknown beat location: {beat.location_id}")
+        master = next(
+            (
+                item
+                for item in plan.possible_master_scenes
+                if item.id == beat.master_scene_id
+            ),
+            None,
+        )
+        keep = [
+            f"location identity and layout: {location.spatial_layout}",
+            f"camera and framing: {beat.camera_framing.value}; {beat.camera_view}",
+        ]
+        if master is not None:
+            keep.extend(
+                (
+                    f"environment geometry: {master.environment_geometry}",
+                    f"recurring object positions: {master.recurring_object_positions}",
+                )
+            )
+        change = beat.change_from_previous_beat
+        if beat.progressive_change is not None:
+            progression = beat.progressive_change
+            change = (
+                f"{progression.subject_id}: {progression.previous_state} -> "
+                f"{progression.current_state}. {progression.progression}"
+            )
+        sections = [
+            (
+                "REFERENCE INSTRUCTIONS",
+                build_reference_role_instruction(references),
+            ),
+            ("KEEP UNCHANGED", "\n".join(f"- {item}" for item in keep)),
+            ("CHANGE ONLY", f"- {change}"),
+            (
+                "REQUIRED RESULT",
+                (
+                    f"The viewer must quickly understand: "
+                    f"{beat.what_viewer_should_understand}. "
+                    "Do not redesign the environment or add unrelated detail."
+                ),
+            ),
+        ]
+        if project_style_prompt is not None and project_style_prompt.strip():
+            sections.insert(
+                1,
+                ("PROJECT STYLE DIRECTION", project_style_prompt.strip()),
+            )
+        if beat.must_not_show:
+            sections.append(("DO NOT SHOW", "; ".join(beat.must_not_show)))
+        prompt = "EDIT THE PROVIDED SOURCE IMAGE.\n\n" + "\n\n".join(
+            f"{heading}:\n{content}" for heading, content in sections
+        )
+        if len(prompt) > self.max_semantic_characters:
+            raise ImagePromptBuildError("Semantic edit prompt is too long")
+        return apply_image_style_contract(prompt, style_id)
 
     @staticmethod
     def _reference_section(

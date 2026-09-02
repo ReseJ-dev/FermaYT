@@ -245,6 +245,41 @@ def test_new_composition_can_use_reference_identity() -> None:
     assert decision.source_visual_ids == ("beat_1",)
 
 
+def test_unsupported_reference_generation_falls_back_to_new_image() -> None:
+    decision = VisualOperationDecisionEngine().decide(
+        _plan(
+            VisualOperation.REFERENCE_GENERATION,
+            second_camera_view="Opposite side composition",
+        ),
+        1,
+        capabilities=VisualProviderCapabilities(),
+        available_visuals={"beat_1": "/media/beat-1.png"},
+    )
+
+    assert decision.operation is VisualOperation.NEW_IMAGE
+    assert decision.fallback_from is VisualOperation.REFERENCE_GENERATION
+    assert decision.source_image_paths == ()
+
+
+def test_storytelling_clarity_outweighs_avoiding_an_image_api_call() -> None:
+    decision = VisualOperationDecisionEngine().decide(
+        _plan(VisualOperation.REUSE),
+        1,
+        capabilities=VisualProviderCapabilities(reference_generation=True),
+        available_visuals={"beat_1": "/media/beat-1.png"},
+        evidence=VisualDecisionEvidence(
+            physical_state_changed=False,
+            visual_similarity=0.9,
+            substantially_different_composition=False,
+            new_image_improves_understanding=True,
+        ),
+    )
+
+    assert decision.operation is VisualOperation.REFERENCE_GENERATION
+    assert decision.requires_image_api is True
+    assert "materially clearer visual outweighs generation cost" in decision.reasons
+
+
 def test_invalid_similarity_evidence_is_rejected() -> None:
     with pytest.raises(ValueError, match="between 0 and 1"):
         VisualDecisionEvidence(visual_similarity=1.2)

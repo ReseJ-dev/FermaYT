@@ -13,16 +13,12 @@ from app.models.visual_plan import (
     VisualOperation,
     VisualPlan,
 )
+from app.provider_capabilities import ImageProviderCapabilities
 
 logger = logging.getLogger(__name__)
 
 
-@dataclass(frozen=True, slots=True)
-class VisualProviderCapabilities:
-    """Visual operations supported by the selected image provider."""
-
-    reference_generation: bool = False
-    image_editing: bool = False
+VisualProviderCapabilities = ImageProviderCapabilities
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,11 +109,10 @@ class VisualOperationDecisionEngine:
             fallback_from = selected
             selected = self._fallback(selected, context)
 
-        # Explicitly preserve the requested EDIT fallback contract even when scoring
-        # already knows that the provider cannot edit.
+        # Explicit fallback contracts take precedence over score-based guesses.
         if (
             beat.preferred_visual_operation is VisualOperation.EDIT_EXISTING
-            and not capabilities.image_editing
+            and (not capabilities.image_editing or not references)
         ):
             fallback_from = VisualOperation.EDIT_EXISTING
             selected = (
@@ -125,11 +120,19 @@ class VisualOperationDecisionEngine:
                 if capabilities.reference_generation and references
                 else VisualOperation.NEW_IMAGE
             )
+        elif (
+            beat.preferred_visual_operation
+            is VisualOperation.REFERENCE_GENERATION
+            and (not capabilities.reference_generation or not references)
+        ):
+            fallback_from = VisualOperation.REFERENCE_GENERATION
+            selected = VisualOperation.NEW_IMAGE
 
         reasons = self._decision_reasons(context, selected, fallback_from)
         source_visual_ids, source_image_paths = self._decision_references(
             selected,
             references,
+            capabilities,
         )
         decision = VisualOperationDecision(
             beat_id=beat.id,
@@ -242,8 +245,20 @@ class VisualOperationDecisionEngine:
                 "new composition with continuity requirements",
             )
         if context.new_image_improves_understanding:
-            scores[VisualOperation.NEW_IMAGE] += 1.5
-            self._reason(context, VisualOperation.NEW_IMAGE, "new image improves understanding")
+            # Clarity outranks call count. This is intentionally much larger than
+            # the small generation-cost tie-breakers below.
+            scores[VisualOperation.NEW_IMAGE] += 6
+            scores[VisualOperation.REFERENCE_GENERATION] += 6
+            scores[VisualOperation.REUSE] -= 2
+            scores[VisualOperation.TRANSFORM] -= 2
+            scores[VisualOperation.OVERLAY] -= 2
+            clarity_reason = "materially clearer visual outweighs generation cost"
+            self._reason(context, VisualOperation.NEW_IMAGE, clarity_reason)
+            self._reason(
+                context,
+                VisualOperation.REFERENCE_GENERATION,
+                clarity_reason,
+            )
 
         if context.references:
             scores[VisualOperation.REFERENCE_GENERATION] += 2.5
@@ -357,12 +372,19 @@ class VisualOperationDecisionEngine:
     def _decision_references(
         operation: VisualOperation,
         references: tuple[tuple[str, str], ...],
+        capabilities: VisualProviderCapabilities,
     ) -> tuple[tuple[str, ...], tuple[str, ...]]:
         if operation is VisualOperation.NEW_IMAGE:
             return (), ()
+        selected_references = references
+        if operation in {
+            VisualOperation.REFERENCE_GENERATION,
+            VisualOperation.EDIT_EXISTING,
+        }:
+            selected_references = references[: capabilities.max_reference_images]
         return (
-            tuple(visual_id for visual_id, _ in references),
-            tuple(path for _, path in references),
+            tuple(visual_id for visual_id, _ in selected_references),
+            tuple(path for _, path in selected_references),
         )
 
     @staticmethod
@@ -387,7 +409,22 @@ class VisualOperationDecisionEngine:
         if context.object_continuity >= 0.5:
             reasons.append("important objects remain continuous")
         if fallback_from is not None:
-            reasons.append(f"fallback from unsupported {fallback_from.value}")
+            if (
+                fallback_from is VisualOperation.EDIT_EXISTING
+                and not context.capabilities.image_editing
+            ):
+                reasons.append("provider does not support editing")
+            elif (
+                fallback_from is VisualOperation.REFERENCE_GENERATION
+                and not context.capabilities.reference_generation
+            ):
+                reasons.append("provider does not support reference generation")
+            elif not context.references:
+                reasons.append(
+                    f"no usable source visual for {fallback_from.value}"
+                )
+            else:
+                reasons.append(f"fallback from {fallback_from.value}")
         return list(dict.fromkeys(reasons)) or ["highest validated continuity score"]
 
     @staticmethod

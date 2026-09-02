@@ -8,6 +8,7 @@ from app.providers import (
     ImageProvider,
     TTSProvider,
     get_image_provider,
+    get_image_provider_capabilities,
     get_tts_provider,
 )
 
@@ -37,6 +38,25 @@ def test_get_qwen_image_provider_with_config() -> None:
 
     assert isinstance(provider, QwenImageProvider)
     assert isinstance(provider, ImageProvider)
+
+
+@pytest.mark.parametrize("provider_name", ["seedream", "qwen"])
+def test_current_image_clients_advertise_verified_reference_capabilities(
+    provider_name: str,
+) -> None:
+    provider = get_image_provider(provider_name)
+    capabilities = get_image_provider_capabilities(provider)
+
+    assert capabilities.text_to_image is True
+    assert capabilities.reference_generation is True
+    assert capabilities.multiple_references is True
+    assert capabilities.max_reference_images == {
+        "seedream": 14,
+        "qwen": 3,
+    }[provider_name]
+    assert capabilities.image_editing is True
+    assert capabilities.seed is False
+    assert capabilities.aspect_ratio is False
 
 
 def test_get_qwen_tts_provider_with_config() -> None:

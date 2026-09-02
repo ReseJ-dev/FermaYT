@@ -24,9 +24,11 @@ from app.style_contracts import DEFAULT_IMAGE_STYLE_ID, get_image_style_contract
 
 logger = logging.getLogger(__name__)
 
+VISUAL_QA_PROMPT_VERSION = "visual_qa_v1"
+
 
 class VisualQAClient(Protocol):
-    """Boundary for a future vision-capable structured-output provider."""
+    """Provider-agnostic boundary for a vision-capable structured-output model."""
 
     async def evaluate(self, prompt: str, image_paths: tuple[str, ...]) -> str: ...
 
@@ -39,9 +41,19 @@ class VisualQAContext:
     important_physical_action: str
     location_id: str
     expected_physical_state: str
+    resolved_operation: str = "NEW_IMAGE"
+    characters_visible: tuple[str, ...] = ()
+    character_definitions: tuple[str, ...] = ()
+    object_definitions: tuple[str, ...] = ()
+    camera_view: str = "unspecified"
+    change_from_previous: str = "No intentional change specified"
+    generation_prompt: str | None = None
     style_id: str = DEFAULT_IMAGE_STYLE_ID
     style_reference_path: str | None = None
     master_reference_path: str | None = None
+    previous_frame_path: str | None = None
+    source_reference_path: str | None = None
+    information_added_beyond_narration: str | None = None
 
     @classmethod
     def from_beat(
@@ -51,6 +63,7 @@ class VisualQAContext:
         style_id: str = DEFAULT_IMAGE_STYLE_ID,
         style_reference_path: str | None = None,
         master_reference_path: str | None = None,
+        previous_frame_path: str | None = None,
     ) -> VisualQAContext:
         return cls(
             visual_purpose=beat.visual_purpose,
@@ -59,9 +72,17 @@ class VisualQAContext:
             important_physical_action=beat.change_from_previous_beat,
             location_id=beat.location_id,
             expected_physical_state=beat.physical_state,
+            resolved_operation=beat.preferred_visual_operation.value,
+            characters_visible=tuple(beat.characters_visible),
+            camera_view=beat.camera_view,
+            change_from_previous=beat.change_from_previous_beat,
             style_id=style_id,
             style_reference_path=style_reference_path,
             master_reference_path=master_reference_path,
+            previous_frame_path=previous_frame_path,
+            information_added_beyond_narration=(
+                beat.information_added_beyond_narration
+            ),
         )
 
 
@@ -81,8 +102,18 @@ class _Candidate:
 
 
 class VisualQAService:
-    def __init__(self, client: VisualQAClient) -> None:
+    def __init__(
+        self,
+        client: VisualQAClient,
+        *,
+        provider: str | None = None,
+        model: str | None = None,
+        prompt_version: str = VISUAL_QA_PROMPT_VERSION,
+    ) -> None:
         self._client = client
+        self.provider = provider or str(getattr(client, "provider", "unknown"))
+        self.model = model or getattr(client, "model", None)
+        self.prompt_version = prompt_version
 
     async def evaluate(
         self,
@@ -94,6 +125,13 @@ class VisualQAService:
             paths.append(context.style_reference_path)
         if context.master_reference_path is not None:
             paths.append(context.master_reference_path)
+        if context.previous_frame_path is not None:
+            paths.append(context.previous_frame_path)
+        if (
+            context.source_reference_path is not None
+            and context.source_reference_path not in paths
+        ):
+            paths.append(context.source_reference_path)
         prompt = build_visual_qa_request(context)
         try:
             raw_result = await self._client.evaluate(prompt, tuple(paths))
@@ -171,7 +209,10 @@ async def generate_with_visual_qa(
         )
         candidate = _Candidate(generated_path, decision)
         candidates.append(candidate)
-        if decision.result is VisualQAResult.PASS:
+        if decision.result in {
+            VisualQAResult.PASS,
+            VisualQAResult.PASS_WITH_WARNING,
+        }:
             await _copy_candidate(generated_path, output_path)
             return VisualQAOutcome(
                 output_path,
@@ -203,10 +244,40 @@ def build_visual_qa_request(context: VisualQAContext) -> str:
         image_roles.append(
             f"IMAGE {next_image} is the immutable MASTER SCENE; compare layout and continuity."
         )
+        next_image += 1
+    if context.previous_frame_path is not None:
+        previous_role = (
+            "PREVIOUS VIDEO FRAME AND EDIT SOURCE"
+            if context.resolved_operation == "EDIT_EXISTING"
+            else "PREVIOUS VIDEO FRAME"
+        )
+        image_roles.append(
+            f"IMAGE {next_image} is the {previous_role}; compare meaningful "
+            "progression and reject arbitrary visual switching or redundant decoration."
+        )
+        next_image += 1
+    if (
+        context.source_reference_path is not None
+        and context.source_reference_path
+        not in {context.master_reference_path, context.previous_frame_path}
+    ):
+        image_roles.append(
+            f"IMAGE {next_image} is the EDIT SOURCE; verify that KEEP elements "
+            "remain unchanged and only the intentional state change was applied."
+        )
+    information_added = (
+        context.information_added_beyond_narration
+        or "The frame must add useful spatial, causal, scale, route, or state information."
+    )
     return f"""Judge the candidate as a VIDEO FRAME, not standalone artwork.
 
 Main question: will this frame communicate the required story information clearly
 within a few seconds?
+
+Apply this priority order: storytelling clarity, spatial continuity, visual
+progression, readability, consistent style, generation efficiency, image beauty.
+A beautiful decorative image must not PASS when it is less clear, breaks continuity,
+or fails to advance the finished sequence.
 
 IMAGE ROLES:
 {chr(10).join(image_roles)}
@@ -218,6 +289,14 @@ REQUIRED STORY INFORMATION:
 - important physical action: {context.important_physical_action}
 - location: {context.location_id}
 - expected physical state: {context.expected_physical_state}
+- intentional change from previous beat: {context.change_from_previous}
+- resolved visual operation: {context.resolved_operation}
+- visible characters: {', '.join(context.characters_visible) or 'none'}
+- character continuity definitions: {', '.join(context.character_definitions) or 'none'}
+- object continuity definitions: {', '.join(context.object_definitions) or 'none'}
+- camera / composition: {context.camera_view}
+- provider-ready generation prompt: {context.generation_prompt or 'not supplied'}
+- information added beyond narration: {information_added}
 
 CHECK STORY ACCURACY: required objects, visible physical action, and intended purpose.
 CHECK CONTINUITY: master location, recurring characters and objects; reject environment
@@ -225,16 +304,65 @@ redesign. CHECK STYLE: reject realism, excess detail, polish, cinematic treatmen
 childishness, and unwanted textures. CHECK COMPOSITION: action prominence, clutter,
 scale of important objects, and overcrowding. CHECK VIDEO READABILITY: rapid
 understanding, needed simplification, and whether crop/framing should change.
+CHECK VISUAL PROGRESSION: compared with the previous frame when supplied, confirm
+that the beat advances state, understanding, framing, or route information without
+an arbitrary location switch or needless repetition.
+CHECK OPERATION CORRECTNESS: for EDIT_EXISTING preserve the source camera, location
+geometry, fixed objects and all KEEP constraints; apply only the explicitly intended
+change. Do not label an intentional story change as continuity drift.
+
+VIDEO READABILITY TEST: if this image appears for approximately 3-5 seconds, can the
+viewer understand the intended visual information in about 2 seconds?
 
 PERMANENT STYLE CONTRACT:
 {style_contract}
 
-Return PASS only when no correction is needed. Otherwise return REGENERATE with
-problem_categories, concrete reasons, and one actionable correction_instruction that
-preserves correct elements and continuity. Return exactly one JSON object matching
+The intended style is deliberately simple, rough, flat and slightly imperfect. Do not
+reject crude geometry, uneven lines, simplified anatomy or mildly imperfect perspective.
+Reject meaningful realism, polish, detail drift, clutter, or loss of readability.
+
+Return PASS only when no correction is needed. PASS_WITH_WARNING is allowed only for
+a usable frame with a minor non-blocking defect. Otherwise return REGENERATE with
+five dimension scores, stable problem_categories, concrete reasons, severity, and one
+actionable correction_instruction that preserves all correct semantic requirements.
+Return exactly one JSON object matching
 this schema, with no markdown or commentary:
 {schema}
 """
+
+
+_HARD_FAILURE_CATEGORIES = {
+    VisualQAProblemCategory.MISSING_REQUIRED_OBJECT,
+    VisualQAProblemCategory.WRONG_PHYSICAL_STATE,
+    VisualQAProblemCategory.WRONG_CHARACTER,
+    VisualQAProblemCategory.LOCATION_DRIFT,
+    VisualQAProblemCategory.STORY_ACCURACY,
+    VisualQAProblemCategory.CONTINUITY,
+    VisualQAProblemCategory.STYLE_DRIFT_REALISM,
+    VisualQAProblemCategory.EDIT_CHANGED_TOO_MUCH,
+    VisualQAProblemCategory.COMPOSITION_UNCLEAR,
+    VisualQAProblemCategory.VIDEO_READABILITY,
+}
+
+
+def is_hard_qa_failure(decision: VisualQADecision) -> bool:
+    """Conservatively prevent a seriously wrong frame from becoming lineage."""
+    if decision.severity is not None and decision.severity.value == "critical":
+        return True
+    return bool(set(decision.problem_categories) & _HARD_FAILURE_CATEGORIES)
+
+
+def qa_candidate_penalty(decision: VisualQADecision) -> float:
+    """Rank imperfect candidates by video usefulness, not image beauty."""
+    scores = decision.scores
+    weighted_loss = (
+        (1 - scores.story_clarity) * 5
+        + (1 - scores.continuity) * 5
+        + (1 - scores.composition) * 4
+        + (1 - scores.operation_correctness) * 4
+        + (1 - scores.style) * 2
+    )
+    return weighted_loss + len(decision.problem_categories) * 0.1
 
 
 def apply_visual_qa_correction(
@@ -268,6 +396,10 @@ async def _finish_best(
     warning: str,
 ) -> VisualQAOutcome:
     best = min(candidates, key=lambda candidate: _candidate_penalty(candidate.decision))
+    if is_hard_qa_failure(best.decision):
+        raise VisualQAError(
+            "Visual QA retries ended without a usable candidate"
+        )
     await _copy_candidate(best.path, output_path)
     return VisualQAOutcome(
         output_path,
@@ -280,11 +412,12 @@ async def _finish_best(
 
 def _candidate_penalty(decision: VisualQADecision) -> int:
     category_weights = {
-        VisualQAProblemCategory.STORY_ACCURACY: 5,
-        VisualQAProblemCategory.CONTINUITY: 5,
-        VisualQAProblemCategory.STYLE_DRIFT: 4,
-        VisualQAProblemCategory.COMPOSITION: 2,
-        VisualQAProblemCategory.VIDEO_READABILITY: 3,
+        VisualQAProblemCategory.STORY_ACCURACY: 8,
+        VisualQAProblemCategory.CONTINUITY: 7,
+        VisualQAProblemCategory.VISUAL_PROGRESSION: 6,
+        VisualQAProblemCategory.VIDEO_READABILITY: 5,
+        VisualQAProblemCategory.COMPOSITION: 4,
+        VisualQAProblemCategory.STYLE_DRIFT: 3,
     }
     return sum(category_weights[category] for category in decision.problem_categories)
 

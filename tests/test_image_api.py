@@ -12,7 +12,7 @@ from app.clients.image_api import (
     ImageGenerationError,
     QwenImageApiClient,
 )
-
+from app.providers import ImageReference, ImageReferenceRole
 
 ResponseHandler = Callable[[httpx.Request], httpx.Response]
 
@@ -106,6 +106,45 @@ def test_seedream_uses_explicit_constructor_config(
     result = asyncio.run(client.generate("A mountain"))
 
     assert result == "https://example.com/image.png"
+
+
+def test_seedream_generate_with_references_sends_image_inputs(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        assert payload["image"] == [
+            "https://example.com/style.png",
+            "https://example.com/master.png",
+        ]
+        assert payload["sequential_image_generation"] == "disabled"
+        return httpx.Response(
+            200,
+            json={"data": [{"url": "https://example.com/result.png"}]},
+        )
+
+    monkeypatch.setenv("BYTEPLUS_ARK_API_KEY", "secret-key")
+    install_mock_transport(monkeypatch, handler)
+    references = (
+        ImageReference(
+            reference_id="style",
+            file_path="https://example.com/style.png",
+            sha256="a" * 64,
+            role=ImageReferenceRole.STYLE,
+        ),
+        ImageReference(
+            reference_id="master",
+            file_path="https://example.com/master.png",
+            sha256="b" * 64,
+            role=ImageReferenceRole.CONTENT_CONTINUITY,
+        ),
+    )
+
+    result = asyncio.run(
+        BytePlusImageApiClient().generate_with_references("Same mine", references)
+    )
+
+    assert result == "https://example.com/result.png"
 
 
 @pytest.mark.parametrize("prompt", ["", "   "])
@@ -290,6 +329,51 @@ def test_qwen_uses_explicit_constructor_config(
     result = asyncio.run(client.generate("A mountain"))
 
     assert result == "https://example.com/qwen.png"
+
+
+def test_qwen_edit_sends_images_before_instruction(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        payload = json.loads(request.content)
+        content = payload["input"]["messages"][0]["content"]
+        assert content == [
+            {"image": "https://example.com/master.png"},
+            {"text": "Raise the water in the same cave"},
+        ]
+        return httpx.Response(
+            200,
+            json={
+                "output": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": [
+                                    {"image": "https://example.com/edited.png"}
+                                ]
+                            }
+                        }
+                    ]
+                }
+            },
+        )
+
+    configure_qwen(monkeypatch, handler)
+    reference = ImageReference(
+        reference_id="master",
+        file_path="https://example.com/master.png",
+        sha256="c" * 64,
+        role=ImageReferenceRole.CONTENT_CONTINUITY,
+    )
+
+    result = asyncio.run(
+        QwenImageApiClient().edit(
+            "Raise the water in the same cave",
+            (reference,),
+        )
+    )
+
+    assert result == "https://example.com/edited.png"
 
 
 @pytest.mark.parametrize("prompt", ["", "   "])

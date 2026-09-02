@@ -6,12 +6,19 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
+from app.models.beat_visual import ManualVisualQAOverride
+from app.models.visual_qa import VisualQADecision, VisualQAResult
 from app.persistence import (
     ApplicationSettings,
+    BeatVisualQAEvaluation,
+    BeatVisualResult,
     MasterSceneAsset,
     Project,
+    ProjectVisualExecutionPlan,
+    ProjectVisualPlan,
     Scene,
     StyleReferenceAsset,
+    VisualOperationDecisionRecord,
 )
 
 PROJECT_UPDATE_FIELDS = frozenset(
@@ -150,6 +157,362 @@ def delete_project(session: Session, project_id: str) -> bool:
     session.delete(project)
     session.commit()
     return True
+
+
+def get_project_visual_plan_record(
+    session: Session,
+    project_id: str,
+) -> ProjectVisualPlan | None:
+    """Load the current persisted visual-plan record for a Project."""
+    statement = select(ProjectVisualPlan).where(
+        ProjectVisualPlan.project_id == project_id
+    )
+    return session.scalar(statement)
+
+
+def save_project_visual_plan_record(
+    session: Session,
+    *,
+    project_id: str,
+    schema_version: str,
+    visual_director_version: str,
+    story_text_hash: str,
+    plan_json: dict[str, Any],
+) -> ProjectVisualPlan:
+    """Atomically create or replace a Project's validated visual plan."""
+    project = get_project(session, project_id)
+    if project is None:
+        raise ValueError(f"Project not found: {project_id}")
+
+    record = get_project_visual_plan_record(session, project_id)
+    if record is None:
+        record = ProjectVisualPlan(
+            project=project,
+            schema_version=schema_version,
+            visual_director_version=visual_director_version,
+            story_text_hash=story_text_hash,
+            plan_json=plan_json,
+        )
+        session.add(record)
+    else:
+        record.schema_version = schema_version
+        record.visual_director_version = visual_director_version
+        record.story_text_hash = story_text_hash
+        record.plan_json = plan_json
+        record.updated_at = datetime.now(UTC)
+
+    try:
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    session.refresh(record)
+    return record
+
+
+def get_visual_execution_plan_by_revision(
+    session: Session,
+    resolution_revision: str,
+) -> ProjectVisualExecutionPlan | None:
+    statement = select(ProjectVisualExecutionPlan).where(
+        ProjectVisualExecutionPlan.resolution_revision == resolution_revision
+    )
+    return session.scalar(statement)
+
+
+def get_visual_execution_plan(
+    session: Session,
+    execution_plan_id: str,
+) -> ProjectVisualExecutionPlan | None:
+    return session.get(ProjectVisualExecutionPlan, execution_plan_id)
+
+
+def get_visual_operation_decision(
+    session: Session,
+    execution_plan_id: str,
+    beat_id: str,
+) -> VisualOperationDecisionRecord | None:
+    statement = select(VisualOperationDecisionRecord).where(
+        VisualOperationDecisionRecord.execution_plan_id == execution_plan_id,
+        VisualOperationDecisionRecord.beat_id == beat_id,
+    )
+    return session.scalar(statement)
+
+
+def list_project_visual_execution_plans(
+    session: Session,
+    project_id: str,
+) -> list[ProjectVisualExecutionPlan]:
+    statement = (
+        select(ProjectVisualExecutionPlan)
+        .where(ProjectVisualExecutionPlan.project_id == project_id)
+        .order_by(ProjectVisualExecutionPlan.created_at, ProjectVisualExecutionPlan.id)
+    )
+    return list(session.scalars(statement))
+
+
+def save_visual_execution_plan(
+    session: Session,
+    *,
+    project_id: str,
+    visual_plan: ProjectVisualPlan,
+    visual_plan_revision: str,
+    provider: str,
+    model: str | None,
+    capability_snapshot: dict[str, Any],
+    decision_input_snapshot: dict[str, Any],
+    resolution_revision: str,
+    decisions: list[dict[str, Any]],
+) -> ProjectVisualExecutionPlan:
+    """Atomically persist a complete provider-specific resolution."""
+    existing = get_visual_execution_plan_by_revision(session, resolution_revision)
+    if existing is not None:
+        return existing
+
+    record = ProjectVisualExecutionPlan(
+        project_id=project_id,
+        visual_plan=visual_plan,
+        visual_plan_schema_version=visual_plan.schema_version,
+        visual_plan_revision=visual_plan_revision,
+        provider=provider,
+        model=model,
+        capability_snapshot=capability_snapshot,
+        decision_input_snapshot=decision_input_snapshot,
+        resolution_revision=resolution_revision,
+    )
+    record.decisions = [
+        VisualOperationDecisionRecord(**decision) for decision in decisions
+    ]
+    session.add(record)
+    try:
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    session.refresh(record)
+    return record
+
+
+def list_beat_visual_results(
+    session: Session,
+    project_id: str,
+    *,
+    execution_plan_id: str | None = None,
+    beat_id: str | None = None,
+    accepted_only: bool = False,
+) -> list[BeatVisualResult]:
+    statement = select(BeatVisualResult).where(
+        BeatVisualResult.project_id == project_id
+    )
+    if execution_plan_id is not None:
+        statement = statement.where(
+            BeatVisualResult.execution_plan_id == execution_plan_id
+        )
+    if beat_id is not None:
+        statement = statement.where(BeatVisualResult.beat_id == beat_id)
+    if accepted_only:
+        statement = statement.where(BeatVisualResult.is_accepted.is_(True))
+    statement = statement.order_by(
+        BeatVisualResult.created_at,
+        BeatVisualResult.id,
+    )
+    return list(session.scalars(statement))
+
+
+def get_beat_visual_result(
+    session: Session,
+    result_id: str,
+) -> BeatVisualResult | None:
+    return session.get(BeatVisualResult, result_id)
+
+
+def get_successful_beat_visual_result(
+    session: Session,
+    *,
+    execution_plan_id: str,
+    beat_id: str,
+    generation_revision: str,
+) -> BeatVisualResult | None:
+    statement = (
+        select(BeatVisualResult)
+        .where(
+            BeatVisualResult.execution_plan_id == execution_plan_id,
+            BeatVisualResult.beat_id == beat_id,
+            BeatVisualResult.generation_revision == generation_revision,
+            BeatVisualResult.generation_status == "SUCCEEDED",
+            BeatVisualResult.is_accepted.is_(True),
+        )
+        .order_by(BeatVisualResult.attempt.desc())
+    )
+    return session.scalar(statement)
+
+
+def next_beat_visual_attempt(
+    session: Session,
+    *,
+    execution_plan_id: str,
+    beat_id: str,
+    generation_revision: str,
+) -> int:
+    last_attempt = session.scalar(
+        select(func.max(BeatVisualResult.attempt)).where(
+            BeatVisualResult.execution_plan_id == execution_plan_id,
+            BeatVisualResult.beat_id == beat_id,
+            BeatVisualResult.generation_revision == generation_revision,
+        )
+    )
+    return 1 if last_attempt is None else last_attempt + 1
+
+
+def create_beat_visual_result(
+    session: Session,
+    **values: Any,
+) -> BeatVisualResult:
+    result = BeatVisualResult(**values)
+    session.add(result)
+    session.commit()
+    session.refresh(result)
+    return result
+
+
+def mark_beat_visual_result_succeeded(
+    session: Session,
+    result: BeatVisualResult,
+    *,
+    output_path: str,
+    file_sha256: str,
+    accept: bool = True,
+) -> BeatVisualResult:
+    result.output_path = output_path
+    result.file_sha256 = file_sha256
+    result.generation_status = "SUCCEEDED"
+    result.is_accepted = accept
+    result.accepted_at = datetime.now(UTC) if accept else None
+    result.error = None
+    result.updated_at = datetime.now(UTC)
+    session.commit()
+    session.refresh(result)
+    return result
+
+
+def get_beat_visual_qa_evaluation_by_revision(
+    session: Session,
+    qa_revision: str,
+) -> BeatVisualQAEvaluation | None:
+    return session.scalar(
+        select(BeatVisualQAEvaluation)
+        .where(BeatVisualQAEvaluation.qa_revision == qa_revision)
+        .order_by(BeatVisualQAEvaluation.created_at)
+    )
+
+
+def create_beat_visual_qa_evaluation(
+    session: Session,
+    candidate: BeatVisualResult,
+    *,
+    qa_revision: str,
+    prompt_version: str,
+    provider: str,
+    model: str | None,
+    qa_attempt: int,
+    decision: VisualQADecision,
+) -> BeatVisualQAEvaluation:
+    evaluation = BeatVisualQAEvaluation(
+        candidate=candidate,
+        qa_revision=qa_revision,
+        prompt_version=prompt_version,
+        provider=provider,
+        model=model,
+        qa_attempt=qa_attempt,
+        result=decision.result.value,
+        scores=decision.scores.model_dump(mode="json"),
+        problem_categories=[item.value for item in decision.problem_categories],
+        reasons=list(decision.reasons),
+        correction_instruction=decision.correction_instruction,
+        severity=decision.severity.value if decision.severity is not None else None,
+        decision_snapshot=decision.model_dump(mode="json"),
+    )
+    session.add(evaluation)
+    session.commit()
+    session.refresh(evaluation)
+    return evaluation
+
+
+def apply_automated_visual_qa_decision(
+    session: Session,
+    result: BeatVisualResult,
+    decision: VisualQADecision,
+    *,
+    qa_revision: str,
+    prompt_version: str,
+    provider: str,
+    model: str | None,
+    qa_attempt: int,
+    warning: str | None = None,
+) -> BeatVisualResult:
+    accepted = decision.result in {
+        VisualQAResult.PASS,
+        VisualQAResult.PASS_WITH_WARNING,
+    }
+    result.qa_status = decision.result.value
+    result.qa_result = decision.result.value
+    result.qa_scores = decision.scores.model_dump(mode="json")
+    result.qa_problem_categories = [
+        item.value for item in decision.problem_categories
+    ]
+    result.qa_reasons = list(decision.reasons)
+    result.qa_correction_instruction = decision.correction_instruction
+    result.qa_provider = provider
+    result.qa_model = model
+    result.qa_attempt = qa_attempt
+    result.qa_revision = qa_revision
+    result.qa_prompt_version = prompt_version
+    result.qa_warning = warning
+    result.is_accepted = accepted
+    result.accepted_at = datetime.now(UTC) if accepted else None
+    result.error = None
+    result.updated_at = datetime.now(UTC)
+    session.commit()
+    session.refresh(result)
+    return result
+
+
+def set_manual_visual_qa_override(
+    session: Session,
+    result: BeatVisualResult,
+    override: ManualVisualQAOverride,
+    *,
+    reason: str,
+) -> BeatVisualResult:
+    normalized_reason = reason.strip()
+    if not normalized_reason:
+        raise ValueError("manual QA override reason must not be empty")
+    if result.generation_status != "SUCCEEDED":
+        raise ValueError("only a generated candidate can receive a QA override")
+    result.manual_qa_override = override.value
+    result.manual_qa_reason = normalized_reason
+    result.manual_qa_at = datetime.now(UTC)
+    result.is_accepted = override is ManualVisualQAOverride.ACCEPTED
+    result.accepted_at = datetime.now(UTC) if result.is_accepted else None
+    result.updated_at = datetime.now(UTC)
+    session.commit()
+    session.refresh(result)
+    return result
+
+
+def mark_beat_visual_result_failed(
+    session: Session,
+    result: BeatVisualResult,
+    *,
+    error: str,
+) -> BeatVisualResult:
+    result.generation_status = "FAILED"
+    result.is_accepted = False
+    result.error = error
+    result.updated_at = datetime.now(UTC)
+    session.commit()
+    session.refresh(result)
+    return result
 
 
 def create_master_scene_asset(
