@@ -54,6 +54,7 @@ from app.pipeline.visual_qa import (
     qa_candidate_penalty,
 )
 from app.provider_capabilities import ImageProviderCapabilities
+from app.provider_diagnostics import diagnostic_from_exception
 from app.providers import (
     ImageProvider,
     get_image_provider,
@@ -478,19 +479,34 @@ class VisualBeatAssetExecutor:
                     output_path = planned_output_path
                     file_sha256 = source.sha256
             except Exception as exc:
-                safe_error = _safe_error(exc)
-                mark_beat_visual_result_failed(self.session, result, error=safe_error)
-                logger.warning(
-                    "Visual beat asset execution failed",
-                    extra={
-                        "project_id": context.project.id,
-                        "beat_id": beat.id,
-                        "attempt": attempt,
-                        "error_type": type(exc).__name__,
-                    },
+                summary = f"Failed to execute visual beat {beat.id}"
+                provider_operation = (
+                    "edit"
+                    if operation is VisualOperation.EDIT_EXISTING
+                    else "reference"
+                    if references
+                    else "generate"
                 )
+                diagnostic = diagnostic_from_exception(
+                    exc,
+                    provider=context.execution_plan.provider,
+                    model=context.execution_plan.model,
+                    operation=provider_operation,
+                    request_stage="visual_beat_generation",
+                ).with_context(
+                    request_stage="visual_beat_generation",
+                    beat_id=beat.id,
+                )
+                mark_beat_visual_result_failed(
+                    self.session,
+                    result,
+                    error=_safe_error(exc),
+                )
+                logger.error("%s", diagnostic.format(summary))
                 raise BeatVisualExecutionError(
-                    f"Failed to execute visual beat {beat.id}: {safe_error}"
+                    f"{summary}: {_safe_error(exc)}",
+                    diagnostic=diagnostic,
+                    user_summary=summary,
                 ) from exc
 
             result = mark_beat_visual_result_succeeded(

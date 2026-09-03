@@ -1,5 +1,6 @@
 """Integration tests for the local project and scene web interface."""
 
+import asyncio
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -12,7 +13,9 @@ from app.database import (
     create_sqlite_engine,
     init_database,
 )
-from app.jobs import GenerationJobManager
+from app.errors import MasterSceneError
+from app.jobs import GenerationJobManager, GenerationJobType
+from app.provider_diagnostics import ImageProviderDiagnostic
 from app.repositories import (
     create_scene,
     get_project,
@@ -77,6 +80,50 @@ def _create_project(client: TestClient) -> str:
     )
     assert response.status_code == 303
     return response.headers["location"].rsplit("/", 1)[-1]
+
+
+def test_job_api_exposes_safe_provider_diagnostic_without_changing_summary(
+    web_app: tuple,
+) -> None:
+    client, _, _ = web_app
+
+    async def scenario() -> str:
+        diagnostic = ImageProviderDiagnostic(
+            provider="seedream",
+            model="seedream-5-0-260128",
+            operation="edit",
+            error_type="timeout",
+            request_stage="visual_beat_generation",
+            provider_error="Request timed out",
+            beat_id="beat_7",
+        )
+
+        async def operation(job_id: str) -> None:
+            del job_id
+            raise MasterSceneError(
+                "Failed to execute visual beat beat_7",
+                diagnostic=diagnostic,
+            )
+
+        job = await main_module.job_manager.enqueue(
+            "project-1",
+            GenerationJobType.GENERATE_VIDEO,
+            operation,
+        )
+        await main_module.job_manager.wait(job.id)
+        return job.id
+
+    job_id = asyncio.run(scenario())
+    response = client.get(f"/api/jobs/{job_id}")
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["error"] == "Failed to execute visual beat beat_7"
+    assert payload["diagnostic"]["provider"] == "seedream"
+    assert payload["diagnostic"]["operation"] == "edit"
+    assert payload["diagnostic"]["error_type"] == "timeout"
+    assert payload["diagnostic"]["beat_id"] == "beat_7"
+    assert payload["report"]["failure"] == payload["diagnostic"]
 
 
 def test_dashboard_creates_and_opens_project(web_app: tuple) -> None:

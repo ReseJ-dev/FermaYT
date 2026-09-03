@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import re
 import sqlite3
 from collections.abc import Awaitable, Callable
@@ -10,6 +11,13 @@ from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from uuid import uuid4
+
+from app.provider_diagnostics import (
+    find_image_provider_diagnostic,
+    sanitize_provider_message,
+)
+
+logger = logging.getLogger(__name__)
 
 
 class GenerationJobStatus(str, Enum):
@@ -214,13 +222,21 @@ class GenerationJobManager:
             raise
         except Exception as exc:  # noqa: BLE001 - job boundary must persist all failures
             error = _safe_job_error(exc)
+            diagnostic = find_image_provider_diagnostic(exc)
+            failure_report = None
+            if diagnostic is not None:
+                failure_report = {
+                    "summary": error,
+                    "failure": diagnostic.as_dict(),
+                }
+                logger.error("%s", diagnostic.format(error))
+            else:
+                logger.error("Generation job failed: %s", error)
             await asyncio.to_thread(
-                self._update_status,
+                self._mark_failed,
                 job_id,
-                GenerationJobStatus.FAILED,
-                "Failed",
                 error[:500],
-                None,
+                failure_report,
             )
         else:
             await asyncio.to_thread(
@@ -486,6 +502,37 @@ class GenerationJobManager:
                     ),
                 )
 
+    def _mark_failed(
+        self,
+        job_id: str,
+        error: str,
+        report: dict[str, object] | None,
+    ) -> None:
+        now = _serialize_datetime(_utc_now())
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE generation_jobs
+                SET status = ?, message = ?, error = ?,
+                    failed_stage = current_stage,
+                    report_json = ?, completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    GenerationJobStatus.FAILED.value,
+                    "Failed",
+                    error,
+                    (
+                        json.dumps(report, ensure_ascii=False, sort_keys=True)
+                        if report is not None
+                        else None
+                    ),
+                    now,
+                    now,
+                    job_id,
+                ),
+            )
+
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)
         connection.row_factory = sqlite3.Row
@@ -501,10 +548,15 @@ def _serialize_datetime(value: datetime) -> str:
 
 
 def _safe_job_error(error: Exception) -> str:
-    message = str(error).strip() or type(error).__name__
+    summary = getattr(error, "user_summary", None)
+    message = (
+        summary.strip()
+        if isinstance(summary, str) and summary.strip()
+        else str(error).strip() or type(error).__name__
+    )
     message = re.sub(
         r"(?i)(bearer|authorization|api[_ -]?key)(?:\s*[:=]?\s*)[^\s,;]+",
         r"\1 [redacted]",
         message,
     )
-    return message[:500]
+    return (sanitize_provider_message(message) or type(error).__name__)[:500]

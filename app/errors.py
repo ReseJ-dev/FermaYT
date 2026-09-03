@@ -40,9 +40,31 @@ class VisualOperationResolutionError(RuntimeError):
 class BeatVisualExecutionError(RuntimeError):
     """Raised after a beat asset execution failure has been persisted safely."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic: object | None = None,
+        user_summary: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.safe_diagnostic = diagnostic
+        self.user_summary = user_summary or message
+
 
 class MasterSceneError(RuntimeError):
     """Raised when an immutable master cannot be generated or verified."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic: object | None = None,
+        user_summary: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.safe_diagnostic = diagnostic
+        self.user_summary = user_summary or message
 
 
 class StyleContractError(ValueError):

@@ -169,8 +169,80 @@ def test_generate_handles_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BYTEPLUS_ARK_API_KEY", "secret-key")
     install_mock_transport(monkeypatch, handler)
 
-    with pytest.raises(ImageGenerationError, match="timed out"):
+    with pytest.raises(ImageGenerationError, match="timed out") as raised:
         run_generate()
+
+    diagnostic = raised.value.safe_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.error_type == "timeout"
+    assert diagnostic.http_status is None
+    assert diagnostic.request_stage == "provider_request"
+
+
+def test_seedream_http_error_exposes_only_safe_structured_diagnostic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            400,
+            json={
+                "code": "InvalidParameter",
+                "message": (
+                    "Invalid size parameter; Authorization: Bearer private-token; "
+                    "data:image/png;base64,QUJDREVGRw==; " + "A" * 300
+                ),
+                "debug": "must-not-be-exposed",
+            },
+        )
+
+    monkeypatch.setenv("BYTEPLUS_ARK_API_KEY", "secret-key")
+    install_mock_transport(monkeypatch, handler)
+
+    with pytest.raises(ImageGenerationError) as raised:
+        run_generate()
+
+    diagnostic = raised.value.safe_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.provider == "seedream"
+    assert diagnostic.model == "seedream-5-0-260128"
+    assert diagnostic.operation == "generate"
+    assert diagnostic.error_type == "http"
+    assert diagnostic.http_status == 400
+    assert diagnostic.request_stage == "provider_response"
+    assert "Invalid size parameter" in (diagnostic.provider_error or "")
+    assert "private-token" not in (diagnostic.provider_error or "")
+    assert "QUJDREVGRw" not in (diagnostic.provider_error or "")
+    assert "A" * 256 not in (diagnostic.provider_error or "")
+    assert "must-not-be-exposed" not in (diagnostic.provider_error or "")
+
+
+def test_seedream_edit_network_error_records_operation_without_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError(
+            "connection failed Authorization: Bearer private-token",
+            request=request,
+        )
+
+    monkeypatch.setenv("BYTEPLUS_ARK_API_KEY", "secret-key")
+    install_mock_transport(monkeypatch, handler)
+    reference = ImageReference(
+        reference_id="master",
+        file_path="https://example.com/master.png",
+        sha256="a" * 64,
+        role=ImageReferenceRole.CONTENT_CONTINUITY,
+    )
+
+    with pytest.raises(ImageGenerationError) as raised:
+        asyncio.run(BytePlusImageApiClient().edit("Raise the water", (reference,)))
+
+    diagnostic = raised.value.safe_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.operation == "edit"
+    assert diagnostic.error_type == "network"
+    assert diagnostic.request_stage == "provider_request"
+    assert "private-token" not in (diagnostic.provider_error or "")
 
 
 @pytest.mark.parametrize("status_code", [400, 429, 500])
@@ -454,8 +526,17 @@ def test_qwen_generate_handles_api_error_response(
     with pytest.raises(
         ImageGenerationError,
         match="InvalidParameter: Bad prompt",
-    ):
+    ) as raised:
         run_qwen_generate()
+
+    diagnostic = raised.value.safe_diagnostic
+    assert diagnostic is not None
+    assert diagnostic.provider == "qwen"
+    assert diagnostic.model == "qwen-image-3.0"
+    assert diagnostic.operation == "generate"
+    assert diagnostic.error_type == "provider_validation"
+    assert diagnostic.request_stage == "provider_response_validation"
+    assert "InvalidParameter" in (diagnostic.provider_error or "")
 
 
 def test_qwen_generate_requires_output(

@@ -923,6 +923,12 @@ def _run_pipeline_worker(job_id: str, project_id: str, dependencies: object) -> 
 
 
 def _job_payload(job: GenerationJob) -> dict[str, object]:
+    diagnostic = (
+        job.report.get("failure")
+        if isinstance(job.report, dict)
+        and isinstance(job.report.get("failure"), dict)
+        else None
+    )
     return {
         "id": job.id,
         "project_id": job.project_id,
@@ -939,6 +945,7 @@ def _job_payload(job: GenerationJob) -> dict[str, object]:
         "failed_beat": job.failed_beat,
         "final_render_id": job.final_render_id,
         "report": job.report,
+        "diagnostic": diagnostic,
         "created_at": job.created_at.isoformat(),
         "updated_at": job.updated_at.isoformat(),
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,

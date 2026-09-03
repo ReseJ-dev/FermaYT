@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,6 +30,7 @@ from app.pipeline.visual_qa import (
     apply_visual_qa_correction,
     generate_with_visual_qa,
 )
+from app.provider_diagnostics import diagnostic_from_exception
 from app.providers import (
     ImageEditingProvider,
     ImageReference,
@@ -43,6 +45,8 @@ from app.style_contracts import (
     get_image_style_contract,
 )
 from app.utils.download import download_file
+
+logger = logging.getLogger(__name__)
 
 
 class MasterSceneImageClient(Protocol):
@@ -196,9 +200,19 @@ async def generate_required_master_scenes(
         except MasterSceneError:
             raise
         except Exception as exc:
-            raise MasterSceneError(
-                f"Failed to generate master scene {master_scene_id}"
-            ) from exc
+            summary = f"Failed to generate master scene {master_scene_id}"
+            diagnostic = diagnostic_from_exception(
+                exc,
+                provider=project.image_provider,
+                model=getattr(client, "model", project.image_model),
+                operation="reference" if style_references else "generate",
+                request_stage="master_scene_generation",
+            ).with_context(
+                request_stage="master_scene_generation",
+                master_scene_id=master_scene_id,
+            )
+            logger.error("%s", diagnostic.format(summary))
+            raise MasterSceneError(summary, diagnostic=diagnostic) from exc
         assets.append(asset)
 
     return assets

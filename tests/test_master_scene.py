@@ -1,6 +1,7 @@
 """Tests for immutable master generation and descendant continuity."""
 
 import asyncio
+import logging
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 import app.generators.master_scene as master_scene_module
+from app.clients.image_api import ImageGenerationError
 from app.database import create_session_factory, create_sqlite_engine, init_database
 from app.errors import ImagePromptBuildError, MasterSceneError
 from app.generators.image_prompt import ImagePromptBuilder
@@ -24,6 +26,7 @@ from app.models.visual_plan import VisualOperation, VisualPlan
 from app.models.visual_qa import VisualQADecision
 from app.pipeline.visual_operation_engine import VisualProviderCapabilities
 from app.pipeline.visual_qa import VisualQAContext
+from app.provider_diagnostics import ImageProviderDiagnostic
 from app.providers import ImageReference, ImageReferenceRole
 from app.repositories import (
     create_master_scene_asset,
@@ -196,6 +199,52 @@ def test_generates_only_referenced_masters_and_persists_metadata(
     assert [item.master_scene_id for item in list_master_scene_assets(session, project.id)] == [
         "shaft_master"
     ]
+
+
+def test_master_provider_failure_adds_safe_master_context_and_logs_it(
+    session: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    project = _project(session)
+
+    async def fail_generation(*args: object, **kwargs: object) -> str:
+        del args, kwargs
+        raise ImageGenerationError(
+            "Qwen Image API returned HTTP 400",
+            diagnostic=ImageProviderDiagnostic(
+                provider="qwen",
+                model="qwen-image-3.0",
+                operation="generate",
+                error_type="http",
+                request_stage="provider_response",
+                http_status=400,
+                provider_error='{"code":"InvalidParameter","message":"Invalid size"}',
+            ),
+        )
+
+    monkeypatch.setattr(master_scene_module, "generate_image", fail_generation)
+
+    with caplog.at_level(logging.ERROR), pytest.raises(MasterSceneError) as raised:
+        asyncio.run(
+            generate_required_master_scenes(
+                session,
+                project,
+                _plan(),
+                client=object(),  # type: ignore[arg-type]
+                projects_root=tmp_path / "projects",
+            )
+        )
+
+    assert str(raised.value) == "Failed to generate master scene shaft_master"
+    diagnostic = raised.value.safe_diagnostic
+    assert isinstance(diagnostic, ImageProviderDiagnostic)
+    assert diagnostic.master_scene_id == "shaft_master"
+    assert diagnostic.request_stage == "master_scene_generation"
+    assert diagnostic.http_status == 400
+    assert "master_scene_id=\"shaft_master\"" in caplog.text
+    assert "Invalid size" in caplog.text
 
 
 def test_existing_master_is_reused_and_never_regenerated(

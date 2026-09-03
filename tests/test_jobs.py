@@ -1,15 +1,18 @@
 """Tests for the local background job manager."""
 
 import asyncio
+import logging
 from pathlib import Path
 
 import pytest
 
+from app.errors import MasterSceneError
 from app.jobs import (
     GenerationJobManager,
     GenerationJobStatus,
     GenerationJobType,
 )
+from app.provider_diagnostics import ImageProviderDiagnostic
 
 
 def test_create_job_persists_queued_metadata(tmp_path: Path) -> None:
@@ -88,6 +91,51 @@ def test_failed_operation_is_persisted(tmp_path: Path) -> None:
         assert failed.error == "Provider unavailable"
 
     asyncio.run(scenario())
+
+
+def test_image_provider_diagnostic_is_persisted_and_logged_safely(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def scenario() -> None:
+        manager = GenerationJobManager(tmp_path / "app.db")
+        diagnostic = ImageProviderDiagnostic(
+            provider="seedream",
+            model="seedream-5-0-260128",
+            operation="generate",
+            error_type="http",
+            request_stage="master_scene_generation",
+            http_status=400,
+            provider_error='{"message":"Invalid size parameter"}',
+            master_scene_id="ms_shaft_wide",
+        )
+
+        async def operation(job_id: str) -> None:
+            del job_id
+            raise MasterSceneError(
+                "Failed to generate master scene ms_shaft_wide",
+                diagnostic=diagnostic,
+            )
+
+        job = await manager.enqueue(
+            "project-1",
+            GenerationJobType.GENERATE_VIDEO,
+            operation,
+        )
+        failed = await manager.wait(job.id)
+
+        assert failed is not None
+        assert failed.error == "Failed to generate master scene ms_shaft_wide"
+        assert failed.report is not None
+        assert failed.report["summary"] == failed.error
+        assert failed.report["failure"] == diagnostic.as_dict()
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(scenario())
+
+    assert "provider=\"seedream\"" in caplog.text
+    assert "http_status=400" in caplog.text
+    assert "Invalid size parameter" in caplog.text
 
 
 def test_startup_marks_running_jobs_as_interrupted(tmp_path: Path) -> None:
