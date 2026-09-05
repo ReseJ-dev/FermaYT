@@ -126,6 +126,33 @@ def test_job_api_exposes_safe_provider_diagnostic_without_changing_summary(
     assert payload["report"]["failure"] == payload["diagnostic"]
 
 
+def test_completed_job_does_not_restart_page_polling(web_app: tuple) -> None:
+    client, _, _ = web_app
+    project_id = _create_project(client)
+
+    async def scenario() -> None:
+        async def operation(job_id: str) -> None:
+            del job_id
+
+        job = await main_module.job_manager.enqueue(
+            project_id,
+            GenerationJobType.GENERATE_VIDEO,
+            operation,
+        )
+        await main_module.job_manager.wait(job.id)
+
+    asyncio.run(scenario())
+    page = client.get(f"/projects/{project_id}")
+    script = client.get("/static/app.js")
+
+    assert page.status_code == 200
+    assert 'data-job-status="completed"' in page.text
+    assert "/static/app.js?v=20260904-3" in page.text
+    assert script.status_code == 200
+    assert '["queued", "running"].includes(existingJobStatus)' in script.text
+    assert "fermayt-completed-job-reloaded" in script.text
+
+
 def test_dashboard_creates_and_opens_project(web_app: tuple) -> None:
     client, session_factory, _ = web_app
 
@@ -140,6 +167,8 @@ def test_dashboard_creates_and_opens_project(web_app: tuple) -> None:
     assert "Сцены" in editor.text
     assert "Сгенерировать видео" in editor.text
     assert "Visual Director" in editor.text
+    assert "Qwen Image 3.0" in editor.text
+    assert 'value="qwen-image-3.0"' in editor.text
     assert "Manual / Legacy tools" in editor.text
     with session_factory() as session:
         project = get_project(session, project_id)
@@ -260,6 +289,50 @@ def test_project_media_is_served_without_path_traversal(web_app: tuple) -> None:
 
     assert response.status_code == 200
     assert response.content == b"png-data"
+    assert traversal.status_code == 404
+
+
+def test_final_video_download_uses_attachment_and_safe_project_filename(
+    web_app: tuple,
+) -> None:
+    client, session_factory, projects_root = web_app
+    project_id = _create_project(client)
+    video = projects_root / project_id / "output" / "final-render.mp4"
+    video.parent.mkdir(parents=True)
+    video.write_bytes(b"final-video")
+    with session_factory() as session:
+        update_project(
+            session,
+            project_id,
+            name="Magic Book / Demo",
+            final_video_path=str(video),
+        )
+
+    page = client.get(f"/projects/{project_id}")
+    response = client.get(f"/api/projects/{project_id}/video/download")
+
+    assert response.status_code == 200
+    assert response.content == b"final-video"
+    assert response.headers["content-type"] == "video/mp4"
+    assert "attachment" in response.headers["content-disposition"]
+    assert "Magic_Book_Demo.mp4" in response.headers["content-disposition"]
+    assert f"/api/projects/{project_id}/video/download" in page.text
+
+
+def test_final_video_download_rejects_missing_or_outside_file(
+    web_app: tuple,
+) -> None:
+    client, session_factory, projects_root = web_app
+    project_id = _create_project(client)
+
+    missing = client.get(f"/api/projects/{project_id}/video/download")
+    outside = projects_root.parent / "outside.mp4"
+    outside.write_bytes(b"private")
+    with session_factory() as session:
+        update_project(session, project_id, final_video_path=str(outside))
+    traversal = client.get(f"/api/projects/{project_id}/video/download")
+
+    assert missing.status_code == 404
     assert traversal.status_code == 404
 
 

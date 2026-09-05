@@ -53,6 +53,10 @@ button, input, textarea, select { font: inherit; }
 .pipeline-progress-head { display: flex; justify-content: space-between; gap: 12px; }
 .pipeline-progress progress { width: 100%; height: 12px; margin: 10px 0 4px; accent-color: var(--primary); }
 .pipeline-progress p { margin: 5px 0 0; font-size: .88rem; }
+.cost-summary { margin-top: 16px; padding: 14px; border: 1px solid var(--border); border-radius: 12px; background: #fbfcff; }
+.cost-summary > div { display: flex; justify-content: space-between; gap: 12px; margin-top: 8px; font-size: .86rem; }
+.cost-summary > div span { color: var(--muted); }
+.cost-summary small { display: block; margin-top: 10px; color: var(--muted); line-height: 1.35; }
 .pipeline-error { color: #b42318; }
 .style-reference-control, .final-video-result { display: grid; gap: 8px; margin-top: 18px; }
 .style-reference-control small, .final-video-result small { color: var(--muted); }

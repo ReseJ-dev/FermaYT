@@ -152,6 +152,7 @@ async def generate_with_visual_qa(
     qa_service: VisualQAService | None,
     *,
     max_retries: int = 2,
+    on_qa_request: Callable[[int, bool], object] | None = None,
 ) -> VisualQAOutcome:
     """Generate, inspect and correct a frame without an unbounded retry loop."""
     if not 0 <= max_retries <= 5:
@@ -185,7 +186,11 @@ async def generate_with_visual_qa(
             raise VisualQAError("Generated QA candidate file is missing")
         try:
             decision = await qa_service.evaluate(generated_path, context)
+            if on_qa_request is not None:
+                on_qa_request(attempt, True)
         except VisualQAError:
+            if on_qa_request is not None:
+                on_qa_request(attempt, False)
             if not candidates:
                 warning = "Visual QA unavailable; kept the generated candidate"
                 logger.warning(warning)

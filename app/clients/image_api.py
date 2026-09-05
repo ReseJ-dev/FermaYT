@@ -318,7 +318,7 @@ class QwenImageApiClient:
     """Minimal client for Qwen Image on Alibaba Cloud Model Studio."""
 
     MODEL_ID: ClassVar[str] = "qwen-image-3.0"
-    TIMEOUT_SECONDS: ClassVar[float] = 30.0
+    TIMEOUT_SECONDS: ClassVar[float] = 180.0
     capabilities: ClassVar[ImageProviderCapabilities] = ImageProviderCapabilities(
         reference_generation=True,
         multiple_references=True,

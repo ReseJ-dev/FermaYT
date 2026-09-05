@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -16,6 +17,11 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from app.clients.image_api import ImageGenerationError
+from app.costs import (
+    estimate_project_generation_cost,
+    load_pricing_config,
+    summarize_project_cost,
+)
 from app.database import SessionLocal, init_database
 from app.database import engine as database_engine
 from app.errors import MediaProbeError, TTSGenerationError
@@ -59,6 +65,9 @@ from app.storage import ProjectMediaPaths
 
 APP_DIR = Path(__file__).resolve().parent
 PROJECTS_ROOT = Path("data/projects").resolve()
+PRICING_CONFIG_PATH = Path(
+    os.environ.get("FERMAYT_PRICING_FILE", "config/provider_pricing.json")
+)
 job_manager = GenerationJobManager()
 secret_store = SecretStore()
 
@@ -66,6 +75,9 @@ secret_store = SecretStore()
 @asynccontextmanager
 async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     await asyncio.to_thread(init_database, database_engine)
+    if PRICING_CONFIG_PATH.is_file():
+        with SessionLocal() as session:
+            load_pricing_config(session, PRICING_CONFIG_PATH)
     await job_manager.startup()
     try:
         yield
@@ -168,6 +180,11 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
             project_id,
             project.final_video_path,
         )
+        final_video_download_url = (
+            f"/api/projects/{quote(project_id)}/video/download"
+            if final_video_url is not None
+            else None
+        )
         style_reference = get_style_reference_asset(
             session, project_id, project.style_id
         )
@@ -177,6 +194,12 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
             None,
         )
         latest_job = await job_manager.get_latest_project_job(project_id)
+        cost_summary = summarize_project_cost(
+            session,
+            project_id,
+            job_id=latest_job.id if latest_job is not None else None,
+        )
+        cost_estimate = estimate_project_generation_cost(session, project_id)
         return templates.TemplateResponse(
             request=request,
             name="project.html",
@@ -185,9 +208,12 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
                 "project": project,
                 "scene_cards": scene_cards,
                 "final_video_url": final_video_url,
+                "final_video_download_url": final_video_download_url,
                 "final_render": final_render,
                 "style_reference": style_reference,
                 "latest_job": latest_job,
+                "cost_summary": cost_summary,
+                "cost_estimate": cost_estimate,
                 "notice": request.query_params.get("notice"),
                 "error": request.query_params.get("error"),
             },
@@ -552,6 +578,35 @@ async def project_media(project_id: str, media_path: str) -> FileResponse:
     return FileResponse(candidate)
 
 
+@app.get("/api/projects/{project_id}/video/download")
+async def download_project_video(project_id: str) -> FileResponse:
+    """Download only the final video persisted for the requested project."""
+    with SessionLocal() as session:
+        project = get_project(session, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        stored_path = project.final_video_path
+        project_name = project.name
+    if not stored_path:
+        raise HTTPException(status_code=404, detail="Final video not found")
+    project_root = (PROJECTS_ROOT / project_id).resolve()
+    candidate = Path(stored_path)
+    if not candidate.is_absolute():
+        candidate = candidate.resolve()
+    if (
+        project_root.parent != PROJECTS_ROOT
+        or not candidate.is_relative_to(project_root)
+        or not candidate.is_file()
+    ):
+        raise HTTPException(status_code=404, detail="Final video not found")
+    safe_name = re.sub(r"[^\w.-]+", "_", project_name).strip("._") or "video"
+    return FileResponse(
+        candidate,
+        media_type="video/mp4",
+        filename=f"{safe_name}.mp4",
+    )
+
+
 @app.get("/settings", response_class=HTMLResponse)
 async def settings(request: Request) -> HTMLResponse:
     """Show provider configuration status without exposing secrets."""
@@ -912,6 +967,7 @@ def _run_pipeline_worker(job_id: str, project_id: str, dependencies: object) -> 
                 project_id,
                 dependencies,  # type: ignore[arg-type]
                 progress=progress,
+                job_id=job_id,
             )
             await job_manager.set_pipeline_result(
                 job_id,
@@ -929,6 +985,13 @@ def _job_payload(job: GenerationJob) -> dict[str, object]:
         and isinstance(job.report.get("failure"), dict)
         else None
     )
+    with SessionLocal() as session:
+        costs = summarize_project_cost(session, job.project_id, job_id=job.id)
+        try:
+            estimate = estimate_project_generation_cost(session, job.project_id)
+        except ValueError:
+            estimate = None
+    estimated_remaining = estimate.maximum if estimate is not None else None
     return {
         "id": job.id,
         "project_id": job.project_id,
@@ -946,6 +1009,9 @@ def _job_payload(job: GenerationJob) -> dict[str, object]:
         "final_render_id": job.final_render_id,
         "report": job.report,
         "diagnostic": diagnostic,
+        "cost": costs.as_dict(),
+        "cost_estimate": estimate.as_dict() if estimate is not None else None,
+        "estimated_remaining": estimated_remaining,
         "created_at": job.created_at.isoformat(),
         "updated_at": job.updated_at.isoformat(),
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,

@@ -15,7 +15,12 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
-from app.errors import BeatVisualExecutionError, VisualOperationResolutionError
+from app.costs import PricingUnit, UsageStatus, record_provider_usage, usage_revision
+from app.errors import (
+    BeatVisualExecutionError,
+    VisualOperationResolutionError,
+    VisualQAError,
+)
 from app.generators.image_prompt import ImagePromptBuilder
 from app.generators.master_scene import (
     ContinuityGenerationRequest,
@@ -94,6 +99,14 @@ ProviderResolver = Callable[[str, Mapping[str, Any] | None], ImageProvider]
 Downloader = Callable[[str, str], Awaitable[str]]
 
 
+def provider_operation_name(operation: VisualOperation, has_references: bool) -> str:
+    if operation is VisualOperation.EDIT_EXISTING:
+        return "EDIT"
+    if has_references:
+        return "REFERENCE_GENERATION"
+    return "NEW_IMAGE"
+
+
 @dataclass(frozen=True, slots=True)
 class VisualAssetExecutionSummary:
     beats: int
@@ -140,6 +153,7 @@ class VisualBeatAssetExecutor:
         style_id: str = DEFAULT_IMAGE_STYLE_ID,
         qa_service: VisualQAService | None = None,
         max_visual_qa_attempts: int = 3,
+        job_id: str | None = None,
     ) -> None:
         if not 1 <= max_visual_qa_attempts <= 5:
             raise ValueError("max_visual_qa_attempts must be between 1 and 5")
@@ -150,6 +164,7 @@ class VisualBeatAssetExecutor:
         self.style_id = style_id
         self.qa_service = qa_service
         self.max_visual_qa_attempts = max_visual_qa_attempts
+        self.job_id = job_id
 
     async def execute_project(
         self,
@@ -373,6 +388,13 @@ class VisualBeatAssetExecutor:
             generation_revision=generation_revision,
         )
         if existing is not None and await _verify_result_file(existing):
+            self._record_usage(
+                context,
+                beat_id=beat.id,
+                operation=operation.value,
+                revision=usage_revision(generation_revision, "cached"),
+                status=UsageStatus.CACHED,
+            )
             logger.info(
                 "Beat visual asset reused by generation revision",
                 extra={
@@ -473,11 +495,26 @@ class VisualBeatAssetExecutor:
                         context.provider,
                         downloader=self.downloader,
                     )
+                    self._record_usage(
+                        context,
+                        beat_id=beat.id,
+                        operation=provider_operation_name(operation, bool(references)),
+                        revision=usage_revision(generation_revision, "image", attempt),
+                        status=UsageStatus.SUCCEEDED,
+                        is_qa_retry=qa_attempt > 1,
+                    )
                     file_sha256 = await asyncio.to_thread(_sha256_file, output_path)
                 else:
                     assert source is not None
                     output_path = planned_output_path
                     file_sha256 = source.sha256
+                    self._record_usage(
+                        context,
+                        beat_id=beat.id,
+                        operation=operation.value,
+                        revision=usage_revision(generation_revision, "free"),
+                        status=UsageStatus.SKIPPED,
+                    )
             except Exception as exc:
                 summary = f"Failed to execute visual beat {beat.id}"
                 provider_operation = (
@@ -486,6 +523,14 @@ class VisualBeatAssetExecutor:
                     else "reference"
                     if references
                     else "generate"
+                )
+                self._record_usage(
+                    context,
+                    beat_id=beat.id,
+                    operation=provider_operation,
+                    revision=usage_revision(generation_revision, "image", attempt),
+                    status=UsageStatus.FAILED,
+                    is_qa_retry=qa_attempt > 1,
                 )
                 diagnostic = diagnostic_from_exception(
                     exc,
@@ -550,10 +595,56 @@ class VisualBeatAssetExecutor:
             if previous_evaluation is None:
                 try:
                     qa_decision = await self.qa_service.evaluate(output_path, qa_context)
-                except Exception as exc:
-                    raise BeatVisualExecutionError(
-                        f"Visual QA failed for beat {beat.id}: {_safe_error(exc)}"
-                    ) from exc
+                    self._record_usage(
+                        context,
+                        beat_id=beat.id,
+                        operation="VISUAL_QA",
+                        revision=usage_revision(qa_revision, "qa"),
+                        status=UsageStatus.SUCCEEDED,
+                        provider=self.qa_service.provider,
+                        model=self.qa_service.model,
+                        unit_type=PricingUnit.PER_REQUEST,
+                        is_qa_retry=qa_attempt > 1,
+                    )
+                except VisualQAError as exc:
+                    self._record_usage(
+                        context,
+                        beat_id=beat.id,
+                        operation="VISUAL_QA",
+                        revision=usage_revision(qa_revision, "qa"),
+                        status=UsageStatus.FAILED,
+                        provider=self.qa_service.provider,
+                        model=self.qa_service.model,
+                        unit_type=PricingUnit.PER_REQUEST,
+                        is_qa_retry=qa_attempt > 1,
+                    )
+                    warning = (
+                        f"Visual QA unavailable for beat {beat.id}; "
+                        "generated candidate kept without automated QA"
+                    )
+                    logger.warning(
+                        "%s",
+                        warning,
+                        extra={"error_type": type(exc).__name__},
+                    )
+                    unavailable_decision = VisualQADecision(
+                        result="PASS_WITH_WARNING",
+                        problem_categories=["OTHER"],
+                        reasons=["Visual QA provider did not return a valid decision"],
+                        correction_instruction=None,
+                        severity="minor",
+                    )
+                    return apply_automated_visual_qa_decision(
+                        self.session,
+                        result,
+                        unavailable_decision,
+                        qa_revision=qa_revision,
+                        prompt_version=self.qa_service.prompt_version,
+                        provider=self.qa_service.provider,
+                        model=self.qa_service.model,
+                        qa_attempt=qa_attempt,
+                        warning=warning,
+                    )
             else:
                 qa_decision = VisualQADecision.model_validate(
                     previous_evaluation.decision_snapshot
@@ -622,6 +713,39 @@ class VisualBeatAssetExecutor:
             )
         raise BeatVisualExecutionError(
             f"Visual QA rejected all {total_attempts} candidates for beat {beat.id}"
+        )
+
+    def _record_usage(
+        self,
+        context: _ExecutionContext,
+        *,
+        beat_id: str,
+        operation: str,
+        revision: str,
+        status: UsageStatus,
+        provider: str | None = None,
+        model: str | None = None,
+        unit_type: PricingUnit = PricingUnit.PER_IMAGE,
+        is_qa_retry: bool = False,
+    ) -> None:
+        if self.job_id is None:
+            return
+        record_provider_usage(
+            self.session,
+            project_id=context.project.id,
+            job_id=self.job_id,
+            pipeline_stage=(
+                "VISUAL_QA" if operation == "VISUAL_QA" else "VISUAL_GENERATION"
+            ),
+            beat_id=beat_id,
+            provider=provider or context.execution_plan.provider,
+            model=model if provider is not None else context.execution_plan.model,
+            operation=operation,
+            request_revision=revision,
+            unit_type=unit_type,
+            input_units=1,
+            status=status,
+            is_qa_retry=is_qa_retry,
         )
 
     @staticmethod

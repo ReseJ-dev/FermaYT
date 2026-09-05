@@ -10,9 +10,18 @@ from dataclasses import asdict, dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
+from app.costs import (
+    PricingUnit,
+    UsageStatus,
+    estimate_project_generation_cost,
+    record_provider_usage,
+    summarize_project_cost,
+    usage_revision,
+)
 from app.generators.master_scene import generate_required_master_scenes
 from app.models.render import ProjectRenderConfig
 from app.pipeline.visual_qa import VisualQAService
@@ -100,6 +109,17 @@ class ProjectPipelineReport:
     final_mp4: str
     final_render_id: str
     reused: dict[str, int | bool]
+    estimated_cost_before_run: dict[str, Any]
+    actual_run_cost: float | None
+    historical_project_asset_cost: float | None
+    qa_retry_cost: float | None
+    cost_by_stage: dict[str, float]
+    cost_by_provider: dict[str, float]
+    cost_by_model: dict[str, float]
+    cost_by_beat: dict[str, float]
+    cost_currency: str | None
+    unpriced_usage_records: int
+    cost_run_id: str
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -111,8 +131,10 @@ async def run_project_video_pipeline(
     dependencies: ProjectPipelineDependencies,
     *,
     progress: PipelineProgress | None = None,
+    job_id: str | None = None,
 ) -> ProjectPipelineReport:
     """Run every required current stage, reusing valid persisted revisions."""
+    cost_run_id = job_id or f"direct-{uuid4()}"
     emit = progress or _ignore_progress
     await emit(
         ProjectPipelineStage.VALIDATING, 2, 0, "Проверка проекта", None, None, None
@@ -138,9 +160,17 @@ async def run_project_video_pipeline(
     )
     if plan_reused:
         plan = existing_plan.plan
+        record_provider_usage(
+            session, project_id=project_id, job_id=cost_run_id,
+            pipeline_stage="PLANNING", provider=project.planning_provider,
+            model=project.planning_model, operation="PLANNING",
+            request_revision=usage_revision(hash_story_text(project.story_text), "planning"),
+            unit_type=PricingUnit.PER_REQUEST, input_units=1,
+            status=UsageStatus.CACHED,
+        )
     else:
         plan = await create_project_visual_plan(
-            session, project_id, dependencies.planning_client
+            session, project_id, dependencies.planning_client, job_id=cost_run_id
         )
     total_beats = len(plan.visual_beats)
     await emit(
@@ -172,6 +202,7 @@ async def run_project_video_pipeline(
         {"model": project.image_model} if project.image_model else None,
     )
     capabilities = get_image_provider_capabilities(provider)
+    estimate = estimate_project_generation_cost(session, project_id)
     style_reference = get_style_reference_asset(session, project_id, project.style_id)
     await emit(
         ProjectPipelineStage.RESOLVING_VISUALS,
@@ -204,6 +235,7 @@ async def run_project_video_pipeline(
         capabilities=capabilities,
         qa_service=dependencies.visual_qa_service,
         downloader=dependencies.downloader,
+        job_id=cost_run_id,
     )
     execution = resolve_project_visual_operations(
         session,
@@ -231,6 +263,7 @@ async def run_project_video_pipeline(
         projects_root=dependencies.projects_root,
         style_id=project.style_id,
         qa_service=dependencies.visual_qa_service,
+        job_id=cost_run_id,
     )
     results = []
     for index, decision in enumerate(execution.decisions, start=1):
@@ -284,6 +317,7 @@ async def run_project_video_pipeline(
         "provider_resolver": dependencies.tts_provider_resolver,
         "downloader": dependencies.downloader,
         "projects_root": dependencies.projects_root,
+        "job_id": cost_run_id,
     }
     if dependencies.duration_probe is not None:
         narration_kwargs["duration_probe"] = dependencies.duration_probe
@@ -382,6 +416,7 @@ async def run_project_video_pipeline(
     )
     qa_summary = build_visual_qa_execution_summary(all_results)
     operation_counts = Counter(item.resolved_operation for item in results)
+    costs = summarize_project_cost(session, project_id, job_id=cost_run_id)
     report = ProjectPipelineReport(
         pipeline_version=PIPELINE_VERSION,
         project_id=project_id,
@@ -407,6 +442,17 @@ async def run_project_video_pipeline(
             ),
             "render": render.id in previous_render_ids,
         },
+        estimated_cost_before_run=estimate.as_dict(),
+        actual_run_cost=costs.run_cost,
+        historical_project_asset_cost=costs.historical_project_cost,
+        qa_retry_cost=costs.qa_retry_cost,
+        cost_by_stage=costs.cost_by_stage,
+        cost_by_provider=costs.cost_by_provider,
+        cost_by_model=costs.cost_by_model,
+        cost_by_beat=costs.cost_by_beat,
+        cost_currency=costs.currency,
+        unpriced_usage_records=costs.unpriced_records,
+        cost_run_id=cost_run_id,
     )
     await emit(
         ProjectPipelineStage.COMPLETED,

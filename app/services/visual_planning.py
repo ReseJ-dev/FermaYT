@@ -7,6 +7,7 @@ from enum import Enum
 
 from sqlalchemy.orm import Session
 
+from app.costs import PricingUnit, UsageStatus, record_provider_usage, usage_revision
 from app.errors import (
     ProjectVisualPlanError,
     StaleProjectVisualPlanError,
@@ -53,6 +54,8 @@ async def create_project_visual_plan(
     session: Session,
     project_id: str,
     planning_client: VisualPlanningClient,
+    *,
+    job_id: str | None = None,
 ) -> VisualPlan:
     """Generate, validate, and atomically persist a Project's current plan."""
     project = get_project(session, project_id)
@@ -72,6 +75,15 @@ async def create_project_visual_plan(
     try:
         plan = await VisualDirector(planning_client).create_plan(story_text)
     except VisualDirectorError as exc:
+        if job_id is not None:
+            record_provider_usage(
+                session, project_id=project_id, job_id=job_id,
+                pipeline_stage="PLANNING", provider=project.planning_provider,
+                model=project.planning_model, operation="PLANNING",
+                request_revision=usage_revision(hash_story_text(story_text), "planning"),
+                unit_type=PricingUnit.PER_REQUEST, input_units=1,
+                status=UsageStatus.FAILED,
+            )
         failure_type = (
             "provider_failure"
             if str(exc) == "Visual planning provider failed"
@@ -84,6 +96,16 @@ async def create_project_visual_plan(
             event=failure_type,
         )
         raise
+
+    if job_id is not None:
+        record_provider_usage(
+            session, project_id=project_id, job_id=job_id,
+            pipeline_stage="PLANNING", provider=project.planning_provider,
+            model=project.planning_model, operation="PLANNING",
+            request_revision=usage_revision(hash_story_text(story_text), "planning"),
+            unit_type=PricingUnit.PER_REQUEST, input_units=1,
+            status=UsageStatus.SUCCEEDED,
+        )
 
     _log(
         logging.INFO,

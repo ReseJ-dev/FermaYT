@@ -14,6 +14,7 @@ from sqlalchemy import (
     Float,
     ForeignKey,
     Integer,
+    Numeric,
     String,
     Text,
     UniqueConstraint,
@@ -189,6 +190,11 @@ class Project(Base):
         back_populates="project",
         cascade="all, delete-orphan",
         order_by="ProjectVideoRender.created_at",
+    )
+    provider_usage_records: Mapped[list[ProviderUsageRecord]] = relationship(
+        back_populates="project",
+        passive_deletes=True,
+        order_by="ProviderUsageRecord.created_at",
     )
 
     @validates("story_text")
@@ -1032,6 +1038,74 @@ class StyleReferenceAsset(Base):
     project: Mapped[Project] = relationship(back_populates="style_reference_assets")
 
 
+class ProviderPricing(Base):
+    """Immutable, versioned price used to value provider usage."""
+
+    __tablename__ = "provider_pricing"
+    __table_args__ = (
+        UniqueConstraint(
+            "provider", "model", "operation", "pricing_unit", "version",
+            name="uq_provider_pricing_version",
+        ),
+        CheckConstraint("price >= 0", name="ck_provider_pricing_non_negative"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    provider: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
+    model: Mapped[str] = mapped_column(String(255), nullable=False)
+    operation: Mapped[str] = mapped_column(String(100), nullable=False)
+    pricing_unit: Mapped[str] = mapped_column(String(50), nullable=False)
+    price: Mapped[float] = mapped_column(Numeric(18, 8), nullable=False)
+    currency: Mapped[str] = mapped_column(String(3), nullable=False)
+    version: Mapped[str] = mapped_column(String(64), nullable=False)
+    effective_from: Mapped[datetime] = mapped_column(UTCDateTime(), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utc_now, nullable=False
+    )
+
+
+class ProviderUsageRecord(Base):
+    """Immutable ledger entry for one provider request or explicit free reuse."""
+
+    __tablename__ = "provider_usage_records"
+    __table_args__ = (
+        UniqueConstraint(
+            "job_id", "pipeline_stage", "request_revision",
+            name="uq_provider_usage_request",
+        ),
+        CheckConstraint("input_units >= 0", name="ck_provider_usage_input_units"),
+        CheckConstraint("output_units >= 0", name="ck_provider_usage_output_units"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    job_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    pipeline_stage: Mapped[str] = mapped_column(String(100), nullable=False)
+    beat_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    master_scene_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    provider: Mapped[str] = mapped_column(String(100), nullable=False)
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    operation: Mapped[str] = mapped_column(String(100), nullable=False)
+    request_revision: Mapped[str] = mapped_column(String(255), nullable=False)
+    estimated_cost: Mapped[float | None] = mapped_column(Numeric(18, 8), nullable=True)
+    actual_cost: Mapped[float | None] = mapped_column(Numeric(18, 8), nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    pricing_version: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    input_units: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    output_units: Mapped[float] = mapped_column(Float, nullable=False, default=0)
+    unit_type: Mapped[str] = mapped_column(String(50), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    cost_certainty: Mapped[str] = mapped_column(String(32), nullable=False)
+    is_qa_retry: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utc_now, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="provider_usage_records")
+
+
 @event.listens_for(MasterSceneAsset, "before_update")
 def _prevent_master_scene_update(
     mapper: object,
@@ -1050,3 +1124,16 @@ def _prevent_style_reference_update(
 ) -> None:
     del mapper, connection, target
     raise ValueError("Style reference assets are immutable")
+
+
+@event.listens_for(ProviderPricing, "before_update")
+@event.listens_for(ProviderPricing, "before_delete")
+def _prevent_pricing_mutation(mapper: object, connection: object, target: object) -> None:
+    del mapper, connection, target
+    raise ValueError("Provider pricing versions are immutable")
+
+
+@event.listens_for(ProviderUsageRecord, "before_update")
+def _prevent_usage_mutation(mapper: object, connection: object, target: object) -> None:
+    del mapper, connection, target
+    raise ValueError("Provider usage records are immutable")

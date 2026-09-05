@@ -12,6 +12,12 @@ from typing import Protocol
 
 from sqlalchemy.orm import Session
 
+from app.costs import (
+    PricingUnit,
+    UsageStatus,
+    record_provider_usage,
+    usage_revision,
+)
 from app.errors import MasterSceneError
 from app.generators.image import generate_image, validate_image_prompt
 from app.generators.image_prompt import ImagePromptBuilder
@@ -86,6 +92,7 @@ async def generate_required_master_scenes(
     qa_service: VisualQAService | None = None,
     max_qa_retries: int = 2,
     downloader: Callable[[str, str], Awaitable[str]] | None = None,
+    job_id: str | None = None,
 ) -> list[MasterSceneAsset]:
     """Generate referenced masters in plan order before dependent visual beats."""
     required_ids = _required_master_scene_ids(plan)
@@ -129,6 +136,25 @@ async def generate_required_master_scenes(
                     "Master scene inputs changed; create an explicit new master version"
                 )
             await verify_master_scene_asset(existing)
+            if job_id is not None:
+                record_provider_usage(
+                    session,
+                    project_id=project.id,
+                    job_id=job_id,
+                    pipeline_stage="MASTER_SCENES",
+                    provider=project.image_provider,
+                    model=getattr(client, "model", project.image_model),
+                    operation=(
+                        "REFERENCE_GENERATION" if style_references else "NEW_IMAGE"
+                    ),
+                    request_revision=usage_revision(
+                        master_scene_id, style_version, "cached"
+                    ),
+                    unit_type=PricingUnit.PER_IMAGE,
+                    input_units=1,
+                    status=UsageStatus.CACHED,
+                    master_scene_id=master_scene_id,
+                )
             assets.append(existing)
             continue
 
@@ -147,6 +173,30 @@ async def generate_required_master_scenes(
                 prompts_by_candidate,
                 downloader or download_file,
                 use_direct_download=downloader is not None,
+                on_request=(
+                    lambda retry, candidate_path, status: record_provider_usage(
+                        session,
+                        project_id=project.id,
+                        job_id=job_id,
+                        pipeline_stage="MASTER_SCENES",
+                        provider=project.image_provider,
+                        model=getattr(client, "model", project.image_model),
+                        operation=(
+                            "REFERENCE_GENERATION"
+                            if style_references
+                            else "NEW_IMAGE"
+                        ),
+                        request_revision=usage_revision(
+                            master_scene_id, style_version, candidate_path
+                        ),
+                        unit_type=PricingUnit.PER_IMAGE,
+                        input_units=1,
+                        status=status,
+                        master_scene_id=master_scene_id,
+                        is_qa_retry=retry,
+                    )
+                    if job_id is not None else None
+                ),
             )
 
             if qa_service is not None:
@@ -170,6 +220,30 @@ async def generate_required_master_scenes(
                     qa_context,
                     qa_service,
                     max_retries=max_qa_retries,
+                    on_qa_request=(
+                        lambda attempt, succeeded: record_provider_usage(
+                            session,
+                            project_id=project.id,
+                            job_id=job_id,
+                            pipeline_stage="VISUAL_QA",
+                            provider=qa_service.provider,
+                            model=qa_service.model,
+                            operation="VISUAL_QA",
+                            request_revision=usage_revision(
+                                master_scene_id, style_version, "qa", attempt
+                            ),
+                            unit_type=PricingUnit.PER_REQUEST,
+                            input_units=1,
+                            status=(
+                                UsageStatus.SUCCEEDED
+                                if succeeded
+                                else UsageStatus.FAILED
+                            ),
+                            master_scene_id=master_scene_id,
+                            is_qa_retry=attempt > 1,
+                        )
+                        if job_id is not None else None
+                    ),
                 )
                 generated_path = qa_outcome.image_path
                 selected_candidate = qa_outcome.selected_candidate_path
@@ -527,6 +601,7 @@ def _build_master_candidate_generator(
     downloader: Callable[[str, str], Awaitable[str]],
     *,
     use_direct_download: bool,
+    on_request: Callable[[bool, str, UsageStatus], object] | None = None,
 ) -> Callable[[str | None, str], Awaitable[str]]:
     async def generate_candidate(
         correction_instruction: str | None,
@@ -538,29 +613,46 @@ def _build_master_candidate_generator(
             style_id,
         )
         prompts_by_candidate[candidate_path] = candidate_prompt
-        if style_references:
-            return await generate_continuity_image(
-                ContinuityGenerationRequest(
-                    operation=VisualOperation.REFERENCE_GENERATION,
-                    prompt=candidate_prompt,
-                    style_version=style_id,
-                    references=style_references,
-                ),
+        try:
+            if style_references:
+                result = await generate_continuity_image(
+                    ContinuityGenerationRequest(
+                        operation=VisualOperation.REFERENCE_GENERATION,
+                        prompt=candidate_prompt,
+                        style_version=style_id,
+                        references=style_references,
+                    ),
+                    candidate_path,
+                    client,
+                    downloader=downloader,
+                )
+            elif use_direct_download:
+                image_url = await client.generate(
+                    apply_image_style_contract(candidate_prompt, style_id)
+                )
+                result = await downloader(image_url, candidate_path)
+            else:
+                result = await generate_image(
+                    candidate_prompt,
+                    candidate_path,
+                    client,  # type: ignore[arg-type]
+                    style_id=style_id,
+                )
+        except Exception:
+            if on_request is not None:
+                on_request(
+                    correction_instruction is not None,
+                    candidate_path,
+                    UsageStatus.FAILED,
+                )
+            raise
+        if on_request is not None:
+            on_request(
+                correction_instruction is not None,
                 candidate_path,
-                client,
-                downloader=downloader,
+                UsageStatus.SUCCEEDED,
             )
-        if use_direct_download:
-            image_url = await client.generate(
-                apply_image_style_contract(candidate_prompt, style_id)
-            )
-            return await downloader(image_url, candidate_path)
-        return await generate_image(
-            candidate_prompt,
-            candidate_path,
-            client,  # type: ignore[arg-type]
-            style_id=style_id,
-        )
+        return result
 
     return generate_candidate
 

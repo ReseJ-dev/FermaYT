@@ -86,7 +86,7 @@ document.addEventListener("DOMContentLoaded", () => {
         ? "Используется DashScope key и настроенный Qwen Image endpoint."
         : "Используется BytePlus API key.";
     }
-    if (changedByUser && imageModel instanceof HTMLInputElement) {
+    if (changedByUser && (imageModel instanceof HTMLInputElement || imageModel instanceof HTMLSelectElement)) {
       imageModel.value = isQwen ? "qwen-image-3.0" : "seedream-5-0-260128";
     }
   };
@@ -106,6 +106,12 @@ document.addEventListener("DOMContentLoaded", () => {
   const progressPercent = document.getElementById("pipeline-percent");
   const progressMessage = document.getElementById("pipeline-message");
   const progressError = document.getElementById("pipeline-error");
+  const costRun = document.getElementById("cost-run");
+  const costEstimate = document.getElementById("cost-estimate");
+  const costRemaining = document.getElementById("cost-remaining");
+  const costTotal = document.getElementById("cost-total");
+  const costQaRetries = document.getElementById("cost-qa-retries");
+  const costNote = document.getElementById("cost-note");
   let pollingTimer = null;
 
   const renderJob = (job) => {
@@ -115,7 +121,23 @@ document.addEventListener("DOMContentLoaded", () => {
     if (progressPercent) progressPercent.textContent = `${job.progress || 0}%`;
     if (progressMessage) progressMessage.textContent = job.message || "";
     if (progressError) progressError.textContent = job.error || "";
+    if (job.cost) {
+      const suffix = job.cost.currency ? ` ${job.cost.currency}` : "";
+      if (costRun) costRun.textContent = job.cost.run_cost === null ? "—" : `${Number(job.cost.run_cost).toFixed(4)}${suffix}`;
+      if (costTotal) costTotal.textContent = job.cost.historical_project_cost === null ? "—" : `${Number(job.cost.historical_project_cost).toFixed(4)}${suffix}`;
+      if (costQaRetries) costQaRetries.textContent = `${Number(job.cost.qa_retry_cost || 0).toFixed(4)}${suffix}`;
+      if (costNote && job.cost.unpriced_records) costNote.textContent = `Без цены: ${job.cost.unpriced_records} запросов. Настройте версионированные тарифы.`;
+    }
+    if (job.cost_estimate && job.cost_estimate.minimum !== null) {
+      const suffix = job.cost_estimate.currency ? ` ${job.cost_estimate.currency}` : "";
+      if (costEstimate) costEstimate.textContent = `${Number(job.cost_estimate.minimum).toFixed(4)}–${Number(job.cost_estimate.maximum).toFixed(4)}${suffix}`;
+    }
+    if (costRemaining) {
+      const suffix = job.cost?.currency || job.cost_estimate?.currency;
+      costRemaining.textContent = job.estimated_remaining === null ? "—" : `${Number(job.estimated_remaining).toFixed(4)}${suffix ? ` ${suffix}` : ""}`;
+    }
     if (generateVideo instanceof HTMLButtonElement) {
+      generateVideo.dataset.jobStatus = job.status;
       generateVideo.disabled = ["queued", "running"].includes(job.status);
       generateVideo.textContent = job.status === "failed" ? "Продолжить / повторить" : "Сгенерировать видео";
     }
@@ -131,7 +153,13 @@ document.addEventListener("DOMContentLoaded", () => {
       if (["completed", "failed"].includes(job.status)) {
         window.clearInterval(pollingTimer);
         pollingTimer = null;
-        if (job.status === "completed") window.location.reload();
+        if (job.status === "completed") {
+          const reloadKey = `fermayt-completed-job-reloaded:${job.id}`;
+          if (window.sessionStorage.getItem(reloadKey) !== "1") {
+            window.sessionStorage.setItem(reloadKey, "1");
+            window.location.reload();
+          }
+        }
       }
     } catch (_) {
       // A later poll can recover from a transient local connection error.
@@ -140,9 +168,10 @@ document.addEventListener("DOMContentLoaded", () => {
 
   if (generateVideo instanceof HTMLButtonElement && projectForm instanceof HTMLFormElement) {
     const existingJob = generateVideo.dataset.jobId;
-    if (existingJob) {
-      pollJob(existingJob);
+    const existingJobStatus = generateVideo.dataset.jobStatus;
+    if (existingJob && ["queued", "running"].includes(existingJobStatus)) {
       pollingTimer = window.setInterval(() => pollJob(existingJob), 1500);
+      pollJob(existingJob);
     }
     generateVideo.addEventListener("click", async () => {
       generateVideo.disabled = true;
@@ -162,6 +191,7 @@ document.addEventListener("DOMContentLoaded", () => {
       }
       renderJob(payload);
       generateVideo.dataset.jobId = payload.id;
+      generateVideo.dataset.jobStatus = payload.status;
       if (pollingTimer) window.clearInterval(pollingTimer);
       pollingTimer = window.setInterval(() => pollJob(payload.id), 1500);
     });

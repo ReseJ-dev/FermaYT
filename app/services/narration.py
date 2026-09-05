@@ -12,6 +12,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from sqlalchemy.orm import Session
 
+from app.costs import PricingUnit, UsageStatus, record_provider_usage, usage_revision
 from app.generators.voice import validate_tts_text
 from app.media.probe import get_media_duration
 from app.models.timeline import (
@@ -56,6 +57,7 @@ async def generate_project_narration(
     downloader: Downloader = download_file,
     duration_probe: DurationProbe = get_media_duration,
     projects_root: str | Path = "data/projects",
+    job_id: str | None = None,
 ) -> ProjectNarrationAsset:
     """Generate or reuse one immutable canonical narration revision."""
     project = get_project(session, project_id)
@@ -91,17 +93,35 @@ async def generate_project_narration(
     )
     existing = get_project_narration_asset_by_revision(session, revision)
     if existing is not None and await _verify_audio(existing):
+        if job_id is not None:
+            _record_tts_usage(
+                session, project, job_id, revision, len(story_text),
+                actual_model, UsageStatus.CACHED,
+            )
         return existing
 
     timestamped_output: TimestampedNarrationOutput | None = None
-    if _has_native_timing(capabilities) and isinstance(
-        provider,
-        TimestampedTTSProvider,
-    ):
-        timestamped_output = await provider.generate_with_timestamps(story_text)
-        audio_result = timestamped_output.audio
-    else:
-        audio_result = await provider.generate(story_text)
+    try:
+        if _has_native_timing(capabilities) and isinstance(
+            provider,
+            TimestampedTTSProvider,
+        ):
+            timestamped_output = await provider.generate_with_timestamps(story_text)
+            audio_result = timestamped_output.audio
+        else:
+            audio_result = await provider.generate(story_text)
+    except Exception:
+        if job_id is not None:
+            _record_tts_usage(
+                session, project, job_id, revision, len(story_text),
+                actual_model, UsageStatus.FAILED,
+            )
+        raise
+    if job_id is not None:
+        _record_tts_usage(
+            session, project, job_id, revision, len(story_text),
+            actual_model, UsageStatus.SUCCEEDED,
+        )
     extension = ".mp3" if project.tts_provider == "elevenlabs" else ".wav"
     output_path = str(
         ProjectMediaPaths(project.id, projects_root).narration_audio_path(
@@ -140,6 +160,30 @@ async def generate_project_narration(
         timing_confidence=timing.confidence,
         timing_data=[item.model_dump(mode="json") for item in timing.items],
         timing_warnings=list(timing.warnings),
+    )
+
+
+def _record_tts_usage(
+    session: Session,
+    project: Project,
+    job_id: str,
+    revision: str,
+    characters: int,
+    model: str | None,
+    status: UsageStatus,
+) -> None:
+    record_provider_usage(
+        session,
+        project_id=project.id,
+        job_id=job_id,
+        pipeline_stage="TTS",
+        provider=project.tts_provider,
+        model=model,
+        operation="TTS",
+        request_revision=usage_revision(revision, "tts"),
+        unit_type=PricingUnit.PER_CHARACTER,
+        input_units=characters,
+        status=status,
     )
 
 

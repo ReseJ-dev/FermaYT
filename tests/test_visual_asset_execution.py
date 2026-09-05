@@ -752,6 +752,42 @@ def test_generated_candidate_passes_qa_and_becomes_accepted(
     assert len(client.calls) == 1
 
 
+def test_invalid_visual_qa_result_keeps_generated_beat_with_warning(
+    session: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, _, execution = _setup_execution(session)
+    provider = FakeImageProvider()
+    client = FakeVisualQAClient([{"result": "PASS", "unexpected": True}])
+    monkeypatch.setattr(
+        execution_module,
+        "resolve_project_visual_operations",
+        lambda session, project_id, provider_resolver: execution,
+    )
+    executor = _executor(
+        session,
+        tmp_path,
+        provider,
+        qa_service=VisualQAService(client),
+    )
+
+    result = asyncio.run(executor.execute_beat(project_id, execution.id, "beat_1"))
+
+    assert result.generation_status == "SUCCEEDED"
+    assert result.is_accepted is True
+    assert result.qa_status == "PASS_WITH_WARNING"
+    assert result.qa_problem_categories == ["OTHER"]
+    assert result.qa_warning is not None
+    assert "kept without automated QA" in result.qa_warning
+    assert result.qa_evaluations == []
+    assert Path(result.output_path or "").is_file()
+
+    repeated = asyncio.run(executor.execute_beat(project_id, execution.id, "beat_1"))
+    assert repeated.id == result.id
+    assert len(client.calls) == 1
+
+
 def test_complete_asset_graph_produces_visual_qa_debug_summary(
     session: Session,
     tmp_path: Path,

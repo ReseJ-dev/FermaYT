@@ -48,7 +48,13 @@
                     <option value="qwen" {% if project.image_provider == 'qwen' %}selected{% endif %}>Alibaba · Qwen Image</option>
                   </select>
                 </label>
-                <label>Модель<input id="image-model" name="image_model" value="{{ project.image_model or '' }}" placeholder="По умолчанию провайдера"><small id="image-provider-help"></small></label>
+                <label>Модель
+                  <select id="image-model" name="image_model">
+                    <option value="seedream-5-0-260128" {% if project.image_model == 'seedream-5-0-260128' %}selected{% endif %}>Seedream 5.0 Lite</option>
+                    <option value="qwen-image-3.0" {% if project.image_model == 'qwen-image-3.0' %}selected{% endif %}>Qwen Image 3.0</option>
+                  </select>
+                  <small id="image-provider-help"></small>
+                </label>
               </section>
 
               <section class="provider-selection-card">
@@ -144,7 +150,7 @@
           <li class="{% if final_video_url %}is-active{% endif %}"><span>4</span><div><strong>Видео</strong><small>Финальный MP4</small></div></li>
         </ol>
         <div class="sidebar-actions">
-          <button class="button button-primary button-full" id="generate-video" type="button" data-project-id="{{ project.id }}" data-job-id="{{ latest_job.id if latest_job else '' }}">{{ 'Продолжить / повторить' if latest_job and latest_job.status.value == 'failed' else 'Сгенерировать видео' }}</button>
+          <button class="button button-primary button-full" id="generate-video" type="button" data-project-id="{{ project.id }}" data-job-id="{{ latest_job.id if latest_job else '' }}" data-job-status="{{ latest_job.status.value if latest_job else '' }}">{{ 'Продолжить / повторить' if latest_job and latest_job.status.value == 'failed' else 'Сгенерировать видео' }}</button>
         </div>
         <section class="pipeline-progress" id="pipeline-progress" {% if not latest_job %}hidden{% endif %}>
           <div class="pipeline-progress-head"><strong id="pipeline-stage">{{ latest_job.current_stage or latest_job.status.value if latest_job else '' }}</strong><span id="pipeline-percent">{{ latest_job.progress if latest_job else 0 }}%</span></div>
@@ -152,12 +158,21 @@
           <p id="pipeline-message">{{ latest_job.message or '' if latest_job else '' }}</p>
           <p class="pipeline-error" id="pipeline-error">{{ latest_job.error or '' if latest_job else '' }}</p>
         </section>
+        <section class="cost-summary" id="cost-summary">
+          <strong>Стоимость</strong>
+          <div><span>Оценка до запуска</span><b id="cost-estimate">{% if cost_estimate.minimum is not none %}{{ '%.4f' | format(cost_estimate.minimum) }}–{{ '%.4f' | format(cost_estimate.maximum) }} {{ cost_estimate.currency }}{% elif 'persisted_visual_plan_required' in cost_estimate.unpriced_operations %}После построения visual plan{% else %}Тарифы не настроены{% endif %}</b></div>
+          <div><span>Этот запуск</span><b id="cost-run">{% if cost_summary.run_cost is not none %}{{ '%.4f' | format(cost_summary.run_cost) }} {{ cost_summary.currency or '' }}{% else %}—{% endif %}</b></div>
+          <div><span>Осталось (макс.)</span><b id="cost-remaining">{% if cost_estimate.maximum is not none %}{{ '%.4f' | format(cost_estimate.maximum) }} {{ cost_estimate.currency or '' }}{% else %}—{% endif %}</b></div>
+          <div><span>Всего по проекту</span><b id="cost-total">{% if cost_summary.historical_project_cost is not none %}{{ '%.4f' | format(cost_summary.historical_project_cost) }} {{ cost_summary.currency or '' }}{% else %}—{% endif %}</b></div>
+          <div><span>QA retries</span><b id="cost-qa-retries">{{ '%.4f' | format(cost_summary.qa_retry_cost or 0) }} {{ cost_summary.currency or '' }}</b></div>
+          <small id="cost-note">{% if cost_summary.unpriced_records %}Без цены: {{ cost_summary.unpriced_records }} запросов. Настройте версионированные тарифы.{% else %}Суммы основаны на настроенных версиях тарифов.{% endif %}</small>
+        </section>
         <section class="style-reference-control">
           <strong>Approved style reference</strong>
           <small>{{ style_reference.style_id if style_reference else 'Не загружен — используется style contract' }}</small>
           {% if not style_reference %}<input id="style-reference-file" type="file" accept="image/png"><button class="button button-secondary button-small" id="upload-style-reference" type="button" data-project-id="{{ project.id }}">Загрузить PNG</button>{% endif %}
         </section>
-        {% if final_video_url %}<div class="final-video-result"><strong>COMPLETED</strong>{% if final_render %}<small>{{ '%.2f' | format(final_render.duration) }} sec · {{ final_render.width }}×{{ final_render.height }} · {{ final_render.fps | int }} FPS</small>{% endif %}<video class="final-preview" controls src="{{ final_video_url }}"></video><a class="button button-secondary button-full" href="{{ final_video_url }}" download>Скачать MP4</a></div>{% endif %}
+        {% if final_video_url %}<div class="final-video-result"><strong>COMPLETED</strong>{% if final_render %}<small>{{ '%.2f' | format(final_render.duration) }} sec · {{ final_render.width }}×{{ final_render.height }} · {{ final_render.fps | int }} FPS</small>{% endif %}<video class="final-preview" controls src="{{ final_video_url }}"></video><a class="button button-secondary button-full" href="{{ final_video_download_url }}">Скачать MP4</a></div>{% endif %}
         <p class="helper-text">Настройте API-провайдеры перед генерацией.</p>
         <a class="text-link" href="/settings">Открыть настройки →</a>
       </section>
