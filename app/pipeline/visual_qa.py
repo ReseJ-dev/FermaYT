@@ -13,6 +13,7 @@ from typing import Protocol
 
 from pydantic import ValidationError
 
+from app.budgets import GenerationBudgetError
 from app.errors import VisualQAError
 from app.models.visual_plan import VisualBeat
 from app.models.visual_qa import (
@@ -152,6 +153,7 @@ async def generate_with_visual_qa(
     qa_service: VisualQAService | None,
     *,
     max_retries: int = 2,
+    before_qa_request: Callable[[int], object] | None = None,
     on_qa_request: Callable[[int, bool], object] | None = None,
 ) -> VisualQAOutcome:
     """Generate, inspect and correct a frame without an unbounded retry loop."""
@@ -176,6 +178,8 @@ async def generate_with_visual_qa(
         candidate_path = _candidate_path(output_path, attempt)
         try:
             generated_path = await generate_candidate(correction, candidate_path)
+        except GenerationBudgetError:
+            raise
         except Exception:
             if not candidates:
                 raise
@@ -185,6 +189,8 @@ async def generate_with_visual_qa(
         if not Path(generated_path).is_file():
             raise VisualQAError("Generated QA candidate file is missing")
         try:
+            if before_qa_request is not None:
+                before_qa_request(attempt)
             decision = await qa_service.evaluate(generated_path, context)
             if on_qa_request is not None:
                 on_qa_request(attempt, True)

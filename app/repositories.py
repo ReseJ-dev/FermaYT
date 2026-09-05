@@ -155,6 +155,10 @@ PROJECT_UPDATE_FIELDS = frozenset(
         "image_fit",
         "final_video_path",
         "rendered_at",
+        "generation_budget_enabled",
+        "generation_budget_amount",
+        "generation_budget_currency",
+        "generation_budget_warning_threshold",
     }
 )
 SCENE_UPDATE_FIELDS = frozenset(
@@ -221,7 +225,15 @@ def create_project(
     image_fit: str = "cover",
     final_video_path: str | None = None,
     rendered_at: datetime | None = None,
+    generation_budget_enabled: bool = False,
+    generation_budget_amount: float | None = None,
+    generation_budget_currency: str = "EUR",
+    generation_budget_warning_threshold: float = 0.8,
 ) -> Project:
+    _validate_project_budget(
+        generation_budget_enabled,
+        generation_budget_amount,
+    )
     project = Project(
         name=name,
         story_text=story_text,
@@ -245,6 +257,10 @@ def create_project(
         image_fit=image_fit,
         final_video_path=final_video_path,
         rendered_at=rendered_at,
+        generation_budget_enabled=generation_budget_enabled,
+        generation_budget_amount=generation_budget_amount,
+        generation_budget_currency=generation_budget_currency,
+        generation_budget_warning_threshold=generation_budget_warning_threshold,
     )
     session.add(project)
     session.commit()
@@ -270,12 +286,21 @@ def update_project(
     if project is None:
         return None
     _validate_update_fields(changes, PROJECT_UPDATE_FIELDS)
+    _validate_project_budget(
+        bool(changes.get("generation_budget_enabled", project.generation_budget_enabled)),
+        changes.get("generation_budget_amount", project.generation_budget_amount),
+    )
     for field, value in changes.items():
         setattr(project, field, value)
     project.updated_at = datetime.now(UTC)
     session.commit()
     session.refresh(project)
     return project
+
+
+def _validate_project_budget(enabled: bool, amount: object) -> None:
+    if enabled and amount is None:
+        raise ValueError("generation_budget_amount is required when budget is enabled")
 
 
 def delete_project(session: Session, project_id: str) -> bool:

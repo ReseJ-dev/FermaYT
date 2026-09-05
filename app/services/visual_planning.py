@@ -7,6 +7,7 @@ from enum import Enum
 
 from sqlalchemy.orm import Session
 
+from app.budgets import ProjectBudgetGuard
 from app.costs import PricingUnit, UsageStatus, record_provider_usage, usage_revision
 from app.errors import (
     ProjectVisualPlanError,
@@ -56,6 +57,7 @@ async def create_project_visual_plan(
     planning_client: VisualPlanningClient,
     *,
     job_id: str | None = None,
+    budget_guard: ProjectBudgetGuard | None = None,
 ) -> VisualPlan:
     """Generate, validate, and atomically persist a Project's current plan."""
     project = get_project(session, project_id)
@@ -72,6 +74,15 @@ async def create_project_visual_plan(
         project_id=project_id,
         event="planning_start",
     )
+    if budget_guard is not None:
+        budget_guard.check_paid_call(
+            pipeline_stage="PLANNING",
+            provider=project.planning_provider,
+            model=project.planning_model,
+            operation="PLANNING",
+            unit_type=PricingUnit.PER_REQUEST,
+            input_units=1,
+        )
     try:
         plan = await VisualDirector(planning_client).create_plan(story_text)
     except VisualDirectorError as exc:

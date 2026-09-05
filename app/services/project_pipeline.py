@@ -14,6 +14,7 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
+from app.budgets import ProjectBudgetGuard
 from app.costs import (
     PricingUnit,
     UsageStatus,
@@ -120,6 +121,7 @@ class ProjectPipelineReport:
     cost_currency: str | None
     unpriced_usage_records: int
     cost_run_id: str
+    generation_budget: dict[str, object]
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -132,6 +134,7 @@ async def run_project_video_pipeline(
     *,
     progress: PipelineProgress | None = None,
     job_id: str | None = None,
+    budget_override: bool = False,
 ) -> ProjectPipelineReport:
     """Run every required current stage, reusing valid persisted revisions."""
     cost_run_id = job_id or f"direct-{uuid4()}"
@@ -143,6 +146,9 @@ async def run_project_video_pipeline(
     if project is None:
         raise ValueError("Project not found")
     _validate_project_preflight(project, dependencies)
+    budget_guard = ProjectBudgetGuard(
+        session, project_id, override=budget_override
+    )
     await emit(
         ProjectPipelineStage.VALIDATING, 5, 100, "Проект готов", None, None, None
     )
@@ -170,7 +176,11 @@ async def run_project_video_pipeline(
         )
     else:
         plan = await create_project_visual_plan(
-            session, project_id, dependencies.planning_client, job_id=cost_run_id
+            session,
+            project_id,
+            dependencies.planning_client,
+            job_id=cost_run_id,
+            budget_guard=budget_guard,
         )
     total_beats = len(plan.visual_beats)
     await emit(
@@ -203,6 +213,7 @@ async def run_project_video_pipeline(
     )
     capabilities = get_image_provider_capabilities(provider)
     estimate = estimate_project_generation_cost(session, project_id)
+    budget_guard.check_preflight(estimate)
     style_reference = get_style_reference_asset(session, project_id, project.style_id)
     await emit(
         ProjectPipelineStage.RESOLVING_VISUALS,
@@ -236,6 +247,7 @@ async def run_project_video_pipeline(
         qa_service=dependencies.visual_qa_service,
         downloader=dependencies.downloader,
         job_id=cost_run_id,
+        budget_guard=budget_guard,
     )
     execution = resolve_project_visual_operations(
         session,
@@ -264,6 +276,7 @@ async def run_project_video_pipeline(
         style_id=project.style_id,
         qa_service=dependencies.visual_qa_service,
         job_id=cost_run_id,
+        budget_guard=budget_guard,
     )
     results = []
     for index, decision in enumerate(execution.decisions, start=1):
@@ -318,6 +331,7 @@ async def run_project_video_pipeline(
         "downloader": dependencies.downloader,
         "projects_root": dependencies.projects_root,
         "job_id": cost_run_id,
+        "budget_guard": budget_guard,
     }
     if dependencies.duration_probe is not None:
         narration_kwargs["duration_probe"] = dependencies.duration_probe
@@ -453,6 +467,7 @@ async def run_project_video_pipeline(
         cost_currency=costs.currency,
         unpriced_usage_records=costs.unpriced_records,
         cost_run_id=cost_run_id,
+        generation_budget=budget_guard.snapshot().as_dict(),
     )
     await emit(
         ProjectPipelineStage.COMPLETED,

@@ -5,6 +5,7 @@ import json
 import shutil
 import subprocess
 from collections.abc import Iterator, Mapping
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +13,8 @@ import pytest
 from sqlalchemy.orm import Session
 from test_master_scene import _plan
 
+from app.budgets import BUDGET_ESTIMATE_EXCEEDS_LIMIT, GenerationBudgetError
+from app.costs import PricingUnit, configure_provider_pricing
 from app.database import create_session_factory, create_sqlite_engine, init_database
 from app.jobs import GenerationJobManager, GenerationJobType
 from app.models.visual_plan import VisualPlan
@@ -245,6 +248,23 @@ def _two_beat_plan() -> VisualPlan:
     return VisualPlan.model_validate(payload)
 
 
+def _configure_budget_prices(session: Session) -> None:
+    effective = datetime(2026, 1, 1, tzinfo=UTC)
+    for provider, model, operation, unit, price in [
+        ("dashscope", "qwen-plus", "PLANNING", PricingUnit.PER_REQUEST, 0.01),
+        ("seedream", "fake-image", "NEW_IMAGE", PricingUnit.PER_IMAGE, 0.06),
+        ("seedream", "fake-image", "REFERENCE_GENERATION", PricingUnit.PER_IMAGE, 0.06),
+        ("seedream", "fake-image", "EDIT", PricingUnit.PER_IMAGE, 0.06),
+        ("dashscope", "qwen-vl-max", "VISUAL_QA", PricingUnit.PER_REQUEST, 0.01),
+        ("qwen", "fake-tts", "TTS", PricingUnit.PER_CHARACTER, 0.001),
+    ]:
+        configure_provider_pricing(
+            session, provider=provider, model=model, operation=operation,
+            pricing_unit=unit, price=price, currency="USD", version="v1",
+            effective_from=effective,
+        )
+
+
 def test_full_pipeline_from_story_only_completes_background_job(
     session: Session,
     tmp_path: Path,
@@ -285,6 +305,40 @@ def test_full_pipeline_from_story_only_completes_background_job(
     assert render.status == "SUCCEEDED"
     assert Path(render.output_path or "").is_file()
     assert qa.calls >= 2  # master and generated beat
+
+
+def test_pipeline_preflight_budget_blocks_images_before_provider_call(
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("FFmpeg is required by pipeline preflight")
+    project = _project(session)
+    update_project(
+        session,
+        project.id,
+        generation_budget_enabled=True,
+        generation_budget_amount=0.05,
+        generation_budget_currency="USD",
+    )
+    _configure_budget_prices(session)
+    planning = FakePlanningClient()
+    provider = FakeImageProvider()
+    qa = PassingQAClient()
+    dependencies = _dependencies(
+        tmp_path, provider, b"unused", b"unused", planning, qa
+    )
+
+    with pytest.raises(GenerationBudgetError) as error:
+        asyncio.run(
+            run_project_video_pipeline(
+                session, project.id, dependencies, job_id="budget-job"
+            )
+        )
+
+    assert error.value.code == BUDGET_ESTIMATE_EXCEEDS_LIMIT
+    assert planning.calls == 1
+    assert provider.calls == 0
 
 
 def test_pipeline_failure_resumes_without_regenerating_completed_master(

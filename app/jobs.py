@@ -12,6 +12,7 @@ from enum import Enum
 from pathlib import Path
 from uuid import uuid4
 
+from app.budgets import GenerationBudgetError
 from app.provider_diagnostics import (
     find_image_provider_diagnostic,
     sanitize_provider_message,
@@ -25,6 +26,7 @@ class GenerationJobStatus(str, Enum):
     RUNNING = "running"
     COMPLETED = "completed"
     FAILED = "failed"
+    PAUSED_BUDGET = "paused_budget"
 
 
 class GenerationJobType(str, Enum):
@@ -220,6 +222,13 @@ class GenerationJobManager:
             await operation(job_id)
         except asyncio.CancelledError:
             raise
+        except GenerationBudgetError as exc:
+            logger.warning(
+                "Generation job paused by budget: %s",
+                exc.code,
+                extra={"job_id": job_id, "pipeline_stage": exc.pipeline_stage},
+            )
+            await asyncio.to_thread(self._mark_budget_paused, job_id, exc)
         except Exception as exc:  # noqa: BLE001 - job boundary must persist all failures
             error = _safe_job_error(exc)
             diagnostic = find_image_provider_diagnostic(exc)
@@ -527,6 +536,33 @@ class GenerationJobManager:
                         if report is not None
                         else None
                     ),
+                    now,
+                    now,
+                    job_id,
+                ),
+            )
+
+    def _mark_budget_paused(
+        self,
+        job_id: str,
+        error: GenerationBudgetError,
+    ) -> None:
+        now = _serialize_datetime(_utc_now())
+        report = {"summary": str(error), "budget_pause": error.as_dict()}
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE generation_jobs
+                SET status = ?, message = ?, error = ?,
+                    failed_stage = current_stage, report_json = ?,
+                    completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    GenerationJobStatus.PAUSED_BUDGET.value,
+                    "Paused by generation budget",
+                    error.code,
+                    json.dumps(report, ensure_ascii=False, sort_keys=True),
                     now,
                     now,
                     job_id,

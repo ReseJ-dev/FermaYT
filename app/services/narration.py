@@ -12,6 +12,7 @@ from typing import Any, Protocol, runtime_checkable
 
 from sqlalchemy.orm import Session
 
+from app.budgets import ProjectBudgetGuard
 from app.costs import PricingUnit, UsageStatus, record_provider_usage, usage_revision
 from app.generators.voice import validate_tts_text
 from app.media.probe import get_media_duration
@@ -58,6 +59,7 @@ async def generate_project_narration(
     duration_probe: DurationProbe = get_media_duration,
     projects_root: str | Path = "data/projects",
     job_id: str | None = None,
+    budget_guard: ProjectBudgetGuard | None = None,
 ) -> ProjectNarrationAsset:
     """Generate or reuse one immutable canonical narration revision."""
     project = get_project(session, project_id)
@@ -101,6 +103,15 @@ async def generate_project_narration(
         return existing
 
     timestamped_output: TimestampedNarrationOutput | None = None
+    if budget_guard is not None:
+        budget_guard.check_paid_call(
+            pipeline_stage="TTS",
+            provider=project.tts_provider,
+            model=actual_model,
+            operation="TTS",
+            unit_type=PricingUnit.PER_CHARACTER,
+            input_units=len(story_text),
+        )
     try:
         if _has_native_timing(capabilities) and isinstance(
             provider,

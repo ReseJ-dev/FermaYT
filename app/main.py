@@ -17,6 +17,7 @@ from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
 from app.clients.image_api import ImageGenerationError
+from app.budgets import ProjectBudgetGuard
 from app.costs import (
     estimate_project_generation_cost,
     load_pricing_config,
@@ -200,6 +201,7 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
             job_id=latest_job.id if latest_job is not None else None,
         )
         cost_estimate = estimate_project_generation_cost(session, project_id)
+        budget_snapshot = ProjectBudgetGuard(session, project_id).snapshot()
         return templates.TemplateResponse(
             request=request,
             name="project.html",
@@ -214,6 +216,7 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
                 "latest_job": latest_job,
                 "cost_summary": cost_summary,
                 "cost_estimate": cost_estimate,
+                "budget_snapshot": budget_snapshot,
                 "notice": request.query_params.get("notice"),
                 "error": request.query_params.get("error"),
             },
@@ -248,6 +251,7 @@ async def generate_project_video_route(
     if active is not None:
         return _job_payload(active)
     form = await _read_optional_form(request)
+    budget_override = form.get("budget_override") == "1"
     with SessionLocal() as session:
         project = get_project(session, project_id)
         if project is None:
@@ -277,6 +281,7 @@ async def generate_project_video_route(
             job_id,
             project_id,
             dependencies,
+            budget_override,
         )
 
     job = await job_manager.enqueue(
@@ -742,6 +747,16 @@ def _optional_int(value: str | None) -> int | None:
         raise ValueError("Количество сцен должно быть целым числом.") from exc
 
 
+def _optional_float(value: str | None, label: str) -> float | None:
+    normalized = (value or "").strip()
+    if not normalized:
+        return None
+    try:
+        return float(normalized)
+    except ValueError as exc:
+        raise ValueError(f"{label} должно быть числом.") from exc
+
+
 def _choice(
     form: dict[str, str],
     field: str,
@@ -901,6 +916,19 @@ def _update_project_from_form(
         form.setdefault("visual_qa_provider", current.visual_qa_provider)
         form.setdefault("visual_qa_model", current.visual_qa_model)
         form.setdefault("style_id", current.style_id)
+    form.setdefault(
+        "generation_budget_enabled",
+        "1" if current.generation_budget_enabled else "0",
+    )
+    form.setdefault(
+        "generation_budget_amount",
+        str(current.generation_budget_amount or ""),
+    )
+    form.setdefault("generation_budget_currency", current.generation_budget_currency)
+    form.setdefault(
+        "generation_budget_warning_threshold",
+        str(current.generation_budget_warning_threshold),
+    )
     project = update_project(
         session,
         project_id,
@@ -918,6 +946,21 @@ def _update_project_from_form(
         ),
         visual_qa_model=_required(form, "visual_qa_model", "Visual QA model"),
         style_id=_required(form, "style_id", "Style ID"),
+        generation_budget_enabled=form.get("generation_budget_enabled", "0") == "1",
+        generation_budget_amount=_optional_float(
+            form.get("generation_budget_amount"), "Ограничение бюджета"
+        ),
+        generation_budget_currency=_choice(
+            form, "generation_budget_currency", {"EUR", "USD"}, "Валюта бюджета"
+        ),
+        generation_budget_warning_threshold=(
+            float(_choice(
+                form,
+                "generation_budget_warning_threshold",
+                {"0.5", "0.7", "0.8", "0.9", "1.0"},
+                "Порог предупреждения",
+            ))
+        ),
         image_provider=_choice(
             form, "image_provider", {"seedream", "qwen"}, "Провайдер изображений"
         ),
@@ -939,7 +982,12 @@ def _update_project_from_form(
     return project
 
 
-def _run_pipeline_worker(job_id: str, project_id: str, dependencies: object) -> None:
+def _run_pipeline_worker(
+    job_id: str,
+    project_id: str,
+    dependencies: object,
+    budget_override: bool = False,
+) -> None:
     async def runner() -> None:
         async def progress(
             stage: object,
@@ -968,6 +1016,7 @@ def _run_pipeline_worker(job_id: str, project_id: str, dependencies: object) -> 
                 dependencies,  # type: ignore[arg-type]
                 progress=progress,
                 job_id=job_id,
+                budget_override=budget_override,
             )
             await job_manager.set_pipeline_result(
                 job_id,
@@ -985,12 +1034,20 @@ def _job_payload(job: GenerationJob) -> dict[str, object]:
         and isinstance(job.report.get("failure"), dict)
         else None
     )
+    budget_pause = (
+        job.report.get("budget_pause")
+        if isinstance(job.report, dict)
+        and isinstance(job.report.get("budget_pause"), dict)
+        else None
+    )
     with SessionLocal() as session:
         costs = summarize_project_cost(session, job.project_id, job_id=job.id)
         try:
             estimate = estimate_project_generation_cost(session, job.project_id)
+            budget = ProjectBudgetGuard(session, job.project_id).snapshot()
         except ValueError:
             estimate = None
+            budget = None
     estimated_remaining = estimate.maximum if estimate is not None else None
     return {
         "id": job.id,
@@ -1009,6 +1066,8 @@ def _job_payload(job: GenerationJob) -> dict[str, object]:
         "final_render_id": job.final_render_id,
         "report": job.report,
         "diagnostic": diagnostic,
+        "budget_pause": budget_pause,
+        "budget": budget.as_dict() if budget is not None else None,
         "cost": costs.as_dict(),
         "cost_estimate": estimate.as_dict() if estimate is not None else None,
         "estimated_remaining": estimated_remaining,

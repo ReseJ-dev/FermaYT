@@ -65,6 +65,10 @@ def _apply_additive_schema_updates(engine: Engine) -> None:
             "visual_qa_provider": "VARCHAR(50) NOT NULL DEFAULT 'dashscope'",
             "visual_qa_model": "VARCHAR(255) NOT NULL DEFAULT 'qwen-vl-max'",
             "style_id": "VARCHAR(64) NOT NULL DEFAULT 'rough_explainer_v1'",
+            "generation_budget_enabled": "BOOLEAN NOT NULL DEFAULT 0",
+            "generation_budget_amount": "NUMERIC(18, 8)",
+            "generation_budget_currency": "VARCHAR(3) NOT NULL DEFAULT 'EUR'",
+            "generation_budget_warning_threshold": "FLOAT NOT NULL DEFAULT 0.8",
         }
         missing_project_columns = {
             name: sql_type

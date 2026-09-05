@@ -99,6 +99,7 @@ document.addEventListener("DOMContentLoaded", () => {
   }
 
   const generateVideo = document.getElementById("generate-video");
+  const continueOverBudget = document.getElementById("continue-over-budget");
   const projectForm = document.getElementById("project-settings-form");
   const progressBox = document.getElementById("pipeline-progress");
   const progressBar = document.getElementById("pipeline-progress-bar");
@@ -112,6 +113,9 @@ document.addEventListener("DOMContentLoaded", () => {
   const costTotal = document.getElementById("cost-total");
   const costQaRetries = document.getElementById("cost-qa-retries");
   const costNote = document.getElementById("cost-note");
+  const budgetAmount = document.getElementById("budget-amount");
+  const budgetAvailable = document.getElementById("budget-available");
+  const budgetWarning = document.getElementById("budget-warning");
   let pollingTimer = null;
 
   const renderJob = (job) => {
@@ -120,7 +124,7 @@ document.addEventListener("DOMContentLoaded", () => {
     if (progressStage) progressStage.textContent = job.current_stage || job.status;
     if (progressPercent) progressPercent.textContent = `${job.progress || 0}%`;
     if (progressMessage) progressMessage.textContent = job.message || "";
-    if (progressError) progressError.textContent = job.error || "";
+    if (progressError) progressError.textContent = job.budget_pause?.message || job.error || "";
     if (job.cost) {
       const suffix = job.cost.currency ? ` ${job.cost.currency}` : "";
       if (costRun) costRun.textContent = job.cost.run_cost === null ? "—" : `${Number(job.cost.run_cost).toFixed(4)}${suffix}`;
@@ -136,11 +140,17 @@ document.addEventListener("DOMContentLoaded", () => {
       const suffix = job.cost?.currency || job.cost_estimate?.currency;
       costRemaining.textContent = job.estimated_remaining === null ? "—" : `${Number(job.estimated_remaining).toFixed(4)}${suffix ? ` ${suffix}` : ""}`;
     }
+    if (job.budget) {
+      if (budgetAmount) budgetAmount.textContent = job.budget.enabled ? `${Number(job.budget.amount).toFixed(2)} ${job.budget.currency}` : "Не включён";
+      if (budgetAvailable) budgetAvailable.textContent = job.budget.available === null ? "—" : `${Number(job.budget.available).toFixed(4)} ${job.budget.currency}`;
+      if (budgetWarning) budgetWarning.textContent = job.budget.warning || "";
+    }
     if (generateVideo instanceof HTMLButtonElement) {
       generateVideo.dataset.jobStatus = job.status;
       generateVideo.disabled = ["queued", "running"].includes(job.status);
-      generateVideo.textContent = job.status === "failed" ? "Продолжить / повторить" : "Сгенерировать видео";
+      generateVideo.textContent = job.status === "paused_budget" ? "Увеличить бюджет и продолжить" : (job.status === "failed" ? "Продолжить / повторить" : "Сгенерировать видео");
     }
+    if (continueOverBudget instanceof HTMLButtonElement) continueOverBudget.hidden = job.status !== "paused_budget";
   };
 
   const pollJob = async (jobId) => {
@@ -150,7 +160,7 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!response.ok) return;
       const job = await response.json();
       renderJob(job);
-      if (["completed", "failed"].includes(job.status)) {
+      if (["completed", "failed", "paused_budget"].includes(job.status)) {
         window.clearInterval(pollingTimer);
         pollingTimer = null;
         if (job.status === "completed") {
@@ -173,10 +183,11 @@ document.addEventListener("DOMContentLoaded", () => {
       pollingTimer = window.setInterval(() => pollJob(existingJob), 1500);
       pollJob(existingJob);
     }
-    generateVideo.addEventListener("click", async () => {
+    const startPipeline = async (overrideBudget = false) => {
       generateVideo.disabled = true;
       if (progressError) progressError.textContent = "";
       const body = new URLSearchParams(new FormData(projectForm));
+      if (overrideBudget) body.set("budget_override", "1");
       const response = await fetch(`/api/projects/${generateVideo.dataset.projectId}/generate-video`, {
         method: "POST",
         headers: {"Content-Type": "application/x-www-form-urlencoded"},
@@ -194,7 +205,11 @@ document.addEventListener("DOMContentLoaded", () => {
       generateVideo.dataset.jobStatus = payload.status;
       if (pollingTimer) window.clearInterval(pollingTimer);
       pollingTimer = window.setInterval(() => pollJob(payload.id), 1500);
-    });
+    };
+    generateVideo.addEventListener("click", () => startPipeline(false));
+    if (continueOverBudget instanceof HTMLButtonElement) {
+      continueOverBudget.addEventListener("click", () => startPipeline(true));
+    }
   }
 
   const uploadStyle = document.getElementById("upload-style-reference");

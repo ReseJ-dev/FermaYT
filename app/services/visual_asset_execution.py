@@ -15,6 +15,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.budgets import ProjectBudgetGuard
 from app.costs import PricingUnit, UsageStatus, record_provider_usage, usage_revision
 from app.errors import (
     BeatVisualExecutionError,
@@ -154,6 +155,7 @@ class VisualBeatAssetExecutor:
         qa_service: VisualQAService | None = None,
         max_visual_qa_attempts: int = 3,
         job_id: str | None = None,
+        budget_guard: ProjectBudgetGuard | None = None,
     ) -> None:
         if not 1 <= max_visual_qa_attempts <= 5:
             raise ValueError("max_visual_qa_attempts must be between 1 and 5")
@@ -165,6 +167,7 @@ class VisualBeatAssetExecutor:
         self.qa_service = qa_service
         self.max_visual_qa_attempts = max_visual_qa_attempts
         self.job_id = job_id
+        self.budget_guard = budget_guard
 
     async def execute_project(
         self,
@@ -272,6 +275,8 @@ class VisualBeatAssetExecutor:
             style_reference=style_reference,
             capabilities=capabilities,
             downloader=self.downloader,
+            job_id=self.job_id,
+            budget_guard=self.budget_guard,
         )
 
         # Master availability is a Stage 2 resolution input. Re-resolve once after
@@ -438,6 +443,18 @@ class VisualBeatAssetExecutor:
                 correction,
                 self.style_id,
             ) if correction is not None else prompt
+            if operation in generated_operations and self.budget_guard is not None:
+                self.budget_guard.check_paid_call(
+                    pipeline_stage="VISUAL_GENERATION",
+                    provider=context.execution_plan.provider,
+                    model=context.execution_plan.model,
+                    operation=provider_operation_name(operation, bool(references)),
+                    unit_type=PricingUnit.PER_IMAGE,
+                    input_units=1,
+                    is_qa_retry=qa_attempt > 1,
+                    beat_id=beat.id,
+                    master_scene_id=beat.master_scene_id,
+                )
             result = create_beat_visual_result(
                 self.session,
                 project_id=context.project.id,
@@ -594,6 +611,18 @@ class VisualBeatAssetExecutor:
             )
             if previous_evaluation is None:
                 try:
+                    if self.budget_guard is not None:
+                        self.budget_guard.check_paid_call(
+                            pipeline_stage="VISUAL_QA",
+                            provider=self.qa_service.provider,
+                            model=self.qa_service.model,
+                            operation="VISUAL_QA",
+                            unit_type=PricingUnit.PER_REQUEST,
+                            input_units=1,
+                            is_qa_retry=qa_attempt > 1,
+                            beat_id=beat.id,
+                            master_scene_id=beat.master_scene_id,
+                        )
                     qa_decision = await self.qa_service.evaluate(output_path, qa_context)
                     self._record_usage(
                         context,

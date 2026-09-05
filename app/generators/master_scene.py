@@ -12,6 +12,7 @@ from typing import Protocol
 
 from sqlalchemy.orm import Session
 
+from app.budgets import GenerationBudgetError, ProjectBudgetGuard
 from app.costs import (
     PricingUnit,
     UsageStatus,
@@ -93,6 +94,7 @@ async def generate_required_master_scenes(
     max_qa_retries: int = 2,
     downloader: Callable[[str, str], Awaitable[str]] | None = None,
     job_id: str | None = None,
+    budget_guard: ProjectBudgetGuard | None = None,
 ) -> list[MasterSceneAsset]:
     """Generate referenced masters in plan order before dependent visual beats."""
     required_ids = _required_master_scene_ids(plan)
@@ -173,6 +175,23 @@ async def generate_required_master_scenes(
                 prompts_by_candidate,
                 downloader or download_file,
                 use_direct_download=downloader is not None,
+                before_request=(
+                    lambda retry: budget_guard.check_paid_call(
+                        pipeline_stage="MASTER_SCENES",
+                        provider=project.image_provider,
+                        model=getattr(client, "model", project.image_model),
+                        operation=(
+                            "REFERENCE_GENERATION"
+                            if style_references
+                            else "NEW_IMAGE"
+                        ),
+                        unit_type=PricingUnit.PER_IMAGE,
+                        input_units=1,
+                        is_qa_retry=retry,
+                        master_scene_id=master_scene_id,
+                    )
+                    if budget_guard is not None else None
+                ),
                 on_request=(
                     lambda retry, candidate_path, status: record_provider_usage(
                         session,
@@ -220,6 +239,19 @@ async def generate_required_master_scenes(
                     qa_context,
                     qa_service,
                     max_retries=max_qa_retries,
+                    before_qa_request=(
+                        lambda attempt: budget_guard.check_paid_call(
+                            pipeline_stage="VISUAL_QA",
+                            provider=qa_service.provider,
+                            model=qa_service.model,
+                            operation="VISUAL_QA",
+                            unit_type=PricingUnit.PER_REQUEST,
+                            input_units=1,
+                            is_qa_retry=attempt > 1,
+                            master_scene_id=master_scene_id,
+                        )
+                        if budget_guard is not None else None
+                    ),
                     on_qa_request=(
                         lambda attempt, succeeded: record_provider_usage(
                             session,
@@ -271,7 +303,7 @@ async def generate_required_master_scenes(
                     reference.sha256 for reference in style_references
                 ],
             )
-        except MasterSceneError:
+        except (MasterSceneError, GenerationBudgetError):
             raise
         except Exception as exc:
             summary = f"Failed to generate master scene {master_scene_id}"
@@ -601,6 +633,7 @@ def _build_master_candidate_generator(
     downloader: Callable[[str, str], Awaitable[str]],
     *,
     use_direct_download: bool,
+    before_request: Callable[[bool], object] | None = None,
     on_request: Callable[[bool, str, UsageStatus], object] | None = None,
 ) -> Callable[[str | None, str], Awaitable[str]]:
     async def generate_candidate(
@@ -613,6 +646,8 @@ def _build_master_candidate_generator(
             style_id,
         )
         prompts_by_candidate[candidate_path] = candidate_prompt
+        if before_request is not None:
+            before_request(correction_instruction is not None)
         try:
             if style_references:
                 result = await generate_continuity_image(

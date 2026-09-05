@@ -72,6 +72,15 @@ class Project(Base):
             "scene_count IS NULL OR scene_count BETWEEN 1 AND 50",
             name="ck_projects_scene_count",
         ),
+        CheckConstraint(
+            "generation_budget_amount IS NULL OR generation_budget_amount > 0",
+            name="ck_projects_generation_budget_amount",
+        ),
+        CheckConstraint(
+            "generation_budget_warning_threshold > 0 AND "
+            "generation_budget_warning_threshold <= 1",
+            name="ck_projects_generation_budget_warning_threshold",
+        ),
     )
 
     id: Mapped[str] = mapped_column(
@@ -124,6 +133,18 @@ class Project(Base):
     image_fit: Mapped[str] = mapped_column(String(20), nullable=False)
 
     final_video_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    generation_budget_enabled: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    generation_budget_amount: Mapped[float | None] = mapped_column(
+        Numeric(18, 8), nullable=True, default=None
+    )
+    generation_budget_currency: Mapped[str] = mapped_column(
+        String(3), nullable=False, default="EUR"
+    )
+    generation_budget_warning_threshold: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.8
+    )
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime(),
         default=_utc_now,
@@ -242,6 +263,34 @@ class Project(Base):
         if not normalized:
             raise ValueError(f"{key} must not be empty")
         return normalized
+
+    @validates("generation_budget_amount")
+    def validate_generation_budget_amount(
+        self, key: str, value: float | None
+    ) -> float | None:
+        del key
+        if value is not None and value <= 0:
+            raise ValueError("generation_budget_amount must be positive")
+        return value
+
+    @validates("generation_budget_currency")
+    def validate_generation_budget_currency(self, key: str, value: str) -> str:
+        del key
+        normalized = value.strip().upper()
+        if len(normalized) != 3 or not normalized.isalpha():
+            raise ValueError("generation_budget_currency must be a 3-letter code")
+        return normalized
+
+    @validates("generation_budget_warning_threshold")
+    def validate_generation_budget_warning_threshold(
+        self, key: str, value: float
+    ) -> float:
+        del key
+        if not 0 < value <= 1:
+            raise ValueError(
+                "generation_budget_warning_threshold must be between 0 and 1"
+            )
+        return value
 
 
 class ApplicationSettings(Base):

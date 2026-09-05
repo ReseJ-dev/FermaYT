@@ -22,6 +22,7 @@ from app.persistence import (
     ProjectVisualExecutionPlan,
     ProviderPricing,
     ProviderUsageRecord,
+    StyleReferenceAsset,
     VisualOperationDecisionRecord,
 )
 
@@ -341,7 +342,7 @@ def estimate_operations(
             missing.add(f"{provider}/{model or ''}/{operation}")
             continue
         minimum += float(price.price)
-        maximum += float(price.price) * max_qa_attempts
+        maximum += float(price.price) * (max_qa_attempts if qa_enabled else 1)
         currencies.add(price.currency)
     expected_qa = len(paid) if qa_enabled else 0
     max_retries = len(paid) * max(max_qa_attempts - 1, 0) if qa_enabled else 0
@@ -416,8 +417,15 @@ def estimate_project_generation_cost(
     required_masters = {
         beat.get("master_scene_id") for beat in beats if beat.get("master_scene_id")
     }
+    has_style_reference = session.scalar(
+        select(StyleReferenceAsset.id).where(
+            StyleReferenceAsset.project_id == project_id,
+            StyleReferenceAsset.style_id == project.style_id,
+        ).limit(1)
+    ) is not None
     remaining_operations.extend(
-        "NEW_IMAGE" for master_id in required_masters - existing_masters
+        ("REFERENCE_GENERATION" if has_style_reference else "NEW_IMAGE")
+        for master_id in required_masters - existing_masters
     )
     estimate = estimate_operations(
         session,

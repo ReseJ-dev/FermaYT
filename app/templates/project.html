@@ -83,6 +83,15 @@
             <label>FPS<select name="fps">{% for fps in [24, 30, 60] %}<option value="{{ fps }}" {% if project.fps == fps %}selected{% endif %}>{{ fps }}</option>{% endfor %}</select></label>
             <label>Масштаб изображения<select name="image_fit"><option value="cover" {% if project.image_fit == 'cover' %}selected{% endif %}>Заполнить кадр (cover)</option><option value="contain" {% if project.image_fit == 'contain' %}selected{% endif %}>Показать целиком (contain)</option></select></label>
             </div>
+            <h3 class="render-settings-title">Бюджет генерации</h3>
+            <input type="hidden" name="generation_budget_enabled" value="0">
+            <label class="qa-toggle"><input name="generation_budget_enabled" type="checkbox" value="1" {% if project.generation_budget_enabled %}checked{% endif %}> Ограничить расходы проекта</label>
+            <div class="form-grid two-columns">
+              <label>Максимальная сумма<input name="generation_budget_amount" type="number" min="0.01" step="0.01" value="{{ project.generation_budget_amount or '' }}" placeholder="3.00"></label>
+              <label>Валюта<select name="generation_budget_currency"><option value="EUR" {% if project.generation_budget_currency == 'EUR' %}selected{% endif %}>EUR (€)</option><option value="USD" {% if project.generation_budget_currency == 'USD' %}selected{% endif %}>USD ($)</option></select></label>
+              <label>Предупреждать при<select name="generation_budget_warning_threshold">{% for threshold, label in [('0.5', '50%'), ('0.7', '70%'), ('0.8', '80%'), ('0.9', '90%'), ('1.0', '100%')] %}<option value="{{ threshold }}" {% if project.generation_budget_warning_threshold == threshold | float %}selected{% endif %}>{{ label }}</option>{% endfor %}</select></label>
+            </div>
+            <small>Твёрдый лимит проверяется до каждого платного запроса. Валюта должна совпадать с настроенными тарифами.</small>
           </div>
         </section>
       </form>
@@ -150,7 +159,8 @@
           <li class="{% if final_video_url %}is-active{% endif %}"><span>4</span><div><strong>Видео</strong><small>Финальный MP4</small></div></li>
         </ol>
         <div class="sidebar-actions">
-          <button class="button button-primary button-full" id="generate-video" type="button" data-project-id="{{ project.id }}" data-job-id="{{ latest_job.id if latest_job else '' }}" data-job-status="{{ latest_job.status.value if latest_job else '' }}">{{ 'Продолжить / повторить' if latest_job and latest_job.status.value == 'failed' else 'Сгенерировать видео' }}</button>
+          <button class="button button-primary button-full" id="generate-video" type="button" data-project-id="{{ project.id }}" data-job-id="{{ latest_job.id if latest_job else '' }}" data-job-status="{{ latest_job.status.value if latest_job else '' }}">{{ 'Увеличить бюджет и продолжить' if latest_job and latest_job.status.value == 'paused_budget' else ('Продолжить / повторить' if latest_job and latest_job.status.value == 'failed' else 'Сгенерировать видео') }}</button>
+          <button class="button button-secondary button-full" id="continue-over-budget" type="button" {% if not latest_job or latest_job.status.value != 'paused_budget' %}hidden{% endif %}>Продолжить несмотря на лимит</button>
         </div>
         <section class="pipeline-progress" id="pipeline-progress" {% if not latest_job %}hidden{% endif %}>
           <div class="pipeline-progress-head"><strong id="pipeline-stage">{{ latest_job.current_stage or latest_job.status.value if latest_job else '' }}</strong><span id="pipeline-percent">{{ latest_job.progress if latest_job else 0 }}%</span></div>
@@ -160,12 +170,15 @@
         </section>
         <section class="cost-summary" id="cost-summary">
           <strong>Стоимость</strong>
+          <div><span>Бюджет</span><b id="budget-amount">{% if budget_snapshot.enabled %}{{ '%.2f' | format(budget_snapshot.amount) }} {{ budget_snapshot.currency }}{% else %}Не включён{% endif %}</b></div>
           <div><span>Оценка до запуска</span><b id="cost-estimate">{% if cost_estimate.minimum is not none %}{{ '%.4f' | format(cost_estimate.minimum) }}–{{ '%.4f' | format(cost_estimate.maximum) }} {{ cost_estimate.currency }}{% elif 'persisted_visual_plan_required' in cost_estimate.unpriced_operations %}После построения visual plan{% else %}Тарифы не настроены{% endif %}</b></div>
           <div><span>Этот запуск</span><b id="cost-run">{% if cost_summary.run_cost is not none %}{{ '%.4f' | format(cost_summary.run_cost) }} {{ cost_summary.currency or '' }}{% else %}—{% endif %}</b></div>
           <div><span>Осталось (макс.)</span><b id="cost-remaining">{% if cost_estimate.maximum is not none %}{{ '%.4f' | format(cost_estimate.maximum) }} {{ cost_estimate.currency or '' }}{% else %}—{% endif %}</b></div>
           <div><span>Всего по проекту</span><b id="cost-total">{% if cost_summary.historical_project_cost is not none %}{{ '%.4f' | format(cost_summary.historical_project_cost) }} {{ cost_summary.currency or '' }}{% else %}—{% endif %}</b></div>
+          <div><span>Доступно</span><b id="budget-available">{% if budget_snapshot.available is not none %}{{ '%.4f' | format(budget_snapshot.available) }} {{ budget_snapshot.currency }}{% else %}—{% endif %}</b></div>
           <div><span>QA retries</span><b id="cost-qa-retries">{{ '%.4f' | format(cost_summary.qa_retry_cost or 0) }} {{ cost_summary.currency or '' }}</b></div>
           <small id="cost-note">{% if cost_summary.unpriced_records %}Без цены: {{ cost_summary.unpriced_records }} запросов. Настройте версионированные тарифы.{% else %}Суммы основаны на настроенных версиях тарифов.{% endif %}</small>
+          <small id="budget-warning">{{ budget_snapshot.warning or '' }}</small>
         </section>
         <section class="style-reference-control">
           <strong>Approved style reference</strong>

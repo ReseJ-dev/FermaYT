@@ -29,3 +29,8 @@ are `PER_IMAGE`, `PER_CHARACTER`, and `PER_REQUEST`. Current operation names are
 
 Set `FERMAYT_PRICING_FILE` to load a different JSON file. Existing versions are
 never overwritten; add a new version/effective date when a tariff changes.
+
+When a Project budget is enabled, every provider/model/operation used by that
+Project must have a price in the same currency as the budget. Missing or mixed
+currency pricing pauses generation before the request; it is never treated as
+free.
