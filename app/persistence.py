@@ -81,6 +81,10 @@ class Project(Base):
             "generation_budget_warning_threshold <= 1",
             name="ck_projects_generation_budget_warning_threshold",
         ),
+        CheckConstraint(
+            "draft_paid_visual_ratio BETWEEN 0.05 AND 1",
+            name="ck_projects_draft_paid_visual_ratio",
+        ),
     )
 
     id: Mapped[str] = mapped_column(
@@ -133,6 +137,8 @@ class Project(Base):
     image_fit: Mapped[str] = mapped_column(String(20), nullable=False)
 
     final_video_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    draft_video_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    pilot_video_path: Mapped[str | None] = mapped_column(Text, nullable=True)
     generation_budget_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False
     )
@@ -145,6 +151,11 @@ class Project(Base):
     generation_budget_warning_threshold: Mapped[float] = mapped_column(
         Float, nullable=False, default=0.8
     )
+    draft_paid_visual_ratio: Mapped[float] = mapped_column(
+        Float, nullable=False, default=0.3
+    )
+    draft_width: Mapped[int] = mapped_column(Integer, nullable=False, default=1280)
+    draft_height: Mapped[int] = mapped_column(Integer, nullable=False, default=720)
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime(),
         default=_utc_now,
@@ -160,6 +171,12 @@ class Project(Base):
         UTCDateTime(),
         nullable=True,
         default=None,
+    )
+    draft_rendered_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True, default=None
+    )
+    pilot_rendered_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True, default=None
     )
 
     scenes: Mapped[list[Scene]] = relationship(
@@ -290,6 +307,19 @@ class Project(Base):
             raise ValueError(
                 "generation_budget_warning_threshold must be between 0 and 1"
             )
+        return value
+
+    @validates("draft_paid_visual_ratio")
+    def validate_draft_paid_visual_ratio(self, key: str, value: float) -> float:
+        del key
+        if not 0.05 <= value <= 1:
+            raise ValueError("draft_paid_visual_ratio must be between 0.05 and 1")
+        return value
+
+    @validates("draft_width", "draft_height")
+    def validate_draft_dimensions(self, key: str, value: int) -> int:
+        if value <= 0 or value % 2:
+            raise ValueError(f"{key} must be a positive even number")
         return value
 
 
@@ -478,6 +508,12 @@ class ProjectVisualExecutionPlan(Base):
     visual_plan_revision: Mapped[str] = mapped_column(String(64), nullable=False)
     provider: Mapped[str] = mapped_column(String(50), nullable=False)
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    production_profile: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="FINAL"
+    )
+    production_profile_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="final_v1"
+    )
     capability_snapshot: Mapped[dict[str, Any]] = mapped_column(
         JSON,
         nullable=False,
@@ -615,6 +651,9 @@ class BeatVisualResult(Base):
     prompt_used: Mapped[str | None] = mapped_column(Text, nullable=True)
     provider: Mapped[str] = mapped_column(String(50), nullable=False)
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    production_profile: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="FINAL"
+    )
     style_version: Mapped[str] = mapped_column(String(64), nullable=False)
     reference_snapshot: Mapped[list[dict[str, Any]]] = mapped_column(
         JSON,
@@ -905,6 +944,13 @@ class ProjectTimeline(Base):
         ForeignKey("project_narration_alignments.id", ondelete="CASCADE"), nullable=False
     )
     rhythm_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    generation_scope_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="FULL"
+    )
+    generation_scope_value: Mapped[float | None] = mapped_column(Float, nullable=True)
+    generation_scope_version: Mapped[str] = mapped_column(
+        String(64), nullable=False, default="generation_scope_v1"
+    )
     timeline_revision: Mapped[str] = mapped_column(String(64), nullable=False)
     duration: Mapped[float] = mapped_column(Float, nullable=False)
     warnings: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
@@ -982,6 +1028,13 @@ class ProjectVideoRender(Base):
     render_config_version: Mapped[str] = mapped_column(String(64), nullable=False)
     render_config_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     renderer_version: Mapped[str] = mapped_column(String(64), nullable=False)
+    production_profile: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="FINAL"
+    )
+    generation_scope_type: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="FULL"
+    )
+    generation_scope_value: Mapped[float | None] = mapped_column(Float, nullable=True)
     render_revision: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     attempt: Mapped[int] = mapped_column(Integer, nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)

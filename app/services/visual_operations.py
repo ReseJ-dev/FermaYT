@@ -18,6 +18,13 @@ from app.pipeline.visual_operation_engine import (
     VisualDecisionEvidence,
     VisualOperationDecisionEngine,
 )
+from app.production_profiles import (
+    DRAFT_PROFILE_VERSION,
+    FINAL_PROFILE_VERSION,
+    ProductionProfile,
+    draft_free_operation,
+    select_draft_key_beats,
+)
 from app.providers import (
     ImageProvider,
     get_image_provider,
@@ -44,12 +51,30 @@ def resolve_project_visual_operations(
     provider_resolver: ProviderResolver = get_image_provider,
     available_visuals: Mapping[str, str] | None = None,
     evidence_by_beat: Mapping[str, VisualDecisionEvidence] | None = None,
+    production_profile: ProductionProfile | str = ProductionProfile.FINAL,
+    draft_paid_visual_ratio: float | None = None,
 ) -> ProjectVisualExecutionPlan:
     """Resolve all beats without generating, editing, or downloading images."""
     state = require_current_project_visual_plan(session, project_id)
     project = get_project(session, project_id)
     plan_record = get_project_visual_plan_record(session, project_id)
     assert project is not None and plan_record is not None
+    profile = ProductionProfile(production_profile)
+    draft_ratio = (
+        draft_paid_visual_ratio
+        if draft_paid_visual_ratio is not None
+        else project.draft_paid_visual_ratio
+    )
+    draft_selection = (
+        select_draft_key_beats(state.plan, draft_ratio)
+        if profile is ProductionProfile.DRAFT
+        else None
+    )
+    profile_version = (
+        DRAFT_PROFILE_VERSION
+        if profile is ProductionProfile.DRAFT
+        else FINAL_PROFILE_VERSION
+    )
 
     provider_options: dict[str, Any] = {}
     if project.image_model is not None:
@@ -76,6 +101,9 @@ def resolve_project_visual_operations(
         "evidence": {
             beat_id: asdict(value) for beat_id, value in sorted(evidence.items())
         },
+        "production_profile": profile.value,
+        "production_profile_version": profile_version,
+        "draft_policy": draft_selection.snapshot() if draft_selection else None,
     }
     plan_revision = _stable_hash(state.plan.model_dump(mode="json"))
     capability_snapshot = capabilities.snapshot()
@@ -90,6 +118,8 @@ def resolve_project_visual_operations(
             "model": model,
             "capabilities": capability_snapshot,
             "decision_inputs": decision_input_snapshot,
+            "production_profile": profile.value,
+            "production_profile_version": profile_version,
         }
     )
     existing = get_visual_execution_plan_by_revision(
@@ -110,6 +140,7 @@ def resolve_project_visual_operations(
     engine = VisualOperationDecisionEngine()
     planned_visuals = dict(initial_visuals)
     records: list[dict[str, Any]] = []
+    last_key_beat_id: str | None = None
     for position, beat in enumerate(state.plan.visual_beats):
         decision = engine.decide(
             state.plan,
@@ -118,25 +149,47 @@ def resolve_project_visual_operations(
             available_visuals=planned_visuals,
             evidence=evidence.get(beat.id),
         )
+        _record_planned_output(planned_visuals, beat.id, decision.operation, decision)
+        resolved_operation = decision.operation
+        source_visual_ids = list(decision.source_visual_ids)
+        source_image_paths = [
+            path
+            for path in decision.source_image_paths
+            if not path.startswith("planned://")
+        ]
+        reasons = list(decision.reasons)
+        fallback_from = decision.fallback_from
+        if profile is ProductionProfile.DRAFT and draft_selection is not None:
+            if draft_selection.is_key(beat.id):
+                last_key_beat_id = beat.id
+                reasons.append("Selected as an important Draft key frame")
+            elif resolved_operation in {
+                VisualOperation.NEW_IMAGE,
+                VisualOperation.REFERENCE_GENERATION,
+                VisualOperation.EDIT_EXISTING,
+            }:
+                fallback_from = resolved_operation
+                resolved_operation = draft_free_operation(beat)
+                source_visual_ids = [last_key_beat_id] if last_key_beat_id else []
+                source_image_paths = []
+                reasons.append(
+                    "Draft policy reuses the nearest key visual to reduce paid calls"
+                )
         records.append(
             {
                 "position": position,
                 "beat_id": decision.beat_id,
                 "preferred_operation": decision.requested_operation.value,
-                "resolved_operation": decision.operation.value,
-                "fallback_used": decision.fallback_from is not None,
+                "resolved_operation": resolved_operation.value,
+                "fallback_used": fallback_from is not None,
                 "fallback_from": (
-                    decision.fallback_from.value
-                    if decision.fallback_from is not None
+                    fallback_from.value
+                    if fallback_from is not None
                     else None
                 ),
-                "reason": list(decision.reasons),
-                "source_visual_ids": list(decision.source_visual_ids),
-                "source_image_paths": [
-                    path
-                    for path in decision.source_image_paths
-                    if not path.startswith("planned://")
-                ],
+                "reason": reasons,
+                "source_visual_ids": source_visual_ids,
+                "source_image_paths": source_image_paths,
             }
         )
         logger.info(
@@ -148,12 +201,11 @@ def resolve_project_visual_operations(
                 "model": model,
                 "beat_id": decision.beat_id,
                 "preferred_operation": decision.requested_operation.value,
-                "resolved_operation": decision.operation.value,
+                "resolved_operation": resolved_operation.value,
                 "fallback_used": decision.fallback_from is not None,
                 "decision_reason": "; ".join(decision.reasons),
             },
         )
-        _record_planned_output(planned_visuals, beat.id, decision.operation, decision)
 
     result = save_visual_execution_plan(
         session,
@@ -166,6 +218,8 @@ def resolve_project_visual_operations(
         decision_input_snapshot=decision_input_snapshot,
         resolution_revision=resolution_revision,
         decisions=records,
+        production_profile=profile.value,
+        production_profile_version=profile_version,
     )
     _log_resolution(
         "resolution_persisted",

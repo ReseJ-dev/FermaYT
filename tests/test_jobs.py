@@ -220,3 +220,25 @@ def test_pipeline_state_and_report_survive_manager_restart(tmp_path: Path) -> No
         assert latest.id == job.id
 
     asyncio.run(scenario())
+
+
+def test_pilot_scope_survives_manager_restart(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        db_path = tmp_path / "app.db"
+        manager = GenerationJobManager(db_path)
+        job = await manager.create_job(
+            "project-1",
+            GenerationJobType.GENERATE_VIDEO,
+            production_profile="FINAL",
+            generation_scope_type="FIRST_SECONDS",
+            generation_scope_value=60,
+        )
+
+        restarted = GenerationJobManager(db_path)
+        stored = await restarted.get_job(job.id)
+
+        assert stored is not None
+        assert stored.generation_scope_type == "FIRST_SECONDS"
+        assert stored.generation_scope_value == 60
+
+    asyncio.run(scenario())

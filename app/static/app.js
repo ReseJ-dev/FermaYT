@@ -98,7 +98,8 @@ document.addEventListener("DOMContentLoaded", () => {
     });
   }
 
-  const generateVideo = document.getElementById("generate-video");
+  const generationActions = document.getElementById("generation-actions");
+  const profileButtons = Array.from(document.querySelectorAll(".generate-profile"));
   const continueOverBudget = document.getElementById("continue-over-budget");
   const projectForm = document.getElementById("project-settings-form");
   const progressBox = document.getElementById("pipeline-progress");
@@ -145,11 +146,16 @@ document.addEventListener("DOMContentLoaded", () => {
       if (budgetAvailable) budgetAvailable.textContent = job.budget.available === null ? "—" : `${Number(job.budget.available).toFixed(4)} ${job.budget.currency}`;
       if (budgetWarning) budgetWarning.textContent = job.budget.warning || "";
     }
-    if (generateVideo instanceof HTMLButtonElement) {
-      generateVideo.dataset.jobStatus = job.status;
-      generateVideo.disabled = ["queued", "running"].includes(job.status);
-      generateVideo.textContent = job.status === "paused_budget" ? "Увеличить бюджет и продолжить" : (job.status === "failed" ? "Продолжить / повторить" : "Сгенерировать видео");
+    if (generationActions instanceof HTMLElement) {
+      generationActions.dataset.jobStatus = job.status;
+      generationActions.dataset.jobId = job.id;
+      generationActions.dataset.jobProfile = job.production_profile || "FINAL";
+      generationActions.dataset.jobScope = job.generation_scope?.type || "FULL";
+      generationActions.dataset.jobScopeValue = job.generation_scope?.value ?? "";
     }
+    profileButtons.forEach((button) => {
+      if (button instanceof HTMLButtonElement) button.disabled = ["queued", "running"].includes(job.status);
+    });
     if (continueOverBudget instanceof HTMLButtonElement) continueOverBudget.hidden = job.status !== "paused_budget";
   };
 
@@ -176,19 +182,22 @@ document.addEventListener("DOMContentLoaded", () => {
     }
   };
 
-  if (generateVideo instanceof HTMLButtonElement && projectForm instanceof HTMLFormElement) {
-    const existingJob = generateVideo.dataset.jobId;
-    const existingJobStatus = generateVideo.dataset.jobStatus;
+  if (generationActions instanceof HTMLElement && projectForm instanceof HTMLFormElement) {
+    const existingJob = generationActions.dataset.jobId;
+    const existingJobStatus = generationActions.dataset.jobStatus;
     if (existingJob && ["queued", "running"].includes(existingJobStatus)) {
       pollingTimer = window.setInterval(() => pollJob(existingJob), 1500);
       pollJob(existingJob);
     }
-    const startPipeline = async (overrideBudget = false) => {
-      generateVideo.disabled = true;
+    const startPipeline = async (profile, scope = "FULL", scopeValue = "", overrideBudget = false) => {
+      profileButtons.forEach((button) => { if (button instanceof HTMLButtonElement) button.disabled = true; });
       if (progressError) progressError.textContent = "";
       const body = new URLSearchParams(new FormData(projectForm));
+      body.set("production_profile", profile);
+      body.set("generation_scope_type", scope);
+      if (scopeValue !== "") body.set("generation_scope_value", String(scopeValue));
       if (overrideBudget) body.set("budget_override", "1");
-      const response = await fetch(`/api/projects/${generateVideo.dataset.projectId}/generate-video`, {
+      const response = await fetch(`/api/projects/${generationActions.dataset.projectId}/generate-video`, {
         method: "POST",
         headers: {"Content-Type": "application/x-www-form-urlencoded"},
         body,
@@ -197,18 +206,35 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!response.ok) {
         if (progressBox) progressBox.hidden = false;
         if (progressError) progressError.textContent = payload.detail || "Не удалось запустить pipeline";
-        generateVideo.disabled = false;
+        profileButtons.forEach((button) => { if (button instanceof HTMLButtonElement) button.disabled = false; });
         return;
       }
       renderJob(payload);
-      generateVideo.dataset.jobId = payload.id;
-      generateVideo.dataset.jobStatus = payload.status;
+      generationActions.dataset.jobId = payload.id;
+      generationActions.dataset.jobStatus = payload.status;
+      generationActions.dataset.jobProfile = payload.production_profile;
+      generationActions.dataset.jobScope = payload.generation_scope?.type || "FULL";
+      generationActions.dataset.jobScopeValue = payload.generation_scope?.value ?? "";
       if (pollingTimer) window.clearInterval(pollingTimer);
       pollingTimer = window.setInterval(() => pollJob(payload.id), 1500);
     };
-    generateVideo.addEventListener("click", () => startPipeline(false));
+    profileButtons.forEach((button) => {
+      if (button instanceof HTMLButtonElement) {
+        button.addEventListener("click", () => startPipeline(
+          button.dataset.profile || "FINAL",
+          button.dataset.scope || "FULL",
+          button.dataset.scopeValue || "",
+          false,
+        ));
+      }
+    });
     if (continueOverBudget instanceof HTMLButtonElement) {
-      continueOverBudget.addEventListener("click", () => startPipeline(true));
+      continueOverBudget.addEventListener("click", () => startPipeline(
+        generationActions.dataset.jobProfile || "FINAL",
+        generationActions.dataset.jobScope || "FULL",
+        generationActions.dataset.jobScopeValue || "",
+        true,
+      ));
     }
   }
 

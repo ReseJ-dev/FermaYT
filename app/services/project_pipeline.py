@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.budgets import ProjectBudgetGuard
@@ -23,9 +24,12 @@ from app.costs import (
     summarize_project_cost,
     usage_revision,
 )
+from app.generation_scope import GenerationScope, GenerationScopeType
 from app.generators.master_scene import generate_required_master_scenes
 from app.models.render import ProjectRenderConfig
+from app.persistence import ProviderUsageRecord
 from app.pipeline.visual_qa import VisualQAService
+from app.production_profiles import ProductionProfile
 from app.providers import (
     ImageProvider,
     TTSProvider,
@@ -122,6 +126,14 @@ class ProjectPipelineReport:
     unpriced_usage_records: int
     cost_run_id: str
     generation_budget: dict[str, object]
+    production_profile: str
+    production_profile_version: str
+    paid_visual_beats: int
+    free_visual_beats: int
+    visual_qa_calls: int
+    projected_final_cost: dict[str, Any] | None
+    generation_scope: dict[str, str | float | int | None]
+    semantic_visual_beats: int
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -135,9 +147,13 @@ async def run_project_video_pipeline(
     progress: PipelineProgress | None = None,
     job_id: str | None = None,
     budget_override: bool = False,
+    production_profile: ProductionProfile | str = ProductionProfile.FINAL,
+    generation_scope: GenerationScope | None = None,
 ) -> ProjectPipelineReport:
     """Run every required current stage, reusing valid persisted revisions."""
     cost_run_id = job_id or f"direct-{uuid4()}"
+    profile = ProductionProfile(production_profile)
+    scope = generation_scope or GenerationScope.full()
     emit = progress or _ignore_progress
     await emit(
         ProjectPipelineStage.VALIDATING, 2, 0, "Проверка проекта", None, None, None
@@ -146,9 +162,17 @@ async def run_project_video_pipeline(
     if project is None:
         raise ValueError("Project not found")
     _validate_project_preflight(project, dependencies)
-    budget_guard = ProjectBudgetGuard(
-        session, project_id, override=budget_override
-    )
+    budget_guard = ProjectBudgetGuard(session, project_id, override=budget_override)
+    narration_kwargs: dict[str, Any] = {
+        "provider_resolver": dependencies.tts_provider_resolver,
+        "downloader": dependencies.downloader,
+        "projects_root": dependencies.projects_root,
+        "job_id": cost_run_id,
+        "budget_guard": budget_guard,
+    }
+    if dependencies.duration_probe is not None:
+        narration_kwargs["duration_probe"] = dependencies.duration_probe
+    narration = None
     await emit(
         ProjectPipelineStage.VALIDATING, 5, 100, "Проект готов", None, None, None
     )
@@ -167,11 +191,18 @@ async def run_project_video_pipeline(
     if plan_reused:
         plan = existing_plan.plan
         record_provider_usage(
-            session, project_id=project_id, job_id=cost_run_id,
-            pipeline_stage="PLANNING", provider=project.planning_provider,
-            model=project.planning_model, operation="PLANNING",
-            request_revision=usage_revision(hash_story_text(project.story_text), "planning"),
-            unit_type=PricingUnit.PER_REQUEST, input_units=1,
+            session,
+            project_id=project_id,
+            job_id=cost_run_id,
+            pipeline_stage="PLANNING",
+            provider=project.planning_provider,
+            model=project.planning_model,
+            operation="PLANNING",
+            request_revision=usage_revision(
+                hash_story_text(project.story_text), "planning"
+            ),
+            unit_type=PricingUnit.PER_REQUEST,
+            input_units=1,
             status=UsageStatus.CACHED,
         )
     else:
@@ -182,12 +213,15 @@ async def run_project_video_pipeline(
             job_id=cost_run_id,
             budget_guard=budget_guard,
         )
-    total_beats = len(plan.visual_beats)
+    semantic_total_beats = len(plan.visual_beats)
+    selected_beat_ids = scope.select_beat_ids(plan)
+    selected_beat_id_set = frozenset(selected_beat_ids)
+    total_beats = len(selected_beat_ids)
     await emit(
         ProjectPipelineStage.PLANNING,
         15,
         100,
-        f"Визуальный план: {total_beats} beats",
+        f"Визуальный план: {semantic_total_beats} beats; выбрано {total_beats}",
         None,
         total_beats,
         None,
@@ -206,14 +240,38 @@ async def run_project_video_pipeline(
         session,
         project_id,
         provider_resolver=dependencies.image_provider_resolver,
+        production_profile=profile,
     )
     provider = dependencies.image_provider_resolver(
         project.image_provider,
         {"model": project.image_model} if project.image_model else None,
     )
     capabilities = get_image_provider_capabilities(provider)
-    estimate = estimate_project_generation_cost(session, project_id)
+    estimate = estimate_project_generation_cost(
+        session,
+        project_id,
+        production_profile=profile.value,
+        beat_ids=selected_beat_id_set,
+    )
     budget_guard.check_preflight(estimate)
+    if scope.type is GenerationScopeType.FIRST_SECONDS:
+        narration = await generate_project_narration(
+            session, project_id, **narration_kwargs
+        )
+        alignment = align_project_visual_beats(session, project_id, narration)
+        selected_beat_ids = scope.select_aligned_beat_ids(
+            plan,
+            {item.beat_id: item.audio_end for item in alignment.beat_timings},
+        )
+        selected_beat_id_set = frozenset(selected_beat_ids)
+        total_beats = len(selected_beat_ids)
+        estimate = estimate_project_generation_cost(
+            session,
+            project_id,
+            production_profile=profile.value,
+            beat_ids=selected_beat_id_set,
+        )
+        budget_guard.check_preflight(estimate)
     style_reference = get_style_reference_asset(session, project_id, project.style_id)
     await emit(
         ProjectPipelineStage.RESOLVING_VISUALS,
@@ -248,11 +306,13 @@ async def run_project_video_pipeline(
         downloader=dependencies.downloader,
         job_id=cost_run_id,
         budget_guard=budget_guard,
+        required_beat_ids=selected_beat_id_set,
     )
     execution = resolve_project_visual_operations(
         session,
         project_id,
         provider_resolver=dependencies.image_provider_resolver,
+        production_profile=profile,
     )
     await emit(
         ProjectPipelineStage.GENERATING_MASTERS,
@@ -277,9 +337,15 @@ async def run_project_video_pipeline(
         qa_service=dependencies.visual_qa_service,
         job_id=cost_run_id,
         budget_guard=budget_guard,
+        required_beat_ids=selected_beat_id_set,
     )
     results = []
-    for index, decision in enumerate(execution.decisions, start=1):
+    scoped_decisions = [
+        decision
+        for decision in execution.decisions
+        if decision.beat_id in selected_beat_id_set
+    ]
+    for index, decision in enumerate(scoped_decisions, start=1):
         stage_progress = round((index - 1) / max(total_beats, 1) * 100)
         overall = 30 + round((index - 1) / max(total_beats, 1) * 30)
         await emit(
@@ -326,18 +392,10 @@ async def run_project_video_pipeline(
         total_beats,
         None,
     )
-    narration_kwargs: dict[str, Any] = {
-        "provider_resolver": dependencies.tts_provider_resolver,
-        "downloader": dependencies.downloader,
-        "projects_root": dependencies.projects_root,
-        "job_id": cost_run_id,
-        "budget_guard": budget_guard,
-    }
-    if dependencies.duration_probe is not None:
-        narration_kwargs["duration_probe"] = dependencies.duration_probe
-    narration = await generate_project_narration(
-        session, project_id, **narration_kwargs
-    )
+    if narration is None:
+        narration = await generate_project_narration(
+            session, project_id, **narration_kwargs
+        )
     await emit(
         ProjectPipelineStage.GENERATING_NARRATION,
         73,
@@ -377,7 +435,14 @@ async def run_project_video_pipeline(
         total_beats,
         None,
     )
-    timeline = build_project_timeline(session, project_id, execution.id, narration.id)
+    timeline = build_project_timeline(
+        session,
+        project_id,
+        execution.id,
+        narration.id,
+        generation_scope=scope,
+        selected_beat_ids=selected_beat_ids,
+    )
     await emit(
         ProjectPipelineStage.BUILDING_TIMELINE,
         86,
@@ -389,8 +454,19 @@ async def run_project_video_pipeline(
     )
 
     render_config = ProjectRenderConfig(
-        width=project.width,
-        height=project.height,
+        version=(
+            "draft_render_config_v1"
+            if profile is ProductionProfile.DRAFT
+            else "project_render_config_v1"
+        ),
+        width=(
+            project.draft_width if profile is ProductionProfile.DRAFT else project.width
+        ),
+        height=(
+            project.draft_height
+            if profile is ProductionProfile.DRAFT
+            else project.height
+        ),
         fps=project.fps,
         image_fit_mode=project.image_fit.upper(),
     )
@@ -412,6 +488,7 @@ async def run_project_video_pipeline(
         timeline.id,
         config=render_config,
         projects_root=dependencies.projects_root,
+        production_profile=profile,
     )
     await emit(
         ProjectPipelineStage.VALIDATING_VIDEO,
@@ -431,6 +508,20 @@ async def run_project_video_pipeline(
     qa_summary = build_visual_qa_execution_summary(all_results)
     operation_counts = Counter(item.resolved_operation for item in results)
     costs = summarize_project_cost(session, project_id, job_id=cost_run_id)
+    paid_operation_names = {"NEW_IMAGE", "REFERENCE_GENERATION", "EDIT_EXISTING"}
+    projected_final = None
+    if profile is ProductionProfile.DRAFT:
+        resolve_project_visual_operations(
+            session,
+            project_id,
+            provider_resolver=dependencies.image_provider_resolver,
+            production_profile=ProductionProfile.FINAL,
+        )
+        projected_final = estimate_project_generation_cost(
+            session,
+            project_id,
+            production_profile=ProductionProfile.FINAL.value,
+        ).as_dict()
     report = ProjectPipelineReport(
         pipeline_version=PIPELINE_VERSION,
         project_id=project_id,
@@ -452,7 +543,12 @@ async def run_project_video_pipeline(
             "visual_plan": plan_reused,
             "master_assets": min(masters_before, len(masters)),
             "accepted_visual_assets": sum(
-                result.id in accepted_before for result in results
+                result.id in accepted_before
+                or (
+                    result.resolved_operation == "REUSE"
+                    and result.source_result_id in accepted_before
+                )
+                for result in results
             ),
             "render": render.id in previous_render_ids,
         },
@@ -468,6 +564,31 @@ async def run_project_video_pipeline(
         unpriced_usage_records=costs.unpriced_records,
         cost_run_id=cost_run_id,
         generation_budget=budget_guard.snapshot().as_dict(),
+        production_profile=profile.value,
+        production_profile_version=execution.production_profile_version,
+        paid_visual_beats=sum(operation_counts[name] for name in paid_operation_names),
+        free_visual_beats=sum(
+            operation_counts[name] for name in ("REUSE", "TRANSFORM", "OVERLAY")
+        ),
+        visual_qa_calls=int(
+            session.scalar(
+                select(func.count(ProviderUsageRecord.id)).where(
+                    ProviderUsageRecord.project_id == project_id,
+                    ProviderUsageRecord.job_id == cost_run_id,
+                    ProviderUsageRecord.pipeline_stage == "VISUAL_QA",
+                    ProviderUsageRecord.status.in_(
+                        [
+                            UsageStatus.SUCCEEDED.value,
+                            UsageStatus.FAILED.value,
+                        ]
+                    ),
+                )
+            )
+            or 0
+        ),
+        projected_final_cost=projected_final,
+        generation_scope=scope.snapshot(),
+        semantic_visual_beats=semantic_total_beats,
     )
     await emit(
         ProjectPipelineStage.COMPLETED,

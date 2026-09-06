@@ -59,6 +59,7 @@ from app.pipeline.visual_qa import (
     is_hard_qa_failure,
     qa_candidate_penalty,
 )
+from app.production_profiles import ProductionProfile
 from app.provider_capabilities import ImageProviderCapabilities
 from app.provider_diagnostics import diagnostic_from_exception
 from app.providers import (
@@ -156,6 +157,7 @@ class VisualBeatAssetExecutor:
         max_visual_qa_attempts: int = 3,
         job_id: str | None = None,
         budget_guard: ProjectBudgetGuard | None = None,
+        required_beat_ids: set[str] | frozenset[str] | None = None,
     ) -> None:
         if not 1 <= max_visual_qa_attempts <= 5:
             raise ValueError("max_visual_qa_attempts must be between 1 and 5")
@@ -168,6 +170,9 @@ class VisualBeatAssetExecutor:
         self.max_visual_qa_attempts = max_visual_qa_attempts
         self.job_id = job_id
         self.budget_guard = budget_guard
+        self.required_beat_ids = (
+            frozenset(required_beat_ids) if required_beat_ids is not None else None
+        )
 
     async def execute_project(
         self,
@@ -277,15 +282,29 @@ class VisualBeatAssetExecutor:
             downloader=self.downloader,
             job_id=self.job_id,
             budget_guard=self.budget_guard,
+            required_beat_ids=self.required_beat_ids,
         )
 
         # Master availability is a Stage 2 resolution input. Re-resolve once after
         # masters exist instead of silently using decisions made without them.
-        current_execution_plan = resolve_project_visual_operations(
-            self.session,
-            project_id,
-            provider_resolver=lambda name, config: provider,
-        )
+        if execution_plan.production_profile == ProductionProfile.FINAL.value:
+            current_execution_plan = resolve_project_visual_operations(
+                self.session,
+                project_id,
+                provider_resolver=lambda name, config: provider,
+            )
+        else:
+            current_execution_plan = resolve_project_visual_operations(
+                self.session,
+                project_id,
+                provider_resolver=lambda name, config: provider,
+                production_profile=execution_plan.production_profile,
+                draft_paid_visual_ratio=(
+                    execution_plan.decision_input_snapshot.get("draft_policy", {}).get("ratio")
+                    if execution_plan.decision_input_snapshot.get("draft_policy")
+                    else None
+                ),
+            )
         if current_execution_plan.id != execution_plan.id:
             logger.info(
                 "Visual operations re-resolved after master generation",
@@ -357,12 +376,20 @@ class VisualBeatAssetExecutor:
         )
         transform = _build_transform(beat) if operation is VisualOperation.TRANSFORM else None
         overlay = _build_overlay(beat) if operation is VisualOperation.OVERLAY else None
-        semantic_state = _semantic_state_snapshot(beat, decision.position)
+        semantic_state = _semantic_state_snapshot(
+            beat,
+            decision.position,
+            story_revision=context.execution_plan.visual_plan.story_text_hash,
+        )
         reference_snapshot = _reference_snapshot(selected_references)
         generation_revision = _stable_hash(
             {
                 "visual_plan_revision": context.execution_plan.visual_plan_revision,
                 "execution_plan_revision": context.execution_plan.resolution_revision,
+                "production_profile": context.execution_plan.production_profile,
+                "production_profile_version": (
+                    context.execution_plan.production_profile_version
+                ),
                 "beat": semantic_state,
                 "resolved_operation": operation.value,
                 "source_asset_id": source.asset_id if source else None,
@@ -416,6 +443,30 @@ class VisualBeatAssetExecutor:
             VisualOperation.REFERENCE_GENERATION,
             VisualOperation.EDIT_EXISTING,
         }
+        reused_scoped = await self._reuse_compatible_scoped_result(
+            context,
+            beat=beat,
+            operation=operation,
+            prompt=prompt,
+            semantic_state=semantic_state,
+            generation_revision=generation_revision,
+            reference_snapshot=reference_snapshot,
+        )
+        if reused_scoped is not None:
+            return reused_scoped
+        promoted = await self._promote_compatible_draft_result(
+            context,
+            beat=beat,
+            operation=operation,
+            prompt=prompt,
+            semantic_state=semantic_state,
+            generation_revision=generation_revision,
+            source=source,
+            master_asset=master_asset,
+            reference_snapshot=reference_snapshot,
+        )
+        if promoted is not None:
+            return promoted
         should_run_qa = operation in generated_operations and self.qa_service is not None
         total_attempts = self.max_visual_qa_attempts if should_run_qa else 1
         correction: str | None = None
@@ -474,6 +525,7 @@ class VisualBeatAssetExecutor:
                 prompt_used=prompt_used,
                 provider=context.execution_plan.provider,
                 model=context.execution_plan.model,
+                production_profile=context.execution_plan.production_profile,
                 style_version=self.style_id,
                 reference_snapshot=reference_snapshot,
                 generation_status=BeatVisualGenerationStatus.PENDING.value,
@@ -744,6 +796,237 @@ class VisualBeatAssetExecutor:
             f"Visual QA rejected all {total_attempts} candidates for beat {beat.id}"
         )
 
+    async def _reuse_compatible_scoped_result(
+        self,
+        context: _ExecutionContext,
+        *,
+        beat: VisualBeat,
+        operation: VisualOperation,
+        prompt: str | None,
+        semantic_state: dict[str, Any],
+        generation_revision: str,
+        reference_snapshot: list[dict[str, Any]],
+    ) -> BeatVisualResult | None:
+        """Carry an exact Pilot result into a later compatible execution revision."""
+        for candidate in reversed(list_beat_visual_results(
+            self.session,
+            context.project.id,
+            beat_id=beat.id,
+            accepted_only=True,
+        )):
+            qa_compatible = (
+                candidate.qa_status == BeatVisualQAStatus.NOT_RUN.value
+                if self.qa_service is None
+                else (
+                    candidate.qa_status == VisualQAResult.PASS.value
+                    and candidate.qa_provider == self.qa_service.provider
+                    and candidate.qa_model == self.qa_service.model
+                    and candidate.qa_prompt_version == self.qa_service.prompt_version
+                )
+            )
+            if not (
+                candidate.execution_plan_id != context.execution_plan.id
+                and candidate.production_profile
+                == context.execution_plan.production_profile
+                and candidate.visual_plan_id == context.execution_plan.visual_plan_id
+                and candidate.visual_plan_revision
+                == context.execution_plan.visual_plan_revision
+                and candidate.resolved_operation == operation.value
+                and candidate.semantic_state_snapshot == semantic_state
+                and candidate.prompt_used == prompt
+                and candidate.provider == context.execution_plan.provider
+                and candidate.model == context.execution_plan.model
+                and candidate.style_version == self.style_id
+                and candidate.master_scene_id == beat.master_scene_id
+                and _references_are_compatible(
+                    candidate.reference_snapshot,
+                    reference_snapshot,
+                )
+                and qa_compatible
+                and await _verify_result_file(candidate)
+            ):
+                continue
+            result = create_beat_visual_result(
+                self.session,
+                project_id=context.project.id,
+                visual_plan_id=context.execution_plan.visual_plan_id,
+                visual_plan_revision=context.execution_plan.visual_plan_revision,
+                execution_plan_id=context.execution_plan.id,
+                beat_id=beat.id,
+                resolved_operation=VisualOperation.REUSE.value,
+                source_result_id=candidate.id,
+                source_path=candidate.output_path,
+                output_path=candidate.output_path,
+                file_sha256=candidate.file_sha256,
+                master_scene_id=beat.master_scene_id,
+                prompt_used=prompt,
+                provider=candidate.provider,
+                model=candidate.model,
+                production_profile=context.execution_plan.production_profile,
+                style_version=candidate.style_version,
+                reference_snapshot=reference_snapshot,
+                generation_status=BeatVisualGenerationStatus.SUCCEEDED.value,
+                qa_status=candidate.qa_status,
+                qa_result=candidate.qa_result,
+                qa_scores=candidate.qa_scores,
+                qa_problem_categories=candidate.qa_problem_categories,
+                qa_reasons=candidate.qa_reasons,
+                qa_correction_instruction=candidate.qa_correction_instruction,
+                qa_provider=candidate.qa_provider,
+                qa_model=candidate.qa_model,
+                qa_attempt=candidate.qa_attempt,
+                qa_revision=candidate.qa_revision,
+                qa_prompt_version=candidate.qa_prompt_version,
+                qa_warning=candidate.qa_warning,
+                is_accepted=True,
+                accepted_at=candidate.accepted_at,
+                error=None,
+                semantic_state_snapshot=semantic_state,
+                generation_revision=generation_revision,
+                attempt=next_beat_visual_attempt(
+                    self.session,
+                    execution_plan_id=context.execution_plan.id,
+                    beat_id=beat.id,
+                    generation_revision=generation_revision,
+                ),
+            )
+            self._record_usage(
+                context,
+                beat_id=beat.id,
+                operation="PILOT_ASSET_REUSE",
+                revision=usage_revision(generation_revision, "pilot-reuse"),
+                status=UsageStatus.CACHED,
+            )
+            return result
+        return None
+
+    async def _promote_compatible_draft_result(
+        self,
+        context: _ExecutionContext,
+        *,
+        beat: VisualBeat,
+        operation: VisualOperation,
+        prompt: str | None,
+        semantic_state: dict[str, Any],
+        generation_revision: str,
+        source: SelectedVisualReference | None,
+        master_asset: MasterSceneAsset | None,
+        reference_snapshot: list[dict[str, Any]],
+    ) -> BeatVisualResult | None:
+        """Reuse a Draft image in Final only when generation and QA are equivalent."""
+        generated_operations = {
+            VisualOperation.NEW_IMAGE,
+            VisualOperation.REFERENCE_GENERATION,
+            VisualOperation.EDIT_EXISTING,
+        }
+        if (
+            context.execution_plan.production_profile
+            != ProductionProfile.FINAL.value
+            or operation not in generated_operations
+            or self.qa_service is None
+        ):
+            return None
+
+        candidates = reversed(
+            list_beat_visual_results(
+                self.session,
+                context.project.id,
+                beat_id=beat.id,
+                accepted_only=True,
+            )
+        )
+        for candidate in candidates:
+            if not (
+                candidate.production_profile == ProductionProfile.DRAFT.value
+                and candidate.visual_plan_id == context.execution_plan.visual_plan_id
+                and candidate.visual_plan_revision
+                == context.execution_plan.visual_plan_revision
+                and candidate.resolved_operation == operation.value
+                and candidate.semantic_state_snapshot == semantic_state
+                and candidate.prompt_used == prompt
+                and candidate.provider == context.execution_plan.provider
+                and candidate.model == context.execution_plan.model
+                and candidate.style_version == self.style_id
+                and candidate.master_scene_id == beat.master_scene_id
+                and _references_are_compatible(
+                    candidate.reference_snapshot,
+                    reference_snapshot,
+                )
+                and candidate.qa_status == VisualQAResult.PASS.value
+                and candidate.qa_provider == self.qa_service.provider
+                and candidate.qa_model == self.qa_service.model
+                and candidate.qa_prompt_version == self.qa_service.prompt_version
+                and await _verify_result_file(candidate)
+            ):
+                continue
+
+            result = create_beat_visual_result(
+                self.session,
+                project_id=context.project.id,
+                visual_plan_id=context.execution_plan.visual_plan_id,
+                visual_plan_revision=context.execution_plan.visual_plan_revision,
+                execution_plan_id=context.execution_plan.id,
+                beat_id=beat.id,
+                resolved_operation=VisualOperation.REUSE.value,
+                source_result_id=candidate.id,
+                source_master_asset_id=(
+                    source.master_asset_id if source is not None else None
+                ),
+                source_path=candidate.output_path,
+                output_path=candidate.output_path,
+                file_sha256=candidate.file_sha256,
+                master_scene_id=beat.master_scene_id,
+                prompt_used=prompt,
+                provider=context.execution_plan.provider,
+                model=context.execution_plan.model,
+                production_profile=ProductionProfile.FINAL.value,
+                style_version=self.style_id,
+                reference_snapshot=reference_snapshot,
+                generation_status=BeatVisualGenerationStatus.SUCCEEDED.value,
+                qa_status=VisualQAResult.PASS.value,
+                qa_result=VisualQAResult.PASS.value,
+                qa_scores=candidate.qa_scores,
+                qa_problem_categories=candidate.qa_problem_categories,
+                qa_reasons=candidate.qa_reasons,
+                qa_correction_instruction=candidate.qa_correction_instruction,
+                qa_provider=candidate.qa_provider,
+                qa_model=candidate.qa_model,
+                qa_attempt=candidate.qa_attempt,
+                qa_revision=candidate.qa_revision,
+                qa_prompt_version=candidate.qa_prompt_version,
+                qa_warning=candidate.qa_warning,
+                is_accepted=True,
+                accepted_at=candidate.accepted_at,
+                error=None,
+                semantic_state_snapshot=semantic_state,
+                generation_revision=generation_revision,
+                attempt=next_beat_visual_attempt(
+                    self.session,
+                    execution_plan_id=context.execution_plan.id,
+                    beat_id=beat.id,
+                    generation_revision=generation_revision,
+                ),
+            )
+            self._record_usage(
+                context,
+                beat_id=beat.id,
+                operation="DRAFT_ASSET_PROMOTION",
+                revision=usage_revision(generation_revision, "draft-promotion"),
+                status=UsageStatus.CACHED,
+            )
+            logger.info(
+                "Compatible Draft visual promoted to Final",
+                extra={
+                    "project_id": context.project.id,
+                    "beat_id": beat.id,
+                    "draft_result_id": candidate.id,
+                    "final_result_id": result.id,
+                    "qa_revision": candidate.qa_revision,
+                },
+            )
+            return result
+        return None
+
     def _record_usage(
         self,
         context: _ExecutionContext,
@@ -1010,9 +1293,15 @@ def _get_beat(plan: VisualPlan, beat_id: str) -> VisualBeat:
     return beat
 
 
-def _semantic_state_snapshot(beat: VisualBeat, position: int) -> dict[str, Any]:
+def _semantic_state_snapshot(
+    beat: VisualBeat,
+    position: int,
+    *,
+    story_revision: str | None = None,
+) -> dict[str, Any]:
     return {
         "beat_position": position,
+        "story_revision": story_revision,
         "location_id": beat.location_id,
         "master_scene_id": beat.master_scene_id,
         "characters_visible": list(beat.characters_visible),
@@ -1040,6 +1329,20 @@ def _reference_snapshot(
         }
         for item in selected
     ]
+
+
+def _references_are_compatible(
+    draft_references: list[dict[str, Any]],
+    final_references: list[dict[str, Any]],
+) -> bool:
+    """Ignore persistence IDs while requiring identical reference content/roles."""
+    normalized_draft = [
+        (item.get("role"), item.get("sha256")) for item in draft_references
+    ]
+    normalized_final = [
+        (item.get("role"), item.get("sha256")) for item in final_references
+    ]
+    return normalized_draft == normalized_final
 
 
 def _build_transform(beat: VisualBeat) -> TransformSpecification:

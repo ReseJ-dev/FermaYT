@@ -16,8 +16,8 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 
-from app.clients.image_api import ImageGenerationError
 from app.budgets import ProjectBudgetGuard
+from app.clients.image_api import ImageGenerationError
 from app.costs import (
     estimate_project_generation_cost,
     load_pricing_config,
@@ -26,6 +26,7 @@ from app.costs import (
 from app.database import SessionLocal, init_database
 from app.database import engine as database_engine
 from app.errors import MediaProbeError, TTSGenerationError
+from app.generation_scope import GenerationScope, GenerationScopeType
 from app.generators.image import (
     build_image_generation_prompt,
     generate_image,
@@ -35,6 +36,7 @@ from app.generators.voice import generate_voice
 from app.jobs import GenerationJob, GenerationJobManager, GenerationJobType
 from app.media.probe import get_media_duration
 from app.persistence import Project, Scene
+from app.production_profiles import ProductionProfile
 from app.providers import get_image_provider, get_tts_provider
 from app.repositories import (
     create_project,
@@ -62,6 +64,7 @@ from app.secret_store import (
 )
 from app.services.pipeline_production import build_production_pipeline_dependencies
 from app.services.project_pipeline import run_project_video_pipeline
+from app.services.visual_planning import load_project_visual_plan_state
 from app.storage import ProjectMediaPaths
 
 APP_DIR = Path(__file__).resolve().parent
@@ -181,6 +184,11 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
             project_id,
             project.final_video_path,
         )
+        draft_video_url = _stored_media_url(
+            project_id,
+            project.draft_video_path,
+        )
+        pilot_video_url = _stored_media_url(project_id, project.pilot_video_path)
         final_video_download_url = (
             f"/api/projects/{quote(project_id)}/video/download"
             if final_video_url is not None
@@ -191,7 +199,31 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
         )
         renders = list_project_video_renders(session, project_id)
         final_render = next(
-            (item for item in reversed(renders) if item.status == "SUCCEEDED"),
+            (
+                item
+                for item in reversed(renders)
+                if item.status == "SUCCEEDED"
+                and item.production_profile == "FINAL"
+                and item.generation_scope_type == "FULL"
+            ),
+            None,
+        )
+        draft_render = next(
+            (
+                item
+                for item in reversed(renders)
+                if item.status == "SUCCEEDED"
+                and item.production_profile == "DRAFT"
+                and item.generation_scope_type == "FULL"
+            ),
+            None,
+        )
+        pilot_render = next(
+            (
+                item
+                for item in reversed(renders)
+                if item.status == "SUCCEEDED" and item.generation_scope_type != "FULL"
+            ),
             None,
         )
         latest_job = await job_manager.get_latest_project_job(project_id)
@@ -201,6 +233,25 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
             job_id=latest_job.id if latest_job is not None else None,
         )
         cost_estimate = estimate_project_generation_cost(session, project_id)
+        draft_cost_estimate = estimate_project_generation_cost(
+            session, project_id, production_profile="DRAFT"
+        )
+        final_cost_estimate = estimate_project_generation_cost(
+            session, project_id, production_profile="FINAL"
+        )
+        plan_state = load_project_visual_plan_state(session, project_id)
+        pilot_cost_estimates: dict[int, object] = {}
+        if plan_state is not None and plan_state.is_current:
+            for seconds in (30, 60):
+                pilot_scope = GenerationScope(
+                    GenerationScopeType.FIRST_SECONDS, seconds
+                )
+                pilot_cost_estimates[seconds] = estimate_project_generation_cost(
+                    session,
+                    project_id,
+                    production_profile="FINAL",
+                    beat_ids=frozenset(pilot_scope.select_beat_ids(plan_state.plan)),
+                )
         budget_snapshot = ProjectBudgetGuard(session, project_id).snapshot()
         return templates.TemplateResponse(
             request=request,
@@ -210,12 +261,19 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
                 "project": project,
                 "scene_cards": scene_cards,
                 "final_video_url": final_video_url,
+                "draft_video_url": draft_video_url,
+                "pilot_video_url": pilot_video_url,
                 "final_video_download_url": final_video_download_url,
                 "final_render": final_render,
+                "draft_render": draft_render,
+                "pilot_render": pilot_render,
                 "style_reference": style_reference,
                 "latest_job": latest_job,
                 "cost_summary": cost_summary,
                 "cost_estimate": cost_estimate,
+                "draft_cost_estimate": draft_cost_estimate,
+                "final_cost_estimate": final_cost_estimate,
+                "pilot_cost_estimates": pilot_cost_estimates,
                 "budget_snapshot": budget_snapshot,
                 "notice": request.query_params.get("notice"),
                 "error": request.query_params.get("error"),
@@ -252,11 +310,28 @@ async def generate_project_video_route(
         return _job_payload(active)
     form = await _read_optional_form(request)
     budget_override = form.get("budget_override") == "1"
+    try:
+        production_profile = ProductionProfile(
+            form.get("production_profile", ProductionProfile.FINAL.value).upper()
+        )
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=422, detail="Unknown production profile"
+        ) from exc
+    try:
+        scope_type = GenerationScopeType(
+            form.get("generation_scope_type", GenerationScopeType.FULL.value).upper()
+        )
+        raw_scope_value = form.get("generation_scope_value", "").strip()
+        scope_value = float(raw_scope_value) if raw_scope_value else None
+        generation_scope = GenerationScope(scope_type, scope_value)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail="Invalid generation scope") from exc
     with SessionLocal() as session:
         project = get_project(session, project_id)
         if project is None:
             raise HTTPException(status_code=404, detail="Project not found")
-        if form:
+        if "name" in form:
             try:
                 project = _update_project_from_form(session, project_id, form)
             except ValueError as exc:
@@ -282,12 +357,21 @@ async def generate_project_video_route(
             project_id,
             dependencies,
             budget_override,
+            production_profile,
+            generation_scope,
         )
 
     job = await job_manager.enqueue(
         project_id,
         GenerationJobType.GENERATE_VIDEO,
         operation,
+        production_profile=production_profile.value,
+        generation_scope_type=generation_scope.type.value,
+        generation_scope_value=(
+            float(generation_scope.value)
+            if generation_scope.value is not None
+            else None
+        ),
     )
     return _job_payload(job)
 
@@ -929,6 +1013,9 @@ def _update_project_from_form(
         "generation_budget_warning_threshold",
         str(current.generation_budget_warning_threshold),
     )
+    form.setdefault("draft_paid_visual_ratio", str(current.draft_paid_visual_ratio))
+    form.setdefault("draft_width", str(current.draft_width))
+    form.setdefault("draft_height", str(current.draft_height))
     project = update_project(
         session,
         project_id,
@@ -954,13 +1041,25 @@ def _update_project_from_form(
             form, "generation_budget_currency", {"EUR", "USD"}, "Валюта бюджета"
         ),
         generation_budget_warning_threshold=(
-            float(_choice(
-                form,
-                "generation_budget_warning_threshold",
-                {"0.5", "0.7", "0.8", "0.9", "1.0"},
-                "Порог предупреждения",
-            ))
+            float(
+                _choice(
+                    form,
+                    "generation_budget_warning_threshold",
+                    {"0.5", "0.7", "0.8", "0.9", "1.0"},
+                    "Порог предупреждения",
+                )
+            )
         ),
+        draft_paid_visual_ratio=float(
+            _choice(
+                form,
+                "draft_paid_visual_ratio",
+                {"0.2", "0.3", "0.4", "0.5"},
+                "Доля ключевых Draft-кадров",
+            )
+        ),
+        draft_width=int(_required(form, "draft_width", "Ширина Draft")),
+        draft_height=int(_required(form, "draft_height", "Высота Draft")),
         image_provider=_choice(
             form, "image_provider", {"seedream", "qwen"}, "Провайдер изображений"
         ),
@@ -987,6 +1086,8 @@ def _run_pipeline_worker(
     project_id: str,
     dependencies: object,
     budget_override: bool = False,
+    production_profile: ProductionProfile = ProductionProfile.FINAL,
+    generation_scope: GenerationScope | None = None,
 ) -> None:
     async def runner() -> None:
         async def progress(
@@ -1017,6 +1118,8 @@ def _run_pipeline_worker(
                 progress=progress,
                 job_id=job_id,
                 budget_override=budget_override,
+                production_profile=production_profile,
+                generation_scope=generation_scope,
             )
             await job_manager.set_pipeline_result(
                 job_id,
@@ -1030,8 +1133,7 @@ def _run_pipeline_worker(
 def _job_payload(job: GenerationJob) -> dict[str, object]:
     diagnostic = (
         job.report.get("failure")
-        if isinstance(job.report, dict)
-        and isinstance(job.report.get("failure"), dict)
+        if isinstance(job.report, dict) and isinstance(job.report.get("failure"), dict)
         else None
     )
     budget_pause = (
@@ -1044,15 +1146,28 @@ def _job_payload(job: GenerationJob) -> dict[str, object]:
         costs = summarize_project_cost(session, job.project_id, job_id=job.id)
         try:
             estimate = estimate_project_generation_cost(session, job.project_id)
+            draft_estimate = estimate_project_generation_cost(
+                session, job.project_id, production_profile="DRAFT"
+            )
+            final_estimate = estimate_project_generation_cost(
+                session, job.project_id, production_profile="FINAL"
+            )
             budget = ProjectBudgetGuard(session, job.project_id).snapshot()
         except ValueError:
             estimate = None
+            draft_estimate = None
+            final_estimate = None
             budget = None
     estimated_remaining = estimate.maximum if estimate is not None else None
     return {
         "id": job.id,
         "project_id": job.project_id,
         "type": job.type.value,
+        "production_profile": job.production_profile,
+        "generation_scope": {
+            "type": job.generation_scope_type,
+            "value": job.generation_scope_value,
+        },
         "status": job.status.value,
         "progress": job.progress,
         "stage_progress": job.stage_progress,
@@ -1070,6 +1185,12 @@ def _job_payload(job: GenerationJob) -> dict[str, object]:
         "budget": budget.as_dict() if budget is not None else None,
         "cost": costs.as_dict(),
         "cost_estimate": estimate.as_dict() if estimate is not None else None,
+        "draft_cost_estimate": (
+            draft_estimate.as_dict() if draft_estimate is not None else None
+        ),
+        "final_cost_estimate": (
+            final_estimate.as_dict() if final_estimate is not None else None
+        ),
         "estimated_remaining": estimated_remaining,
         "created_at": job.created_at.isoformat(),
         "updated_at": job.updated_at.isoformat(),

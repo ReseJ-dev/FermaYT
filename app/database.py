@@ -69,6 +69,13 @@ def _apply_additive_schema_updates(engine: Engine) -> None:
             "generation_budget_amount": "NUMERIC(18, 8)",
             "generation_budget_currency": "VARCHAR(3) NOT NULL DEFAULT 'EUR'",
             "generation_budget_warning_threshold": "FLOAT NOT NULL DEFAULT 0.8",
+            "draft_video_path": "TEXT",
+            "draft_rendered_at": "DATETIME",
+            "draft_paid_visual_ratio": "FLOAT NOT NULL DEFAULT 0.3",
+            "draft_width": "INTEGER NOT NULL DEFAULT 1280",
+            "draft_height": "INTEGER NOT NULL DEFAULT 720",
+            "pilot_video_path": "TEXT",
+            "pilot_rendered_at": "DATETIME",
         }
         missing_project_columns = {
             name: sql_type
@@ -81,6 +88,67 @@ def _apply_additive_schema_updates(engine: Engine) -> None:
                     connection.execute(
                         text(f"ALTER TABLE projects ADD COLUMN {name} {sql_type}")
                     )
+    if "project_visual_execution_plans" in table_names:
+        execution_columns = {
+            column["name"]
+            for column in inspector.get_columns("project_visual_execution_plans")
+        }
+        execution_additions = {
+            "production_profile": "VARCHAR(16) NOT NULL DEFAULT 'FINAL'",
+            "production_profile_version": "VARCHAR(64) NOT NULL DEFAULT 'final_v1'",
+        }
+        with engine.begin() as connection:
+            for name, sql_type in execution_additions.items():
+                if name not in execution_columns:
+                    connection.execute(text(
+                        f"ALTER TABLE project_visual_execution_plans "
+                        f"ADD COLUMN {name} {sql_type}"
+                    ))
+    if "beat_visual_results" in table_names:
+        beat_profile_columns = {
+            column["name"]
+            for column in inspector.get_columns("beat_visual_results")
+        }
+        if "production_profile" not in beat_profile_columns:
+            with engine.begin() as connection:
+                connection.execute(text(
+                    "ALTER TABLE beat_visual_results ADD COLUMN "
+                    "production_profile VARCHAR(16) NOT NULL DEFAULT 'FINAL'"
+                ))
+    if "project_video_renders" in table_names:
+        render_columns = {
+            column["name"]
+            for column in inspector.get_columns("project_video_renders")
+        }
+        render_additions = {
+            "production_profile": "VARCHAR(16) NOT NULL DEFAULT 'FINAL'",
+            "generation_scope_type": "VARCHAR(32) NOT NULL DEFAULT 'FULL'",
+            "generation_scope_value": "FLOAT",
+        }
+        with engine.begin() as connection:
+            for name, sql_type in render_additions.items():
+                if name in render_columns:
+                    continue
+                connection.execute(text(
+                    f"ALTER TABLE project_video_renders ADD COLUMN {name} {sql_type}"
+                ))
+    if "project_timelines" in table_names:
+        timeline_columns = {
+            column["name"] for column in inspector.get_columns("project_timelines")
+        }
+        timeline_additions = {
+            "generation_scope_type": "VARCHAR(32) NOT NULL DEFAULT 'FULL'",
+            "generation_scope_value": "FLOAT",
+            "generation_scope_version": (
+                "VARCHAR(64) NOT NULL DEFAULT 'generation_scope_v1'"
+            ),
+        }
+        with engine.begin() as connection:
+            for name, sql_type in timeline_additions.items():
+                if name not in timeline_columns:
+                    connection.execute(text(
+                        f"ALTER TABLE project_timelines ADD COLUMN {name} {sql_type}"
+                    ))
     if "project_visual_plans" in table_names:
         columns = {
             column["name"]

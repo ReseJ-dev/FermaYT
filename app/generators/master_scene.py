@@ -95,9 +95,10 @@ async def generate_required_master_scenes(
     downloader: Callable[[str, str], Awaitable[str]] | None = None,
     job_id: str | None = None,
     budget_guard: ProjectBudgetGuard | None = None,
+    required_beat_ids: set[str] | frozenset[str] | None = None,
 ) -> list[MasterSceneAsset]:
     """Generate referenced masters in plan order before dependent visual beats."""
-    required_ids = _required_master_scene_ids(plan)
+    required_ids = _required_master_scene_ids(plan, required_beat_ids)
     definitions = {master.id: master for master in plan.possible_master_scenes}
     style_version = build_style_version(style_id)
     paths = ProjectMediaPaths(project.id, projects_root)
@@ -116,8 +117,7 @@ async def generate_required_master_scenes(
         )
         if style_references:
             base_prompt = (
-                f"{base_prompt}\n\n"
-                f"{build_reference_role_instruction(style_references)}"
+                f"{base_prompt}\n\n{build_reference_role_instruction(style_references)}"
             )
         prompt = apply_image_style_contract(
             base_prompt,
@@ -176,45 +176,51 @@ async def generate_required_master_scenes(
                 downloader or download_file,
                 use_direct_download=downloader is not None,
                 before_request=(
-                    lambda retry: budget_guard.check_paid_call(
-                        pipeline_stage="MASTER_SCENES",
-                        provider=project.image_provider,
-                        model=getattr(client, "model", project.image_model),
-                        operation=(
-                            "REFERENCE_GENERATION"
-                            if style_references
-                            else "NEW_IMAGE"
-                        ),
-                        unit_type=PricingUnit.PER_IMAGE,
-                        input_units=1,
-                        is_qa_retry=retry,
-                        master_scene_id=master_scene_id,
+                    lambda retry, master_scene_id=master_scene_id: (
+                        budget_guard.check_paid_call(
+                            pipeline_stage="MASTER_SCENES",
+                            provider=project.image_provider,
+                            model=getattr(client, "model", project.image_model),
+                            operation=(
+                                "REFERENCE_GENERATION"
+                                if style_references
+                                else "NEW_IMAGE"
+                            ),
+                            unit_type=PricingUnit.PER_IMAGE,
+                            input_units=1,
+                            is_qa_retry=retry,
+                            master_scene_id=master_scene_id,
+                        )
+                        if budget_guard is not None
+                        else None
                     )
-                    if budget_guard is not None else None
                 ),
                 on_request=(
-                    lambda retry, candidate_path, status: record_provider_usage(
-                        session,
-                        project_id=project.id,
-                        job_id=job_id,
-                        pipeline_stage="MASTER_SCENES",
-                        provider=project.image_provider,
-                        model=getattr(client, "model", project.image_model),
-                        operation=(
-                            "REFERENCE_GENERATION"
-                            if style_references
-                            else "NEW_IMAGE"
-                        ),
-                        request_revision=usage_revision(
-                            master_scene_id, style_version, candidate_path
-                        ),
-                        unit_type=PricingUnit.PER_IMAGE,
-                        input_units=1,
-                        status=status,
-                        master_scene_id=master_scene_id,
-                        is_qa_retry=retry,
+                    lambda retry, candidate_path, status, master_scene_id=master_scene_id: (
+                        record_provider_usage(
+                            session,
+                            project_id=project.id,
+                            job_id=job_id,
+                            pipeline_stage="MASTER_SCENES",
+                            provider=project.image_provider,
+                            model=getattr(client, "model", project.image_model),
+                            operation=(
+                                "REFERENCE_GENERATION"
+                                if style_references
+                                else "NEW_IMAGE"
+                            ),
+                            request_revision=usage_revision(
+                                master_scene_id, style_version, candidate_path
+                            ),
+                            unit_type=PricingUnit.PER_IMAGE,
+                            input_units=1,
+                            status=status,
+                            master_scene_id=master_scene_id,
+                            is_qa_retry=retry,
+                        )
+                        if job_id is not None
+                        else None
                     )
-                    if job_id is not None else None
                 ),
             )
 
@@ -240,41 +246,47 @@ async def generate_required_master_scenes(
                     qa_service,
                     max_retries=max_qa_retries,
                     before_qa_request=(
-                        lambda attempt: budget_guard.check_paid_call(
-                            pipeline_stage="VISUAL_QA",
-                            provider=qa_service.provider,
-                            model=qa_service.model,
-                            operation="VISUAL_QA",
-                            unit_type=PricingUnit.PER_REQUEST,
-                            input_units=1,
-                            is_qa_retry=attempt > 1,
-                            master_scene_id=master_scene_id,
+                        lambda attempt, master_scene_id=master_scene_id: (
+                            budget_guard.check_paid_call(
+                                pipeline_stage="VISUAL_QA",
+                                provider=qa_service.provider,
+                                model=qa_service.model,
+                                operation="VISUAL_QA",
+                                unit_type=PricingUnit.PER_REQUEST,
+                                input_units=1,
+                                is_qa_retry=attempt > 1,
+                                master_scene_id=master_scene_id,
+                            )
+                            if budget_guard is not None
+                            else None
                         )
-                        if budget_guard is not None else None
                     ),
                     on_qa_request=(
-                        lambda attempt, succeeded: record_provider_usage(
-                            session,
-                            project_id=project.id,
-                            job_id=job_id,
-                            pipeline_stage="VISUAL_QA",
-                            provider=qa_service.provider,
-                            model=qa_service.model,
-                            operation="VISUAL_QA",
-                            request_revision=usage_revision(
-                                master_scene_id, style_version, "qa", attempt
-                            ),
-                            unit_type=PricingUnit.PER_REQUEST,
-                            input_units=1,
-                            status=(
-                                UsageStatus.SUCCEEDED
-                                if succeeded
-                                else UsageStatus.FAILED
-                            ),
-                            master_scene_id=master_scene_id,
-                            is_qa_retry=attempt > 1,
+                        lambda attempt, succeeded, master_scene_id=master_scene_id: (
+                            record_provider_usage(
+                                session,
+                                project_id=project.id,
+                                job_id=job_id,
+                                pipeline_stage="VISUAL_QA",
+                                provider=qa_service.provider,
+                                model=qa_service.model,
+                                operation="VISUAL_QA",
+                                request_revision=usage_revision(
+                                    master_scene_id, style_version, "qa", attempt
+                                ),
+                                unit_type=PricingUnit.PER_REQUEST,
+                                input_units=1,
+                                status=(
+                                    UsageStatus.SUCCEEDED
+                                    if succeeded
+                                    else UsageStatus.FAILED
+                                ),
+                                master_scene_id=master_scene_id,
+                                is_qa_retry=attempt > 1,
+                            )
+                            if job_id is not None
+                            else None
                         )
-                        if job_id is not None else None
                     ),
                 )
                 generated_path = qa_outcome.image_path
@@ -299,9 +311,7 @@ async def generate_required_master_scenes(
                 provider=project.image_provider,
                 model=project.image_model,
                 seed=None,
-                reference_hashes=[
-                    reference.sha256 for reference in style_references
-                ],
+                reference_hashes=[reference.sha256 for reference in style_references],
             )
         except (MasterSceneError, GenerationBudgetError):
             raise
@@ -567,11 +577,15 @@ def build_style_version(style_id: str = DEFAULT_IMAGE_STYLE_ID) -> str:
     return style_id.strip()
 
 
-def _required_master_scene_ids(plan: VisualPlan) -> list[str]:
+def _required_master_scene_ids(
+    plan: VisualPlan,
+    required_beat_ids: set[str] | frozenset[str] | None = None,
+) -> list[str]:
     master_ids = {master.id for master in plan.possible_master_scenes}
     referenced = {
         visual_id
         for beat in plan.visual_beats
+        if required_beat_ids is None or beat.id in required_beat_ids
         for visual_id in (
             beat.master_scene_id,
             beat.source_visual_id,
@@ -610,7 +624,9 @@ def _usable_style_references(
     if style_reference is None or not provider_accepts_references:
         return ()
     if style_reference.style_id != style_id:
-        raise MasterSceneError("Style reference version does not match generation style")
+        raise MasterSceneError(
+            "Style reference version does not match generation style"
+        )
     verify_style_reference_asset(style_reference)
     return (to_style_image_reference(style_reference),)
 

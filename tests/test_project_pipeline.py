@@ -10,16 +10,20 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 from test_master_scene import _plan
 
 from app.budgets import BUDGET_ESTIMATE_EXCEEDS_LIMIT, GenerationBudgetError
 from app.costs import PricingUnit, configure_provider_pricing
 from app.database import create_session_factory, create_sqlite_engine, init_database
+from app.generation_scope import GenerationScope, GenerationScopeType
 from app.jobs import GenerationJobManager, GenerationJobType
 from app.models.visual_plan import VisualPlan
 from app.models.visual_qa import VisualQADecision
+from app.persistence import ProviderUsageRecord
 from app.pipeline.visual_qa import VisualQAService
+from app.production_profiles import ProductionProfile
 from app.provider_capabilities import ImageProviderCapabilities
 from app.repositories import (
     create_project,
@@ -259,8 +263,14 @@ def _configure_budget_prices(session: Session) -> None:
         ("qwen", "fake-tts", "TTS", PricingUnit.PER_CHARACTER, 0.001),
     ]:
         configure_provider_pricing(
-            session, provider=provider, model=model, operation=operation,
-            pricing_unit=unit, price=price, currency="USD", version="v1",
+            session,
+            provider=provider,
+            model=model,
+            operation=operation,
+            pricing_unit=unit,
+            price=price,
+            currency="USD",
+            version="v1",
             effective_from=effective,
         )
 
@@ -325,9 +335,7 @@ def test_pipeline_preflight_budget_blocks_images_before_provider_call(
     planning = FakePlanningClient()
     provider = FakeImageProvider()
     qa = PassingQAClient()
-    dependencies = _dependencies(
-        tmp_path, provider, b"unused", b"unused", planning, qa
-    )
+    dependencies = _dependencies(tmp_path, provider, b"unused", b"unused", planning, qa)
 
     with pytest.raises(GenerationBudgetError) as error:
         asyncio.run(
@@ -429,3 +437,206 @@ def test_pipeline_revisions_invalidate_only_required_downstream_work(
     assert planning.calls == 2
     assert provider.calls == initial_image_calls + 2
     assert changed_story.story_revision != first.story_revision
+
+
+def test_draft_renders_preview_and_final_promotes_only_qa_passed_assets(
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    image, audio = _assets(tmp_path)
+    project = _project(session)
+    update_project(
+        session,
+        project.id,
+        story_text="The miners worked below. Then the route began to fail.",
+        draft_width=320,
+        draft_height=180,
+    )
+    planning = FakePlanningClient(_two_beat_plan())
+    provider = FakeImageProvider()
+    qa = PassingQAClient()
+    dependencies = _dependencies(tmp_path, provider, image, audio, planning, qa)
+
+    draft = asyncio.run(
+        run_project_video_pipeline(
+            session,
+            project.id,
+            dependencies,
+            production_profile=ProductionProfile.DRAFT,
+        )
+    )
+    calls_after_draft = provider.calls
+
+    assert draft.production_profile == "DRAFT"
+    assert Path(draft.final_mp4).is_file()
+    assert draft.paid_visual_beats == 2
+    assert (
+        list_project_video_renders(session, project.id)[-1].production_profile
+        == "DRAFT"
+    )
+
+    final = asyncio.run(
+        run_project_video_pipeline(
+            session,
+            project.id,
+            dependencies,
+            production_profile=ProductionProfile.FINAL,
+        )
+    )
+
+    assert final.production_profile == "FINAL"
+    assert final.production_profile_version != draft.production_profile_version
+    assert Path(final.final_mp4).is_file()
+    assert provider.calls == calls_after_draft
+    results = list_beat_visual_results(session, project.id, accepted_only=True)
+    draft_results = [item for item in results if item.production_profile == "DRAFT"]
+    final_results = [item for item in results if item.production_profile == "FINAL"]
+    assert len(draft_results) == len(final_results) == 2
+    assert all(item.source_result_id is not None for item in final_results)
+    assert all(item.resolved_operation == "REUSE" for item in final_results)
+
+
+def test_final_does_not_promote_draft_assets_without_visual_qa(
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    image, audio = _assets(tmp_path)
+    project = _project(session)
+    update_project(
+        session,
+        project.id,
+        draft_width=320,
+        draft_height=180,
+        visual_qa_enabled=False,
+    )
+    planning = FakePlanningClient()
+    provider = FakeImageProvider()
+    qa = PassingQAClient()
+    draft_dependencies = _dependencies(tmp_path, provider, image, audio, planning, qa)
+    draft_dependencies = ProjectPipelineDependencies(
+        planning_client=draft_dependencies.planning_client,
+        image_provider_resolver=draft_dependencies.image_provider_resolver,
+        tts_provider_resolver=draft_dependencies.tts_provider_resolver,
+        visual_qa_service=None,
+        projects_root=draft_dependencies.projects_root,
+        downloader=draft_dependencies.downloader,
+    )
+
+    asyncio.run(
+        run_project_video_pipeline(
+            session,
+            project.id,
+            draft_dependencies,
+            production_profile=ProductionProfile.DRAFT,
+        )
+    )
+    calls_after_draft = provider.calls
+    update_project(session, project.id, visual_qa_enabled=True)
+    final_dependencies = _dependencies(tmp_path, provider, image, audio, planning, qa)
+    asyncio.run(
+        run_project_video_pipeline(
+            session,
+            project.id,
+            final_dependencies,
+            production_profile=ProductionProfile.FINAL,
+        )
+    )
+
+    assert provider.calls == calls_after_draft + 1
+    final_result = next(
+        item
+        for item in list_beat_visual_results(session, project.id, accepted_only=True)
+        if item.production_profile == "FINAL"
+    )
+    assert final_result.resolved_operation == "NEW_IMAGE"
+    assert final_result.source_result_id is None
+
+
+def test_pilot_renders_prefix_then_full_reuses_pilot_assets(
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    image, audio = _assets(tmp_path)
+    project = _project(session)
+    project = update_project(
+        session,
+        project.id,
+        story_text="The miners worked below. Then the route began to fail.",
+    )
+    assert project is not None
+    scoped_plan_payload = _two_beat_plan().model_dump(mode="json")
+    second_master = dict(scoped_plan_payload["possible_master_scenes"][0])
+    second_master.update(
+        id="side_tunnel_master",
+        description="Separate side tunnel master",
+        basic_composition="Side tunnel opening and exit route",
+    )
+    scoped_plan_payload["possible_master_scenes"].append(second_master)
+    scoped_plan_payload["visual_beats"][1]["master_scene_id"] = "side_tunnel_master"
+    scoped_plan_payload["visual_beats"][1]["source_visual_id"] = None
+    scoped_plan_payload["visual_beats"][1]["geography_established_by"] = None
+    scoped_plan_payload["visual_beats"][1]["preferred_visual_operation"] = "NEW_IMAGE"
+    planning = FakePlanningClient(VisualPlan.model_validate(scoped_plan_payload))
+    provider = FakeImageProvider()
+    qa = PassingQAClient()
+    dependencies = _dependencies(tmp_path, provider, image, audio, planning, qa)
+    original_story = project.story_text
+
+    pilot = asyncio.run(
+        run_project_video_pipeline(
+            session,
+            project.id,
+            dependencies,
+            job_id="pilot-run",
+            generation_scope=GenerationScope(
+                GenerationScopeType.FIRST_BEATS,
+                1,
+            ),
+        )
+    )
+    calls_after_pilot = provider.calls
+    pilot_render = list_project_video_renders(session, project.id)[-1]
+
+    assert pilot.visual_beats == 1
+    assert pilot.semantic_visual_beats == 2
+    assert pilot.generation_scope["type"] == "FIRST_BEATS"
+    assert Path(pilot.final_mp4).is_file()
+    assert pilot_render.generation_scope_type == "FIRST_BEATS"
+    assert project.pilot_video_path == pilot.final_mp4
+    assert {
+        item.beat_id
+        for item in list_beat_visual_results(session, project.id, accepted_only=True)
+    } == {"beat_1"}
+    assert len(list_master_scene_assets(session, project.id)) == 1
+
+    full = asyncio.run(
+        run_project_video_pipeline(
+            session,
+            project.id,
+            dependencies,
+            job_id="full-run",
+        )
+    )
+    full_render = list_project_video_renders(session, project.id)[-1]
+
+    assert full.generation_scope["type"] == "FULL"
+    assert full.visual_beats == full.semantic_visual_beats == 2
+    assert provider.calls == calls_after_pilot + 2
+    assert full.reused["accepted_visual_assets"] >= 1
+    assert full.final_render_id != pilot.final_render_id
+    assert full_render.render_revision != pilot_render.render_revision
+    assert full_render.generation_scope_type == "FULL"
+    assert project.story_text == original_story
+    assert len(list_project_narration_assets(session, project.id)) == 1
+    pilot_usage = list(
+        session.scalars(
+            select(ProviderUsageRecord).where(ProviderUsageRecord.job_id == "pilot-run")
+        )
+    )
+    full_usage = list(
+        session.scalars(
+            select(ProviderUsageRecord).where(ProviderUsageRecord.job_id == "full-run")
+        )
+    )
+    assert pilot_usage and full_usage
+    assert any(item.status == "CACHED" for item in full_usage)

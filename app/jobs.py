@@ -58,6 +58,9 @@ class GenerationJob:
     final_render_id: str | None = None
     report: dict[str, object] | None = None
     completed_at: datetime | None = None
+    production_profile: str = "FINAL"
+    generation_scope_type: str = "FULL"
+    generation_scope_value: float | None = None
 
 
 JobOperation = Callable[[str], Awaitable[None]]
@@ -91,6 +94,9 @@ class GenerationJobManager:
         self,
         project_id: str,
         job_type: GenerationJobType,
+        production_profile: str = "FINAL",
+        generation_scope_type: str = "FULL",
+        generation_scope_value: float | None = None,
     ) -> GenerationJob:
         """Persist a new queued job."""
         await self.startup()
@@ -104,6 +110,9 @@ class GenerationJobManager:
             error=None,
             created_at=_utc_now(),
             updated_at=_utc_now(),
+            production_profile=production_profile.strip().upper(),
+            generation_scope_type=generation_scope_type.strip().upper(),
+            generation_scope_value=generation_scope_value,
         )
         await asyncio.to_thread(self._insert_job, job)
         return job
@@ -131,9 +140,18 @@ class GenerationJobManager:
         project_id: str,
         job_type: GenerationJobType,
         operation: JobOperation,
+        production_profile: str = "FINAL",
+        generation_scope_type: str = "FULL",
+        generation_scope_value: float | None = None,
     ) -> GenerationJob:
         """Create a queued job and schedule its operation in-process."""
-        job = await self.create_job(project_id, job_type)
+        job = await self.create_job(
+            project_id,
+            job_type,
+            production_profile=production_profile,
+            generation_scope_type=generation_scope_type,
+            generation_scope_value=generation_scope_value,
+        )
         task = asyncio.create_task(
             self._run_job(job.id, operation),
             name=f"generation-job-{job.id}",
@@ -292,6 +310,9 @@ class GenerationJobManager:
                 "final_render_id": "TEXT",
                 "report_json": "TEXT",
                 "completed_at": "TEXT",
+                "production_profile": "TEXT NOT NULL DEFAULT 'FINAL'",
+                "generation_scope_type": "TEXT NOT NULL DEFAULT 'FULL'",
+                "generation_scope_value": "REAL",
             }
             for name, sql_type in additions.items():
                 if name not in columns:
@@ -321,8 +342,9 @@ class GenerationJobManager:
                 """
                 INSERT INTO generation_jobs (
                     id, project_id, type, status, progress,
-                    message, error, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    message, error, created_at, updated_at, production_profile,
+                    generation_scope_type, generation_scope_value
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     job.id,
@@ -334,6 +356,9 @@ class GenerationJobManager:
                     job.error,
                     _serialize_datetime(job.created_at),
                     _serialize_datetime(job.updated_at),
+                    job.production_profile,
+                    job.generation_scope_type,
+                    job.generation_scope_value,
                 ),
             )
 
@@ -369,6 +394,9 @@ class GenerationJobManager:
                 if row["completed_at"]
                 else None
             ),
+            production_profile=row["production_profile"],
+            generation_scope_type=row["generation_scope_type"],
+            generation_scope_value=row["generation_scope_value"],
         )
 
     def _get_latest_project_job(self, project_id: str) -> GenerationJob | None:

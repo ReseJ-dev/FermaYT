@@ -2,12 +2,12 @@
 
 from __future__ import annotations
 
+import json
 from collections import defaultdict
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from hashlib import sha256
-import json
 from pathlib import Path
 from typing import Any
 
@@ -104,16 +104,19 @@ def configure_provider_pricing(
     normalized_model = model.strip()
     normalized_operation = operation.strip().upper()
     normalized_unit = PricingUnit(pricing_unit).value
-    existing = session.scalar(select(ProviderPricing).where(
-        ProviderPricing.provider == normalized_provider,
-        ProviderPricing.model == normalized_model,
-        ProviderPricing.operation == normalized_operation,
-        ProviderPricing.pricing_unit == normalized_unit,
-        ProviderPricing.version == version.strip(),
-    ))
+    existing = session.scalar(
+        select(ProviderPricing).where(
+            ProviderPricing.provider == normalized_provider,
+            ProviderPricing.model == normalized_model,
+            ProviderPricing.operation == normalized_operation,
+            ProviderPricing.pricing_unit == normalized_unit,
+            ProviderPricing.version == version.strip(),
+        )
+    )
     if existing is not None:
         if (
-            float(existing.price) != price or existing.currency != currency
+            float(existing.price) != price
+            or existing.currency != currency
             or existing.effective_from != effective_from.astimezone(UTC)
         ):
             raise ValueError("pricing version already exists with different values")
@@ -138,19 +141,24 @@ def load_pricing_config(session: Session, path: str | Path) -> list[ProviderPric
     """Load idempotent immutable price versions from a local JSON configuration."""
     data = json.loads(Path(path).read_text(encoding="utf-8"))
     if not isinstance(data, dict) or not isinstance(data.get("prices"), list):
-        raise ValueError("pricing config must contain a prices list")
+        raise TypeError("pricing config must contain a prices list")
     records: list[ProviderPricing] = []
     for item in data["prices"]:
         if not isinstance(item, dict):
-            raise ValueError("each pricing entry must be an object")
-        records.append(configure_provider_pricing(
-            session,
-            provider=str(item["provider"]), model=str(item["model"]),
-            operation=str(item["operation"]), pricing_unit=str(item["pricing_unit"]),
-            price=float(item["price"]), currency=str(item["currency"]),
-            version=str(item["version"]),
-            effective_from=datetime.fromisoformat(str(item["effective_from"])),
-        ))
+            raise TypeError("each pricing entry must be an object")
+        records.append(
+            configure_provider_pricing(
+                session,
+                provider=str(item["provider"]),
+                model=str(item["model"]),
+                operation=str(item["operation"]),
+                pricing_unit=str(item["pricing_unit"]),
+                price=float(item["price"]),
+                currency=str(item["currency"]),
+                version=str(item["version"]),
+                effective_from=datetime.fromisoformat(str(item["effective_from"])),
+            )
+        )
     return records
 
 
@@ -174,7 +182,9 @@ def find_pricing(
             ProviderPricing.pricing_unit == PricingUnit(unit_type).value,
             ProviderPricing.effective_from <= moment,
         )
-        .order_by(ProviderPricing.effective_from.desc(), ProviderPricing.created_at.desc())
+        .order_by(
+            ProviderPricing.effective_from.desc(), ProviderPricing.created_at.desc()
+        )
         .limit(1)
     )
 
@@ -214,19 +224,23 @@ def record_provider_usage(
     is_free = normalized_status in {UsageStatus.CACHED, UsageStatus.SKIPPED} or (
         normalized_operation in FREE_VISUAL_OPERATIONS
     )
-    pricing = None if is_free else find_pricing(
-        session, provider, model, normalized_operation, normalized_unit
+    pricing = (
+        None
+        if is_free
+        else find_pricing(
+            session, provider, model, normalized_operation, normalized_unit
+        )
     )
     units = input_units + output_units
-    estimated_cost = 0.0 if is_free else (
-        round(float(pricing.price) * units, 8) if pricing is not None else None
+    estimated_cost = (
+        0.0
+        if is_free
+        else (round(float(pricing.price) * units, 8) if pricing is not None else None)
     )
     if is_free:
         actual_cost = 0.0
         certainty = CostCertainty.ACTUAL
-    elif normalized_status is UsageStatus.FAILED:
-        certainty = CostCertainty.UNKNOWN
-    elif pricing is None:
+    elif normalized_status is UsageStatus.FAILED or pricing is None:
         certainty = CostCertainty.UNKNOWN
     elif actual_cost is not None:
         certainty = CostCertainty.ACTUAL
@@ -266,17 +280,25 @@ def usage_revision(*parts: object) -> str:
 def summarize_project_cost(
     session: Session, project_id: str, *, job_id: str | None = None
 ) -> CostSummary:
-    all_records = list(session.scalars(
-        select(ProviderUsageRecord)
-        .where(ProviderUsageRecord.project_id == project_id)
-        .order_by(ProviderUsageRecord.created_at)
-    ))
-    run_records = [record for record in all_records if job_id is None or record.job_id == job_id]
+    all_records = list(
+        session.scalars(
+            select(ProviderUsageRecord)
+            .where(ProviderUsageRecord.project_id == project_id)
+            .order_by(ProviderUsageRecord.created_at)
+        )
+    )
+    run_records = [
+        record for record in all_records if job_id is None or record.job_id == job_id
+    ]
     currencies = {record.currency for record in all_records if record.currency}
     currency = next(iter(currencies)) if len(currencies) == 1 else None
 
     def valued(record: ProviderUsageRecord) -> float | None:
-        value = record.actual_cost if record.actual_cost is not None else record.estimated_cost
+        value = (
+            record.actual_cost
+            if record.actual_cost is not None
+            else record.estimated_cost
+        )
         return float(value) if value is not None else None
 
     def total(records: list[ProviderUsageRecord]) -> float | None:
@@ -310,8 +332,10 @@ def summarize_project_cost(
         cost_by_model={key: round(value, 8) for key, value in by_model.items()},
         cost_by_beat={key: round(value, 8) for key, value in by_beat.items()},
         unpriced_records=sum(
-            record.estimated_cost is None and record.actual_cost is None
-            and record.status not in {UsageStatus.CACHED.value, UsageStatus.SKIPPED.value}
+            record.estimated_cost is None
+            and record.actual_cost is None
+            and record.status
+            not in {UsageStatus.CACHED.value, UsageStatus.SKIPPED.value}
             for record in run_records
         ),
     )
@@ -374,55 +398,81 @@ def estimate_project_generation_cost(
     project_id: str,
     *,
     max_qa_attempts: int = 3,
+    production_profile: str | None = None,
+    beat_ids: set[str] | frozenset[str] | None = None,
 ) -> CostEstimate:
     """Estimate remaining paid work from the latest persisted resolved plan."""
     project = session.get(Project, project_id)
     if project is None:
         raise ValueError("Project not found")
+    execution_query = select(ProjectVisualExecutionPlan).where(
+        ProjectVisualExecutionPlan.project_id == project_id
+    )
+    if production_profile is not None:
+        execution_query = execution_query.where(
+            ProjectVisualExecutionPlan.production_profile
+            == production_profile.strip().upper()
+        )
     execution = session.scalar(
-        select(ProjectVisualExecutionPlan)
-        .where(ProjectVisualExecutionPlan.project_id == project_id)
-        .order_by(ProjectVisualExecutionPlan.created_at.desc())
-        .limit(1)
+        execution_query.order_by(ProjectVisualExecutionPlan.created_at.desc()).limit(1)
     )
     if execution is None or project.visual_plan is None:
         return CostEstimate(
-            minimum=None, maximum=None, currency=None, paid_image_calls=0,
-            free_visual_operations=0, expected_qa_calls=0,
+            minimum=None,
+            maximum=None,
+            currency=None,
+            paid_image_calls=0,
+            free_visual_operations=0,
+            expected_qa_calls=0,
             maximum_qa_retry_calls=0,
             unpriced_operations=("persisted_visual_plan_required",),
         )
-    accepted_beats = set(session.scalars(
-        select(BeatVisualResult.beat_id).where(
-            BeatVisualResult.execution_plan_id == execution.id,
-            BeatVisualResult.is_accepted.is_(True),
+    accepted_beats = set(
+        session.scalars(
+            select(BeatVisualResult.beat_id).where(
+                BeatVisualResult.execution_plan_id == execution.id,
+                BeatVisualResult.is_accepted.is_(True),
+            )
         )
-    ))
-    decisions = list(session.scalars(
-        select(VisualOperationDecisionRecord).where(
-            VisualOperationDecisionRecord.execution_plan_id == execution.id
+    )
+    decisions = list(
+        session.scalars(
+            select(VisualOperationDecisionRecord).where(
+                VisualOperationDecisionRecord.execution_plan_id == execution.id
+            )
         )
-    ))
+    )
     remaining_operations = [
         decision.resolved_operation
         for decision in decisions
         if decision.beat_id not in accepted_beats
+        and (beat_ids is None or decision.beat_id in beat_ids)
     ]
-    existing_masters = set(session.scalars(
-        select(MasterSceneAsset.master_scene_id).where(
-            MasterSceneAsset.project_id == project_id
+    existing_masters = set(
+        session.scalars(
+            select(MasterSceneAsset.master_scene_id).where(
+                MasterSceneAsset.project_id == project_id
+            )
         )
-    ))
+    )
     beats = project.visual_plan.plan_json.get("visual_beats", [])
     required_masters = {
-        beat.get("master_scene_id") for beat in beats if beat.get("master_scene_id")
+        beat.get("master_scene_id")
+        for beat in beats
+        if beat.get("master_scene_id")
+        and (beat_ids is None or beat.get("id") in beat_ids)
     }
-    has_style_reference = session.scalar(
-        select(StyleReferenceAsset.id).where(
-            StyleReferenceAsset.project_id == project_id,
-            StyleReferenceAsset.style_id == project.style_id,
-        ).limit(1)
-    ) is not None
+    has_style_reference = (
+        session.scalar(
+            select(StyleReferenceAsset.id)
+            .where(
+                StyleReferenceAsset.project_id == project_id,
+                StyleReferenceAsset.style_id == project.style_id,
+            )
+            .limit(1)
+        )
+        is not None
+    )
     remaining_operations.extend(
         ("REFERENCE_GENERATION" if has_style_reference else "NEW_IMAGE")
         for master_id in required_masters - existing_masters
@@ -438,16 +488,24 @@ def estimate_project_generation_cost(
         max_qa_attempts=max_qa_attempts,
     )
     story_hash = sha256(project.story_text.strip().encode()).hexdigest()
-    narration_cached = session.scalar(
-        select(ProjectNarrationAsset.id).where(
-            ProjectNarrationAsset.project_id == project_id,
-            ProjectNarrationAsset.story_text_hash == story_hash,
-        ).limit(1)
-    ) is not None
+    narration_cached = (
+        session.scalar(
+            select(ProjectNarrationAsset.id)
+            .where(
+                ProjectNarrationAsset.project_id == project_id,
+                ProjectNarrationAsset.story_text_hash == story_hash,
+            )
+            .limit(1)
+        )
+        is not None
+    )
     if narration_cached:
         return estimate
     tts_price = find_pricing(
-        session, project.tts_provider, project.tts_model, "TTS",
+        session,
+        project.tts_provider,
+        project.tts_model,
+        "TTS",
         PricingUnit.PER_CHARACTER,
     )
     missing = set(estimate.unpriced_operations)
@@ -461,7 +519,9 @@ def estimate_project_generation_cost(
         tts_cost = float(tts_price.price) * len(project.story_text.strip())
         minimum = round(minimum + tts_cost, 8)
         maximum = round(maximum + tts_cost, 8)
-        currency = tts_price.currency if currency in {None, tts_price.currency} else None
+        currency = (
+            tts_price.currency if currency in {None, tts_price.currency} else None
+        )
     return CostEstimate(
         minimum=minimum,
         maximum=maximum,

@@ -13,6 +13,7 @@ from typing import Any
 from sqlalchemy.orm import Session
 
 from app.errors import ProjectVisualPlanError
+from app.generation_scope import GenerationScope
 from app.models.timeline import NormalizedOverlay, NormalizedTransform
 from app.persistence import (
     BeatVisualResult,
@@ -56,8 +57,11 @@ def build_project_timeline(
     project_id: str,
     execution_plan_id: str,
     narration_asset_id: str,
+    generation_scope: GenerationScope | None = None,
+    selected_beat_ids: tuple[str, ...] | None = None,
 ) -> ProjectTimeline:
     """Create or reuse a complete gap-free timeline for current accepted assets."""
+    scope = generation_scope or GenerationScope.full()
     state = require_current_project_visual_plan(session, project_id)
     project = get_project(session, project_id)
     plan_record = get_project_visual_plan_record(session, project_id)
@@ -91,12 +95,19 @@ def build_project_timeline(
             accepted_only=True,
         )
     )
-    missing = [beat.id for beat in state.plan.visual_beats if beat.id not in accepted]
+    selected_ids = selected_beat_ids or scope.select_beat_ids(state.plan)
+    selected_id_set = set(selected_ids)
+    selected_beats = [
+        beat for beat in state.plan.visual_beats if beat.id in selected_id_set
+    ]
+    if tuple(beat.id for beat in selected_beats) != selected_ids:
+        raise ValueError("Generation scope must select an ordered plan prefix")
+    missing = [beat.id for beat in selected_beats if beat.id not in accepted]
     if missing:
         raise ValueError(
             "Timeline requires accepted visual assets for beats: " + ", ".join(missing)
         )
-    for beat in state.plan.visual_beats:
+    for beat in selected_beats:
         result = accepted[beat.id]
         if result.output_path is None or result.file_sha256 is None:
             raise ValueError(f"Accepted visual metadata is incomplete for beat {beat.id}")
@@ -112,7 +123,7 @@ def build_project_timeline(
             "transform": accepted[beat.id].transform_metadata,
             "overlay": accepted[beat.id].overlay_metadata,
         }
-        for beat in state.plan.visual_beats
+        for beat in selected_beats
     ]
     timeline_revision = _stable_hash(
         {
@@ -123,22 +134,30 @@ def build_project_timeline(
             "narration_revision": narration.generation_revision,
             "alignment_revision": alignment.alignment_revision,
             "rhythm_version": TIMELINE_RHYTHM_VERSION,
+            "generation_scope": scope.snapshot(),
         }
     )
     existing = get_project_timeline_by_revision(session, timeline_revision)
     if existing is not None:
         return existing
 
+    timing_by_beat = {item.beat_id: item for item in alignment.beat_timings}
+    selected_timings = [timing_by_beat[beat.id] for beat in selected_beats]
+    timeline_duration = (
+        narration.duration
+        if scope.is_full
+        else selected_timings[-1].audio_end
+    )
     raw_intervals = [
-        (item.audio_start, item.audio_end) for item in alignment.beat_timings
+        (item.audio_start, item.audio_end) for item in selected_timings
     ]
     intervals, rhythm_warnings, repaired = plan_visual_rhythm(
         raw_intervals,
-        narration.duration,
+        timeline_duration,
     )
     entries: list[dict[str, Any]] = []
     for position, (beat, interval) in enumerate(
-        zip(state.plan.visual_beats, intervals, strict=True)
+        zip(selected_beats, intervals, strict=True)
     ):
         result = accepted[beat.id]
         assert result.output_path is not None
@@ -177,8 +196,11 @@ def build_project_timeline(
         narration_asset_id=narration.id,
         alignment_id=alignment.id,
         rhythm_version=TIMELINE_RHYTHM_VERSION,
+        generation_scope_type=scope.type.value,
+        generation_scope_value=(float(scope.value) if scope.value is not None else None),
+        generation_scope_version=scope.version,
         timeline_revision=timeline_revision,
-        duration=narration.duration,
+        duration=timeline_duration,
         warnings=warnings,
         entries=entries,
     )

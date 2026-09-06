@@ -109,6 +109,8 @@ def succeed_video_render(
     height: int,
     fps: float,
     diagnostics: dict[str, Any],
+    production_profile: str = "FINAL",
+    generation_scope_type: str = "FULL",
 ) -> ProjectVideoRender:
     now = datetime.now(UTC)
     record.status = "SUCCEEDED"
@@ -124,8 +126,15 @@ def succeed_video_render(
     record.diagnostics = diagnostics
     record.completed_at = now
     record.updated_at = now
-    record.project.final_video_path = output_path
-    record.project.rendered_at = now
+    if generation_scope_type != "FULL":
+        record.project.pilot_video_path = output_path
+        record.project.pilot_rendered_at = now
+    elif production_profile == "DRAFT":
+        record.project.draft_video_path = output_path
+        record.project.draft_rendered_at = now
+    else:
+        record.project.final_video_path = output_path
+        record.project.rendered_at = now
     record.project.updated_at = now
     session.commit()
     session.refresh(record)
@@ -159,6 +168,13 @@ PROJECT_UPDATE_FIELDS = frozenset(
         "generation_budget_amount",
         "generation_budget_currency",
         "generation_budget_warning_threshold",
+        "draft_paid_visual_ratio",
+        "draft_width",
+        "draft_height",
+        "draft_video_path",
+        "draft_rendered_at",
+        "pilot_video_path",
+        "pilot_rendered_at",
     }
 )
 SCENE_UPDATE_FIELDS = frozenset(
@@ -229,6 +245,13 @@ def create_project(
     generation_budget_amount: float | None = None,
     generation_budget_currency: str = "EUR",
     generation_budget_warning_threshold: float = 0.8,
+    draft_paid_visual_ratio: float = 0.3,
+    draft_width: int = 1280,
+    draft_height: int = 720,
+    draft_video_path: str | None = None,
+    draft_rendered_at: datetime | None = None,
+    pilot_video_path: str | None = None,
+    pilot_rendered_at: datetime | None = None,
 ) -> Project:
     _validate_project_budget(
         generation_budget_enabled,
@@ -261,6 +284,13 @@ def create_project(
         generation_budget_amount=generation_budget_amount,
         generation_budget_currency=generation_budget_currency,
         generation_budget_warning_threshold=generation_budget_warning_threshold,
+        draft_paid_visual_ratio=draft_paid_visual_ratio,
+        draft_width=draft_width,
+        draft_height=draft_height,
+        draft_video_path=draft_video_path,
+        draft_rendered_at=draft_rendered_at,
+        pilot_video_path=pilot_video_path,
+        pilot_rendered_at=pilot_rendered_at,
     )
     session.add(project)
     session.commit()
@@ -416,6 +446,8 @@ def save_visual_execution_plan(
     decision_input_snapshot: dict[str, Any],
     resolution_revision: str,
     decisions: list[dict[str, Any]],
+    production_profile: str = "FINAL",
+    production_profile_version: str = "final_v1",
 ) -> ProjectVisualExecutionPlan:
     """Atomically persist a complete provider-specific resolution."""
     existing = get_visual_execution_plan_by_revision(session, resolution_revision)
@@ -432,6 +464,8 @@ def save_visual_execution_plan(
         capability_snapshot=capability_snapshot,
         decision_input_snapshot=decision_input_snapshot,
         resolution_revision=resolution_revision,
+        production_profile=production_profile,
+        production_profile_version=production_profile_version,
     )
     record.decisions = [
         VisualOperationDecisionRecord(**decision) for decision in decisions

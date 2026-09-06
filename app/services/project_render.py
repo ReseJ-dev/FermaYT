@@ -25,6 +25,7 @@ from app.persistence import (
     ProjectVideoRender,
     TimelineEntry,
 )
+from app.production_profiles import ProductionProfile
 from app.repositories import (
     create_pending_video_render,
     fail_video_render,
@@ -44,20 +45,22 @@ def render_project_video(
     *,
     config: ProjectRenderConfig | None = None,
     projects_root: str | Path = "data/projects",
+    production_profile: ProductionProfile | str = ProductionProfile.FINAL,
 ) -> ProjectVideoRender:
     """Render or reuse one validated timeline/config/source revision."""
     timeline = session.get(ProjectTimeline, timeline_id)
     if timeline is None or timeline.project_id != project_id:
         raise ValueError("Project timeline was not found")
     render_config = config or ProjectRenderConfig()
-    revision = _render_revision(timeline, render_config)
+    profile = ProductionProfile(production_profile)
+    revision = _render_revision(timeline, render_config, profile)
     reusable = get_successful_video_render(session, revision)
     if reusable is not None and _successful_output_is_valid(reusable, render_config, timeline.duration):
         try:
             _validate_render_inputs(session, timeline, render_config)
         except Exception as exc:
             record = _create_render_attempt(
-                session, timeline, render_config, revision
+                session, timeline, render_config, revision, profile
             )
             safe = _safe_error(exc, None, "VALIDATION")
             fail_video_render(
@@ -69,7 +72,9 @@ def render_project_video(
             )
             raise ProjectTimelineRenderError(safe) from exc
         return reusable
-    record = _create_render_attempt(session, timeline, render_config, revision)
+    record = _create_render_attempt(
+        session, timeline, render_config, revision, profile
+    )
     current_entry: TimelineEntry | None = None
     stage = "VALIDATION"
     try:
@@ -143,6 +148,8 @@ def render_project_video(
                 "reused_intermediate_clips": reused_clips,
                 "manifest": build_render_manifest(timeline, render_config, frame_ranges),
             },
+            production_profile=profile.value,
+            generation_scope_type=timeline.generation_scope_type,
         )
     except Exception as exc:
         safe = _safe_error(exc, current_entry, stage)
@@ -173,6 +180,10 @@ def build_render_manifest(
         "renderer_version": RENDERER_VERSION,
         "timeline_id": timeline.id,
         "timeline_revision": timeline.timeline_revision,
+        "generation_scope": {
+            "type": timeline.generation_scope_type,
+            "value": timeline.generation_scope_value,
+        },
         "narration_asset_id": timeline.narration_asset_id,
         "narration_path": timeline.narration_asset.audio_path,
         "config": config.model_dump(mode="json"),
@@ -259,6 +270,7 @@ def _create_render_attempt(
     timeline: ProjectTimeline,
     config: ProjectRenderConfig,
     revision: str,
+    production_profile: ProductionProfile = ProductionProfile.FINAL,
 ) -> ProjectVideoRender:
     return create_pending_video_render(
         session,
@@ -269,6 +281,9 @@ def _create_render_attempt(
         render_config_snapshot=config.model_dump(mode="json"),
         renderer_version=RENDERER_VERSION,
         render_revision=revision,
+        production_profile=production_profile.value,
+        generation_scope_type=timeline.generation_scope_type,
+        generation_scope_value=timeline.generation_scope_value,
     )
 
 
@@ -358,13 +373,20 @@ def _successful_output_is_valid(record: ProjectVideoRender, config: ProjectRende
     return True
 
 
-def _render_revision(timeline: ProjectTimeline, config: ProjectRenderConfig) -> str:
+def _render_revision(
+    timeline: ProjectTimeline,
+    config: ProjectRenderConfig,
+    production_profile: ProductionProfile = ProductionProfile.FINAL,
+) -> str:
     payload = {
         "timeline_revision": timeline.timeline_revision,
         "narration_sha256": timeline.narration_asset.audio_sha256,
         "visual_results": [entry.beat_visual_result_id for entry in timeline.entries],
         "config": config.model_dump(mode="json"),
         "renderer": RENDERER_VERSION,
+        "production_profile": production_profile.value,
+        "generation_scope_type": timeline.generation_scope_type,
+        "generation_scope_value": timeline.generation_scope_value,
     }
     serialized = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(serialized.encode()).hexdigest()

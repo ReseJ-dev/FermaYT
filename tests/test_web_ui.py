@@ -147,7 +147,7 @@ def test_completed_job_does_not_restart_page_polling(web_app: tuple) -> None:
 
     assert page.status_code == 200
     assert 'data-job-status="completed"' in page.text
-    assert "/static/app.js?v=20260904-3" in page.text
+    assert "/static/app.js?v=20260906-1" in page.text
     assert script.status_code == 200
     assert '["queued", "running"].includes(existingJobStatus)' in script.text
     assert "fermayt-completed-job-reloaded" in script.text
