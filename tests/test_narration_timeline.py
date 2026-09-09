@@ -742,6 +742,53 @@ def test_alignment_and_timeline_survive_restart(tmp_path: Path) -> None:
     engine.dispose()
 
 
+def test_project_with_timeline_deletes_from_fresh_unloaded_session(
+    tmp_path: Path,
+) -> None:
+    engine = create_sqlite_engine(tmp_path / "delete-project.db")
+    init_database(engine)
+    factory = create_session_factory(engine)
+    with factory() as setup_session:
+        project, execution, _ = _setup_graph(setup_session, tmp_path)
+        narration = asyncio.run(
+            generate_project_narration(
+                setup_session,
+                project.id,
+                provider_resolver=_resolver_with_calls([]),
+                duration_probe=lambda path: 32.0,
+                projects_root=tmp_path / "projects",
+            )
+        )
+        build_project_timeline(
+            setup_session,
+            project.id,
+            execution.id,
+            narration.id,
+        )
+        project_id = project.id
+
+    with factory() as fresh_session:
+        assert delete_project(fresh_session, project_id) is True
+        assert fresh_session.get(type(project), project_id) is None
+
+    with engine.connect() as connection:
+        for table in (
+            "projects",
+            "project_visual_plans",
+            "project_visual_execution_plans",
+            "beat_visual_results",
+            "project_narration_assets",
+            "project_narration_alignments",
+            "project_timelines",
+            "timeline_entries",
+        ):
+            remaining = connection.exec_driver_sql(
+                f"SELECT COUNT(*) FROM {table}"
+            ).scalar_one()
+            assert remaining == 0
+    engine.dispose()
+
+
 def test_real_project_timeline_render_is_valid_and_idempotent(
     session: Session,
     tmp_path: Path,

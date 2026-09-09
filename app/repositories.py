@@ -3,7 +3,7 @@
 from datetime import UTC, datetime
 from typing import Any
 
-from sqlalchemy import func, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from app.models.beat_visual import ManualVisualQAOverride
@@ -334,12 +334,10 @@ def _validate_project_budget(enabled: bool, amount: object) -> None:
 
 
 def delete_project(session: Session, project_id: str) -> bool:
-    project = get_project(session, project_id)
-    if project is None:
-        return False
-    session.delete(project)
+    result = session.execute(delete(Project).where(Project.id == project_id))
     session.commit()
-    return True
+    session.expire_all()
+    return bool(result.rowcount)
 
 
 def get_project_visual_plan_record(
