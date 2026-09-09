@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 import app.generators.master_scene as master_scene_module
+from app import style_contracts
 from app.clients.image_api import ImageGenerationError
 from app.database import create_session_factory, create_sqlite_engine, init_database
 from app.errors import ImagePromptBuildError, MasterSceneError
@@ -199,6 +200,140 @@ def test_generates_only_referenced_masters_and_persists_metadata(
     assert [item.master_scene_id for item in list_master_scene_assets(session, project.id)] == [
         "shaft_master"
     ]
+
+
+def test_master_generation_accepts_negative_project_style_and_calls_provider(
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    project = _project(session)
+    project.global_image_style_prompt = """AVOID:
+- photorealism
+- realistic materials
+- realistic anatomy
+- cinematic lighting
+- polished editorial illustration
+- polished vector art
+- 3D render
+"""
+
+    class Client:
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        async def generate(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            return "https://example.com/master.png"
+
+    async def fake_download(url: str, output_path: str) -> str:
+        assert url == "https://example.com/master.png"
+        path = Path(output_path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(b"master")
+        return output_path
+
+    client = Client()
+    assets = asyncio.run(
+        generate_required_master_scenes(
+            session,
+            project,
+            _plan(),
+            client=client,
+            projects_root=tmp_path / "projects",
+            downloader=fake_download,
+        )
+    )
+
+    assert len(assets) == 1
+    assert len(client.prompts) == 1
+    assert client.prompts[0].count("STYLE CONTRACT [rough_explainer_v1]") == 1
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_method"),
+    [
+        (VisualOperation.NEW_IMAGE, "generate"),
+        (VisualOperation.REFERENCE_GENERATION, "generate_with_references"),
+        (VisualOperation.EDIT_EXISTING, "edit"),
+    ],
+)
+def test_all_continuity_provider_paths_do_not_rescan_permanent_contract(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: VisualOperation,
+    expected_method: str,
+) -> None:
+    dynamic_prompt = """A readable mine frame.
+No photorealism. Avoid realistic materials. Without realistic anatomy.
+Do not use cinematic lighting. No polished editorial illustration.
+Avoid polished vector art. No 3D render.
+"""
+    assembled_prompt = style_contracts.apply_image_style_contract(dynamic_prompt)
+    reference = ImageReference(
+        reference_id="source",
+        file_path="source.png",
+        sha256="0" * 64,
+        role=ImageReferenceRole.CONTENT_CONTINUITY,
+    )
+    references = () if operation is VisualOperation.NEW_IMAGE else (reference,)
+
+    class Client:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, str]] = []
+
+        async def generate(self, prompt: str) -> str:
+            self.calls.append(("generate", prompt))
+            return "https://example.com/frame.png"
+
+        async def generate_with_references(
+            self,
+            prompt: str,
+            received_references: tuple[ImageReference, ...],
+        ) -> str:
+            assert received_references == references
+            self.calls.append(("generate_with_references", prompt))
+            return "https://example.com/frame.png"
+
+        async def edit(
+            self,
+            prompt: str,
+            received_references: tuple[ImageReference, ...],
+        ) -> str:
+            assert received_references == references
+            self.calls.append(("edit", prompt))
+            return "https://example.com/frame.png"
+
+    def fail_if_rescanned(prompt: str, style_id: str) -> str:
+        raise AssertionError(f"final prompt was rescanned: {style_id}: {prompt}")
+
+    async def fake_download(url: str, output_path: str) -> str:
+        assert url == "https://example.com/frame.png"
+        return output_path
+
+    monkeypatch.setattr(
+        style_contracts,
+        "validate_image_style_prompt",
+        fail_if_rescanned,
+    )
+    client = Client()
+    request = master_scene_module.ContinuityGenerationRequest(
+        operation=operation,
+        prompt=assembled_prompt,
+        references=references,
+    )
+
+    result = asyncio.run(
+        generate_continuity_image(
+            request,
+            "frame.png",
+            client,
+            downloader=fake_download,
+        )
+    )
+
+    assert result == "frame.png"
+    assert len(client.calls) == 1
+    assert client.calls[0][0] == expected_method
+    assert client.calls[0][1] == assembled_prompt
 
 
 def test_master_provider_failure_adds_safe_master_context_and_logs_it(
@@ -621,7 +756,10 @@ def test_continuity_generation_feeds_qa_correction_into_retry(
                     result="REGENERATE",
                     problem_categories=["COMPOSITION"],
                     reasons=["The broken ladder is too small"],
-                    correction_instruction="Crop closer to the broken ladder",
+                    correction_instruction=(
+                        "Crop closer to the broken ladder; avoid photorealism and "
+                        "do not use cinematic lighting"
+                    ),
                 )
             return VisualQADecision(
                 result="PASS",
@@ -661,6 +799,8 @@ def test_continuity_generation_feeds_qa_correction_into_retry(
     assert len(client.prompts) == 2
     assert "VISUAL QA CORRECTION FOR REGENERATION" in client.prompts[1]
     assert "Crop closer to the broken ladder" in client.prompts[1]
+    assert "avoid photorealism" in client.prompts[1]
+    assert client.prompts[1].count("STYLE CONTRACT [rough_explainer_v1]") == 1
 
 
 def test_master_generation_is_qa_checked_and_keeps_correction_provenance(

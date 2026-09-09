@@ -77,6 +77,18 @@ class FakePlanningClient:
         return self.response
 
 
+class SequencedPlanningClient:
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = responses
+        self.calls = 0
+        self.prompts: list[str] = []
+
+    async def generate(self, prompt: str) -> str:
+        self.calls += 1
+        self.prompts.append(prompt)
+        return self.responses[self.calls - 1]
+
+
 def _valid_plan_payload() -> dict[str, Any]:
     return {
         "story_summary": "A mine ladder fails and blocks the route.",
@@ -220,6 +232,105 @@ def test_project_story_creates_and_persists_validated_visual_plan(
         "persistence_success",
     }
     assert all(item.project_id == project.id for item in caplog.records)
+
+
+def test_production_unknown_geography_reference_is_repaired_and_persisted(
+    session: Session,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    project = _create_project(session)
+    invalid = _two_beat_plan_payload()
+    invalid["possible_master_scenes"][0]["id"] = "main_tunnel_wide"
+    for beat in invalid["visual_beats"]:
+        beat["master_scene_id"] = "main_tunnel_wide"
+    invalid["visual_beats"][1]["id"] = "beat_5"
+    invalid["visual_beats"][1][
+        "geography_established_by"
+    ] = "beat_5_main_tunnel_wide"
+    repaired = deepcopy(invalid)
+    repaired["visual_beats"][1]["geography_established_by"] = "main_tunnel_wide"
+    client = SequencedPlanningClient(
+        [json.dumps(invalid), json.dumps(repaired)]
+    )
+
+    with caplog.at_level(logging.INFO, logger="app.services.visual_planning"):
+        plan = asyncio.run(
+            create_project_visual_plan(
+                session,
+                project.id,
+                client,
+                job_id="geography-repair-job",
+            )
+        )
+
+    assert client.calls == 2
+    assert plan.visual_beats[1].geography_established_by == "main_tunnel_wide"
+    record = get_project_visual_plan_record(session, project.id)
+    assert record is not None
+    assert record.plan_json["visual_beats"][1][
+        "geography_established_by"
+    ] == "main_tunnel_wide"
+    usage_units = session.execute(
+        text(
+            "SELECT input_units FROM provider_usage_records "
+            "WHERE job_id = 'geography-repair-job'"
+        )
+    ).scalar_one()
+    assert usage_units == 2
+    failed_validation = next(
+        record
+        for record in caplog.records
+        if record.visual_planning_event == "repair_validation_failure"
+    )
+    assert failed_validation.validation_category == "UNKNOWN_REFERENCE"
+    assert failed_validation.validation_issue == {
+        "category": "UNKNOWN_REFERENCE",
+        "owner_type": "VisualBeat",
+        "owner_id": "beat_5",
+        "field": "geography_established_by",
+        "invalid_id": "beat_5_main_tunnel_wide",
+        "available_ids": ["beat_1", "main_tunnel_wide"],
+    }
+    assert any(
+        record.visual_planning_event == "repair_success"
+        and record.repair_attempt == 1
+        for record in caplog.records
+    )
+
+
+def test_failed_reference_repairs_keep_last_valid_persisted_plan(
+    session: Session,
+) -> None:
+    project = _create_project(session)
+    asyncio.run(
+        create_project_visual_plan(
+            session,
+            project.id,
+            FakePlanningClient(json.dumps(_valid_plan_payload())),
+        )
+    )
+    before = get_project_visual_plan_record(session, project.id)
+    assert before is not None
+    original_id = before.id
+    original_json = deepcopy(before.plan_json)
+    invalid = _two_beat_plan_payload()
+    invalid["visual_beats"][1][
+        "geography_established_by"
+    ] = "beat_5_main_tunnel_wide"
+    invalid_response = json.dumps(invalid)
+    client = SequencedPlanningClient(
+        [invalid_response, invalid_response, invalid_response]
+    )
+
+    with pytest.raises(VisualDirectorError, match="after 2 repair attempt"):
+        asyncio.run(create_project_visual_plan(session, project.id, client))
+
+    session.expire_all()
+    after = get_project_visual_plan_record(session, project.id)
+    assert after is not None
+    assert after.id == original_id
+    assert after.plan_json == original_json
+    assert client.calls == 3
 
 
 def test_story_change_marks_plan_stale_without_deleting_it(

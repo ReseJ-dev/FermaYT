@@ -13,6 +13,7 @@ from app.clients.dashscope_ai import (
     DashScopeVisualPlanningClient,
     DashScopeVisualQAClient,
 )
+from app.clients.kimi_ai import KimiVisualPlanningClient
 from app.pipeline.visual_qa import VisualQAService
 from app.providers import (
     ImageProvider,
@@ -25,6 +26,7 @@ from app.secret_store import (
     BYTEPLUS_API_KEY,
     DASHSCOPE_API_KEY,
     ELEVENLABS_API_KEY,
+    KIMI_API_KEY,
     SecretStore,
 )
 from app.services.project_pipeline import ProjectPipelineDependencies
@@ -41,13 +43,24 @@ def build_production_pipeline_dependencies(
     if project is None:
         raise ValueError("Project not found")
     settings = get_application_settings(session)
-    dashscope_key = _secret(secret_store, DASHSCOPE_API_KEY, "DASHSCOPE_API_KEY")
+    needs_dashscope = (
+        project.planning_provider == "dashscope"
+        or project.visual_qa_enabled
+        or project.image_provider == "qwen"
+        or project.tts_provider == "qwen"
+    )
+    dashscope_key = (
+        _secret(secret_store, DASHSCOPE_API_KEY, "DASHSCOPE_API_KEY")
+        if needs_dashscope
+        else None
+    )
 
     image_key: str
     image_endpoint: str | None = None
     if project.image_provider == "seedream":
         image_key = _secret(secret_store, BYTEPLUS_API_KEY, "BYTEPLUS_ARK_API_KEY")
     elif project.image_provider == "qwen":
+        assert dashscope_key is not None
         image_key = dashscope_key
         image_endpoint = (
             settings.qwen_image_endpoint or os.getenv("QWEN_IMAGE_ENDPOINT", "").strip()
@@ -58,20 +71,37 @@ def build_production_pipeline_dependencies(
         raise ValueError("Выбран неизвестный image provider")
 
     if project.tts_provider == "qwen":
+        assert dashscope_key is not None
         tts_key = dashscope_key
     elif project.tts_provider == "elevenlabs":
         tts_key = _secret(secret_store, ELEVENLABS_API_KEY, "ELEVENLABS_API_KEY")
     else:
         raise ValueError("Выбран неизвестный TTS provider")
 
-    planning_client = DashScopeVisualPlanningClient(
-        api_key=dashscope_key,
-        model=project.planning_model,
-    )
+    if project.planning_provider == "dashscope":
+        assert dashscope_key is not None
+        planning_client = DashScopeVisualPlanningClient(
+            api_key=dashscope_key,
+            model=project.planning_model,
+        )
+    elif project.planning_provider == "kimi":
+        kimi_key = (
+            secret_store.get_secret(KIMI_API_KEY)
+            or os.getenv("MOONSHOT_API_KEY", "").strip()
+            or os.getenv("KIMI_API_KEY", "").strip()
+        )
+        if not kimi_key:
+            raise ValueError("Добавьте MOONSHOT_API_KEY в Settings")
+        planning_client = KimiVisualPlanningClient(
+            api_key=kimi_key,
+            model=project.planning_model,
+        )
+    else:
+        raise ValueError("Выбран неизвестный planning provider")
     qa_service = (
         VisualQAService(
             DashScopeVisualQAClient(
-                api_key=dashscope_key,
+                api_key=_required_key(dashscope_key),
                 model=project.visual_qa_model,
             ),
             provider=project.visual_qa_provider,
@@ -113,6 +143,12 @@ def _secret(store: SecretStore, name: str, environment_name: str) -> str:
     value = store.get_secret(name) or os.getenv(environment_name, "").strip()
     if not value:
         raise ValueError(f"Добавьте {environment_name} в Settings")
+    return value
+
+
+def _required_key(value: str | None) -> str:
+    if value is None:
+        raise ValueError("Добавьте DASHSCOPE_API_KEY в Settings")
     return value
 
 

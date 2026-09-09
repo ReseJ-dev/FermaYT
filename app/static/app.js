@@ -74,6 +74,30 @@ document.addEventListener("DOMContentLoaded", () => {
     ttsProvider.addEventListener("change", () => updateTtsFields(true));
   }
 
+  const planningProvider = document.getElementById("planning-provider");
+  const planningModel = document.getElementById("planning-model");
+  const planningProviderHelp = document.getElementById("planning-provider-help");
+
+  const updatePlanningProviderFields = (changedByUser = false) => {
+    if (!(planningProvider instanceof HTMLSelectElement)) return;
+    const isKimi = planningProvider.value === "kimi";
+    if (planningProviderHelp) {
+      planningProviderHelp.textContent = isKimi
+        ? "Используются Kimi API key и модель kimi-k3."
+        : "Используются DashScope API key и модель qwen-plus.";
+    }
+    if (changedByUser && planningModel instanceof HTMLInputElement) {
+      planningModel.value = isKimi ? "kimi-k3" : "qwen-plus";
+    }
+  };
+
+  if (planningProvider instanceof HTMLSelectElement) {
+    updatePlanningProviderFields();
+    planningProvider.addEventListener("change", () => {
+      updatePlanningProviderFields(true);
+    });
+  }
+
   const imageProvider = document.getElementById("image-provider");
   const imageModel = document.getElementById("image-model");
   const imageProviderHelp = document.getElementById("image-provider-help");
@@ -81,9 +105,14 @@ document.addEventListener("DOMContentLoaded", () => {
   const updateImageProviderFields = (changedByUser = false) => {
     if (!(imageProvider instanceof HTMLSelectElement)) return;
     const isQwen = imageProvider.value === "qwen";
+    if (imageModel instanceof HTMLSelectElement) {
+      Array.from(imageModel.options).forEach((option) => {
+        option.disabled = option.dataset.provider !== imageProvider.value;
+      });
+    }
     if (imageProviderHelp) {
       imageProviderHelp.textContent = isQwen
-        ? "Используется DashScope key и настроенный Qwen Image endpoint."
+        ? "Выберите Qwen Image 2.0 или 3.0. Используются DashScope key и настроенный endpoint."
         : "Используется BytePlus API key.";
     }
     if (changedByUser && (imageModel instanceof HTMLInputElement || imageModel instanceof HTMLSelectElement)) {

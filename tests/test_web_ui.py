@@ -26,6 +26,7 @@ from app.secret_store import (
     BYTEPLUS_API_KEY,
     DASHSCOPE_API_KEY,
     ELEVENLABS_API_KEY,
+    KIMI_API_KEY,
 )
 
 
@@ -147,7 +148,7 @@ def test_completed_job_does_not_restart_page_polling(web_app: tuple) -> None:
 
     assert page.status_code == 200
     assert 'data-job-status="completed"' in page.text
-    assert "/static/app.js?v=20260906-1" in page.text
+    assert "/static/app.js?v=20260907-1" in page.text
     assert script.status_code == 200
     assert '["queued", "running"].includes(existingJobStatus)' in script.text
     assert "fermayt-completed-job-reloaded" in script.text
@@ -167,7 +168,9 @@ def test_dashboard_creates_and_opens_project(web_app: tuple) -> None:
     assert "Сцены" in editor.text
     assert "Сгенерировать видео" in editor.text
     assert "Visual Director" in editor.text
+    assert "Qwen Image 2.0" in editor.text
     assert "Qwen Image 3.0" in editor.text
+    assert 'value="qwen-image-2.0"' in editor.text
     assert 'value="qwen-image-3.0"' in editor.text
     assert "Manual / Legacy tools" in editor.text
     with session_factory() as session:
@@ -213,7 +216,7 @@ def test_project_settings_can_be_updated(web_app: tuple) -> None:
             "global_image_style_prompt": "  paper cut art  ",
             "scene_count": "5",
             "image_provider": "qwen",
-            "image_model": "qwen-image-3.0",
+            "image_model": "qwen-image-2.0",
             "tts_provider": "qwen",
             "tts_model": "qwen3-tts-flash",
             "tts_voice": "Cherry",
@@ -230,6 +233,7 @@ def test_project_settings_can_be_updated(web_app: tuple) -> None:
         project = get_project(session, project_id)
         assert project is not None
         assert project.name == "Updated story"
+        assert project.image_model == "qwen-image-2.0"
         assert project.global_image_style_prompt == "paper cut art"
         assert (project.width, project.height, project.fps) == (1920, 1080, 24)
 
@@ -366,13 +370,14 @@ def test_settings_save_preserve_and_delete_api_keys(
             "byteplus_api_key": "byteplus-private",
             "dashscope_api_key": "dashscope-private",
             "elevenlabs_api_key": "elevenlabs-private",
+            "kimi_api_key": "kimi-private",
         },
         follow_redirects=False,
     )
     page = client.get("/settings")
     preserved = client.post(
         "/settings",
-        data={"byteplus_api_key": "", "dashscope_api_key": ""},
+        data={"byteplus_api_key": "", "dashscope_api_key": "", "kimi_api_key": ""},
         follow_redirects=False,
     )
     deleted = client.post(
@@ -385,12 +390,55 @@ def test_settings_save_preserve_and_delete_api_keys(
     assert store.values == {
         DASHSCOPE_API_KEY: "dashscope-private",
         ELEVENLABS_API_KEY: "elevenlabs-private",
+        KIMI_API_KEY: "kimi-private",
     }
     assert "byteplus-private" not in page.text
     assert "dashscope-private" not in page.text
     assert "elevenlabs-private" not in page.text
+    assert "kimi-private" not in page.text
     assert page.text.count("Настроено") >= 3
     assert BYTEPLUS_API_KEY not in store.values
+
+
+def test_project_can_select_kimi_for_story_planning(web_app: tuple) -> None:
+    client, session_factory, _ = web_app
+    project_id = _create_project(client)
+
+    response = client.post(
+        f"/projects/{project_id}",
+        data={
+            "name": "Kimi planned story",
+            "story_text": "A complete story",
+            "scene_count": "3",
+            "planning_provider": "kimi",
+            "planning_model": "kimi-k3",
+            "visual_qa_enabled": "0",
+            "visual_qa_provider": "dashscope",
+            "visual_qa_model": "qwen-vl-max",
+            "style_id": "rough_explainer_v1",
+            "image_provider": "seedream",
+            "image_model": "seedream-5-0-260128",
+            "tts_provider": "elevenlabs",
+            "tts_model": "eleven_multilingual_v2",
+            "tts_voice": "voice-id",
+            "tts_language": "Russian",
+            "output_preset": "vertical",
+            "fps": "30",
+            "image_fit": "cover",
+            "draft_width": "1280",
+            "draft_height": "720",
+        },
+        follow_redirects=False,
+    )
+
+    assert response.status_code == 303
+    editor = client.get(f"/projects/{project_id}")
+    assert "Moonshot AI · Kimi" in editor.text
+    with session_factory() as session:
+        project = get_project(session, project_id)
+        assert project is not None
+        assert project.planning_provider == "kimi"
+        assert project.planning_model == "kimi-k3"
 
 
 def test_global_provider_selection_is_visible_and_used_for_new_project(

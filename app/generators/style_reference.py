@@ -26,6 +26,7 @@ from app.style_contracts import (
     DEFAULT_IMAGE_STYLE_ID,
     apply_image_style_contract,
     get_image_style_contract,
+    prepare_image_prompt_for_provider,
 )
 
 _PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
@@ -52,7 +53,7 @@ class StyleReferenceBoundProvider:
     async def generate(self, prompt: str) -> str:
         if not self._supports_references:
             return await self._provider.generate(
-                apply_image_style_contract(prompt, self._style_id)
+                prepare_image_prompt_for_provider(prompt, self._style_id)
             )
         references = (self._style_reference,)
         contracted_prompt = self._prepare_prompt(prompt, references)

@@ -185,6 +185,7 @@ label small, .helper-text { color: #8a94a7; font-size: .7rem; font-weight: 500; 
 .provider-logo { display: grid; width: 2.6rem; height: 2.6rem; place-items: center; border-radius: .7rem; color: white; font-weight: 850; }
 .provider-logo.seedream { background: linear-gradient(135deg, #5660d8, #9b6de1); }
 .provider-logo.qwen { background: linear-gradient(135deg, #e37542, #cc3f70); }
+.provider-logo.kimi { background: linear-gradient(135deg, #151515, #5d6673); }
 .provider-logo.elevenlabs { color: #111; background: #efefef; font-size: .75rem; }
 .config-status { padding: .3rem .55rem; border-radius: 2rem; color: #985050; background: #fff0f0; font-size: .65rem; font-weight: 750; }
 .config-status.configured { color: #18704a; background: #e7f8ef; }

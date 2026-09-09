@@ -607,7 +607,7 @@ def _validate_project_preflight(
 ) -> None:
     if not project.story_text.strip():
         raise ValueError("Добавьте готовый текст истории")
-    if project.planning_provider != "dashscope":
+    if project.planning_provider not in {"dashscope", "kimi"}:
         raise ValueError("Выбранный planning provider не поддерживается")
     if project.visual_qa_enabled and dependencies.visual_qa_service is None:
         raise ValueError("Visual QA включён, но vision provider не настроен")

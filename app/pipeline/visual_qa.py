@@ -21,7 +21,11 @@ from app.models.visual_qa import (
     VisualQAProblemCategory,
     VisualQAResult,
 )
-from app.style_contracts import DEFAULT_IMAGE_STYLE_ID, get_image_style_contract
+from app.style_contracts import (
+    DEFAULT_IMAGE_STYLE_ID,
+    apply_image_style_contract,
+    get_image_style_contract,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -393,11 +397,11 @@ def apply_visual_qa_correction(
     normalized_prompt = prompt.strip()
     if normalized_prompt.endswith(contract):
         normalized_prompt = normalized_prompt[: -len(contract)].rstrip()
-    return (
+    corrected_dynamic_prompt = (
         f"{normalized_prompt}\n\nVISUAL QA CORRECTION FOR REGENERATION:\n"
-        f"{correction}\nPreserve all elements that QA did not identify as problems.\n\n"
-        f"{contract}"
+        f"{correction}\nPreserve all elements that QA did not identify as problems."
     )
+    return apply_image_style_contract(corrected_dynamic_prompt, style_id)
 
 
 async def _finish_best(

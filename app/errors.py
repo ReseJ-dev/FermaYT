@@ -20,6 +20,19 @@ class ProjectTimelineRenderError(VideoRenderError):
 class VisualDirectorError(RuntimeError):
     """Raised when a safe, validated visual plan cannot be produced."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        validation_category: str | None = None,
+        diagnostic: dict[str, object] | None = None,
+        provider_requests: int = 0,
+    ) -> None:
+        super().__init__(message)
+        self.validation_category = validation_category
+        self.diagnostic = diagnostic
+        self.provider_requests = provider_requests
+
 
 class StructuredAIProviderError(RuntimeError):
     """Raised when a structured planning or vision provider call fails safely."""

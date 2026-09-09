@@ -59,6 +59,7 @@ from app.secret_store import (
     BYTEPLUS_API_KEY,
     DASHSCOPE_API_KEY,
     ELEVENLABS_API_KEY,
+    KIMI_API_KEY,
     SecretStore,
     SecretStoreError,
 )
@@ -711,6 +712,10 @@ async def settings(request: Request) -> HTMLResponse:
         ELEVENLABS_API_KEY,
         "ELEVENLABS_API_KEY",
     )
+    kimi_configured, kimi_store_error = _secret_status(
+        KIMI_API_KEY,
+        "MOONSHOT_API_KEY",
+    )
     with SessionLocal() as session:
         application_settings = get_application_settings(session)
     return templates.TemplateResponse(
@@ -721,13 +726,17 @@ async def settings(request: Request) -> HTMLResponse:
             "byteplus_configured": byteplus_configured,
             "dashscope_configured": dashscope_configured,
             "elevenlabs_configured": elevenlabs_configured,
+            "kimi_configured": kimi_configured,
             "qwen_image_endpoint_configured": bool(
                 application_settings.qwen_image_endpoint
                 or os.getenv("QWEN_IMAGE_ENDPOINT", "").strip()
             ),
             "application_settings": application_settings,
             "keyring_error": (
-                byteplus_store_error or dashscope_store_error or elevenlabs_store_error
+                byteplus_store_error
+                or dashscope_store_error
+                or elevenlabs_store_error
+                or kimi_store_error
             ),
             "notice": request.query_params.get("notice"),
             "error": request.query_params.get("error"),
@@ -768,6 +777,12 @@ async def update_settings(request: Request) -> RedirectResponse:
             field="elevenlabs_api_key",
             delete_field="delete_elevenlabs_api_key",
             secret_name=ELEVENLABS_API_KEY,
+        )
+        _update_secret_from_form(
+            form,
+            field="kimi_api_key",
+            delete_field="delete_kimi_api_key",
+            secret_name=KIMI_API_KEY,
         )
         with SessionLocal() as session:
             update_application_settings(
@@ -1024,7 +1039,7 @@ def _update_project_from_form(
         global_image_style_prompt=form.get("global_image_style_prompt"),
         scene_count=_optional_int(form.get("scene_count")),
         planning_provider=_choice(
-            form, "planning_provider", {"dashscope"}, "Planning provider"
+            form, "planning_provider", {"dashscope", "kimi"}, "Planning provider"
         ),
         planning_model=_required(form, "planning_model", "Planning model"),
         visual_qa_enabled=form.get("visual_qa_enabled", "0") == "1",

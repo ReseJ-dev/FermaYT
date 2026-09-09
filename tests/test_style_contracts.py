@@ -1,13 +1,20 @@
 """Tests for permanent versioned image style enforcement."""
 
+from types import MappingProxyType
+
 import pytest
 
+from app import style_contracts
 from app.errors import StyleContractError
 from app.style_contracts import (
     DEFAULT_IMAGE_STYLE_ID,
     ROUGH_EXPLAINER_V1,
+    ImageStyleContract,
+    StyleConflictRule,
     apply_image_style_contract,
     get_image_style_contract,
+    prepare_image_prompt_for_provider,
+    validate_image_style_prompt,
 )
 
 
@@ -83,3 +90,278 @@ def test_later_conflict_is_detected_even_if_first_occurrence_is_negated() -> Non
 
     with pytest.raises(StyleContractError, match="conflicts"):
         apply_image_style_contract(prompt)
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "photorealistic mine",
+        "highly photorealistic scene",
+        "realistic stone walls",
+        "realistic human anatomy",
+        "use realistic material textures",
+        "cinematic lighting",
+        "cinematic flashlight lighting",
+        "cinematic realistic lighting",
+        "complex shadows",
+        "detailed wood grain",
+        "sophisticated perspective",
+        "polished editorial illustration",
+        "polished vector art",
+        "3d render",
+        "depth of field",
+        "strong depth of field",
+        "complex gradients",
+    ],
+)
+def test_real_style_requests_remain_conflicts(prompt: str) -> None:
+    with pytest.raises(StyleContractError, match="conflicts"):
+        validate_image_style_prompt(prompt)
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "no photorealism",
+        "not photorealistic",
+        "non-photorealistic cartoon",
+        "avoid realistic materials",
+        "without realistic materials",
+        "without cinematic lighting",
+        "do not use cinematic lighting",
+        "avoid depth of field",
+        "simple flat colors, no complex gradients",
+        "no realistic anatomy",
+        "do not use wood grain",
+        "don't use complex shadows",
+        "don’t use complex gradients",
+        "avoid sophisticated perspective",
+        "no polished vector art",
+        "without depth of field",
+        "keep surfaces simple rather than realistic",
+        "non-photorealistic cartoon mine",
+        "non realistic materials",
+        "simple flat lighting, not cinematic lighting",
+        "excluding complex gradients",
+    ],
+)
+def test_negated_style_concepts_are_allowed(prompt: str) -> None:
+    assert validate_image_style_prompt(prompt) == prompt
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "no photorealism",
+        "avoid realistic materials",
+        "without realistic anatomy",
+        "do not use cinematic lighting",
+        "no polished editorial illustration",
+        "avoid polished vector art",
+        "no 3d render",
+    ],
+)
+def test_required_negative_style_instructions_pass(prompt: str) -> None:
+    assert validate_image_style_prompt(prompt) == prompt
+
+
+def test_negative_section_heading_applies_to_each_bullet() -> None:
+    prompt = """AVOID:
+- photorealism
+- realistic materials
+- realistic anatomy
+- cinematic lighting
+- polished editorial illustration
+- polished vector art
+- 3D render
+"""
+
+    assert validate_image_style_prompt(prompt) == prompt.strip()
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "photorealistic mine shaft",
+        "use realistic materials",
+        "realistic human anatomy",
+        "cinematic lighting",
+        "polished editorial illustration",
+        "polished vector art",
+        "3d render",
+    ],
+)
+def test_required_positive_conflicts_still_fail(prompt: str) -> None:
+    with pytest.raises(StyleContractError, match="conflicts"):
+        validate_image_style_prompt(prompt)
+
+
+@pytest.mark.parametrize(
+    "alias",
+    [
+        "photorealism",
+        "photorealistic",
+        "photo realistic",
+        "photo-realistic",
+        "3-d render",
+    ],
+)
+def test_style_concept_aliases_are_blocked(alias: str) -> None:
+    with pytest.raises(StyleContractError, match="conflicts"):
+        validate_image_style_prompt(f"Create a {alias} mine")
+
+
+def test_mixed_negated_and_positive_concepts_still_conflict() -> None:
+    prompt = "no photorealism, but use cinematic lighting"
+
+    with pytest.raises(StyleContractError, match="cinematic lighting"):
+        validate_image_style_prompt(prompt)
+
+
+def test_negation_does_not_leak_into_a_later_positive_instruction() -> None:
+    prompt = "avoid flat colors and use photorealistic textures"
+
+    with pytest.raises(StyleContractError, match="photorealism"):
+        validate_image_style_prompt(prompt)
+
+
+def test_unrelated_no_does_not_blanket_allow_a_later_conflict() -> None:
+    prompt = "no flat colors and photorealistic textures"
+
+    with pytest.raises(StyleContractError, match="photorealism"):
+        validate_image_style_prompt(prompt)
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
+        "no flat illustration, make the scene photorealistic",
+        "avoid cartoon styling and use cinematic realistic lighting",
+    ],
+)
+def test_unrelated_style_negation_does_not_allow_conflict(prompt: str) -> None:
+    with pytest.raises(StyleContractError, match="conflicts"):
+        validate_image_style_prompt(prompt)
+
+
+def test_gapped_alias_does_not_match_across_clause_boundary() -> None:
+    prompt = "Use a cinematic composition. Lighting must remain simple and flat."
+
+    assert validate_image_style_prompt(prompt) == prompt
+
+
+@pytest.mark.parametrize(
+    "prompt, expected_concept",
+    [
+        ("no photorealism, use depth of field", "depth of field"),
+        (
+            "avoid cinematic lighting, use realistic stone textures",
+            "realistic stone",
+        ),
+    ],
+)
+def test_mixed_prompt_blocks_its_positive_conflict(
+    prompt: str,
+    expected_concept: str,
+) -> None:
+    with pytest.raises(StyleContractError, match=expected_concept):
+        validate_image_style_prompt(prompt)
+
+
+def test_mixed_prompt_with_only_negated_conflict_passes() -> None:
+    prompt = "no realistic anatomy, use simplified cartoon anatomy"
+
+    assert validate_image_style_prompt(prompt) == prompt
+
+
+def test_not_only_is_not_treated_as_style_negation() -> None:
+    prompt = "not only photorealistic but cinematic"
+
+    with pytest.raises(StyleContractError, match="photorealism"):
+        validate_image_style_prompt(prompt)
+
+
+def test_validation_precedes_contract_injection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_prompts: list[str] = []
+    real_validator = style_contracts.validate_image_style_prompt
+
+    def observe_dynamic_prompt(prompt: str, style_id: str) -> str:
+        observed_prompts.append(prompt)
+        assert "STYLE CONTRACT [" not in prompt
+        return real_validator(prompt, style_id)
+
+    monkeypatch.setattr(
+        style_contracts,
+        "validate_image_style_prompt",
+        observe_dynamic_prompt,
+    )
+
+    result = style_contracts.apply_image_style_contract("A flat cartoon mine")
+
+    assert observed_prompts == ["A flat cartoon mine"]
+    assert "STYLE CONTRACT [rough_explainer_v1]" in result
+
+
+def test_existing_permanent_contract_is_not_validated_as_dynamic_content(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    contracted = apply_image_style_contract("A flat cartoon mine")
+    observed_prompts: list[str] = []
+    real_validator = style_contracts.validate_image_style_prompt
+
+    def observe_dynamic_prompt(prompt: str, style_id: str) -> str:
+        observed_prompts.append(prompt)
+        return real_validator(prompt, style_id)
+
+    monkeypatch.setattr(
+        style_contracts,
+        "validate_image_style_prompt",
+        observe_dynamic_prompt,
+    )
+
+    assert style_contracts.apply_image_style_contract(contracted) == contracted
+    assert observed_prompts == ["A flat cartoon mine"]
+
+
+def test_provider_boundary_does_not_rescan_assembled_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    assembled = apply_image_style_contract("A flat cartoon mine")
+
+    def fail_if_called(prompt: str, style_id: str) -> str:
+        raise AssertionError(f"assembled prompt was rescanned: {style_id}: {prompt}")
+
+    monkeypatch.setattr(
+        style_contracts,
+        "validate_image_style_prompt",
+        fail_if_called,
+    )
+
+    assert prepare_image_prompt_for_provider(assembled) == assembled
+
+
+def test_validator_uses_rules_from_selected_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    custom_contract = ImageStyleContract(
+        style_id="custom_flat_v1",
+        description="Custom flat style.",
+        required=("flat colors",),
+        prohibited=("oil painting",),
+        priority_rule="Flat style wins.",
+        conflict_rules=(StyleConflictRule("oil painting", ("oil painting",)),),
+    )
+    monkeypatch.setattr(
+        style_contracts,
+        "IMAGE_STYLE_CONTRACTS",
+        MappingProxyType({custom_contract.style_id: custom_contract}),
+    )
+
+    assert (
+        validate_image_style_prompt("photorealistic reference", custom_contract.style_id)
+        == "photorealistic reference"
+    )
+    with pytest.raises(StyleContractError, match="oil painting"):
+        validate_image_style_prompt("use oil painting", custom_contract.style_id)

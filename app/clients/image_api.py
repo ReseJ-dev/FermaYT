@@ -365,7 +365,7 @@ class QwenImageApiClient:
         prompt: str,
         references: tuple[_ReferenceInput, ...],
     ) -> str:
-        """Edit one to three reference images using Qwen Image 3.0."""
+        """Edit one to three reference images using the configured Qwen model."""
         try:
             images = _prepare_references(references, maximum=3)
         except ImageGenerationError as exc:

@@ -1,7 +1,10 @@
 """Image generation orchestration."""
 
 from app.clients.image_api import ImageApiClient
-from app.style_contracts import DEFAULT_IMAGE_STYLE_ID, apply_image_style_contract
+from app.style_contracts import (
+    DEFAULT_IMAGE_STYLE_ID,
+    prepare_image_prompt_for_provider,
+)
 from app.utils.download import download_file
 
 
@@ -37,7 +40,7 @@ async def generate_image(
 ) -> str:
     """Generate an image, download it, and return the output path."""
     validated_prompt = validate_image_prompt(prompt)
-    contracted_prompt = apply_image_style_contract(validated_prompt, style_id)
+    contracted_prompt = prepare_image_prompt_for_provider(validated_prompt, style_id)
     image_client = client if client is not None else ImageApiClient()
     image_url = await image_client.generate(contracted_prompt)
     return await download_file(image_url, output_path)

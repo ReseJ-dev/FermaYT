@@ -18,7 +18,7 @@ class _DashScopeStructuredClient:
     ENDPOINT: ClassVar[str] = (
         "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
     )
-    TIMEOUT_SECONDS: ClassVar[float] = 120.0
+    TIMEOUT_SECONDS: ClassVar[float] = 300.0
     provider: ClassVar[str] = "dashscope"
 
     def __init__(

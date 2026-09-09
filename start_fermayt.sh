@@ -58,6 +58,7 @@ fi
 
 echo "Starting FermaYT at http://127.0.0.1:8000"
 echo "Close this window or press Ctrl+C to stop the application."
+mkdir -p "$APP_DIR/data" || show_error "cannot create the data directory"
 "$PYTHON_BIN" "$APP_DIR/run.py"
 exit_code=$?
 

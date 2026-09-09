@@ -54,3 +54,25 @@ def test_visual_beat_rejects_extra_prompt_field() -> None:
             estimated_duration_seconds=4,
             image_prompt="This layer must not create prompts yet",
         )
+
+
+def test_non_overlay_beat_discards_provider_overlay_description() -> None:
+    beat = VisualBeat(
+        id="beat",
+        narration_segment="Narration",
+        visual_purpose="Purpose",
+        what_viewer_should_understand="Meaning",
+        location_id="location",
+        camera_framing=ShotFraming.WIDE,
+        camera_view="Wide",
+        framing_reason="Establish geography",
+        camera_movement=CameraMovement.STATIC,
+        physical_state="Stable",
+        change_from_previous_beat="Initial",
+        information_added_beyond_narration="Shows distance",
+        preferred_visual_operation=VisualOperation.NEW_IMAGE,
+        overlay_description="A provider-added highlight that does not apply",
+        estimated_duration_seconds=4,
+    )
+
+    assert beat.overlay_description is None

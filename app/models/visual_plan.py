@@ -7,6 +7,56 @@ from typing import Protocol
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 
+class VisualPlanReferenceError(ValueError):
+    """Structured cross-reference failure raised by the canonical validator."""
+
+    def __init__(
+        self,
+        *,
+        category: str,
+        owner_type: str,
+        owner_id: str,
+        field: str,
+        invalid_id: str,
+        reference_type: str,
+        available_ids: set[str],
+    ) -> None:
+        self.category = category
+        self.owner_type = owner_type
+        self.owner_id = owner_id
+        self.field = field
+        self.invalid_id = invalid_id
+        self.reference_type = reference_type
+        self.available_ids = tuple(sorted(available_ids))
+        if category == "INVALID_REFERENCE_TYPE":
+            message = f"invalid {reference_type} reference: {invalid_id}"
+        else:
+            message = f"unknown {reference_type} id: {invalid_id}"
+        super().__init__(message)
+
+    def as_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {
+            "category": self.category,
+            "owner_type": self.owner_type,
+            "owner_id": self.owner_id,
+            "field": self.field,
+            "invalid_id": self.invalid_id,
+        }
+        if len(self.available_ids) <= 20:
+            result["available_ids"] = list(self.available_ids)
+        return result
+
+
+class VisualPlanDuplicateIdError(ValueError):
+    """Duplicate registry identifier with a machine-readable category."""
+
+    def __init__(self, label: str, duplicate_id: str) -> None:
+        self.category = "DUPLICATE_ID"
+        self.label = label
+        self.duplicate_id = duplicate_id
+        super().__init__(f"duplicate {label} id: {duplicate_id}")
+
+
 class VisualOperation(str, Enum):
     """The visual operation preferred by the director for a beat."""
 
@@ -177,6 +227,22 @@ class VisualBeat(_VisualModel):
     )
     estimated_duration_seconds: float = Field(gt=0)
 
+    @model_validator(mode="before")
+    @classmethod
+    def discard_overlay_description_for_non_overlay(
+        cls, value: object
+    ) -> object:
+        """Normalize a harmless structured-provider inconsistency."""
+        if not isinstance(value, dict):
+            return value
+        if (
+            value.get("preferred_visual_operation") != VisualOperation.OVERLAY.value
+            and value.get("overlay_description") is not None
+        ):
+            value = dict(value)
+            value["overlay_description"] = None
+        return value
+
     @model_validator(mode="after")
     def require_source_for_dependent_operation(self) -> "VisualBeat":
         dependent_operations = {
@@ -235,19 +301,39 @@ class VisualPlan(_VisualModel):
         }
 
         for environment in self.recurring_environments:
-            _require_known(environment.location_id, location_ids, "location")
+            _require_known(
+                environment.location_id,
+                location_ids,
+                "location",
+                owner_type="RecurringEnvironment",
+                owner_id=environment.id,
+                field="location_id",
+            )
 
         for master_scene in self.possible_master_scenes:
-            _require_known(master_scene.location_id, location_ids, "location")
+            _require_known(
+                master_scene.location_id,
+                location_ids,
+                "location",
+                owner_type="MasterScene",
+                owner_id=master_scene.id,
+                field="location_id",
+            )
             _require_all_known(
                 master_scene.characters_visible,
                 character_ids,
                 "character",
+                owner_type="MasterScene",
+                owner_id=master_scene.id,
+                field="characters_visible",
             )
             _require_all_known(
                 master_scene.important_objects,
                 object_ids,
                 "important object",
+                owner_type="MasterScene",
+                owner_id=master_scene.id,
+                field="important_objects",
             )
 
         previous_beat_ids: set[str] = set()
@@ -256,9 +342,30 @@ class VisualPlan(_VisualModel):
             for master_scene in self.possible_master_scenes
         }
         for beat in self.visual_beats:
-            _require_known(beat.location_id, location_ids, "location")
-            _require_all_known(beat.characters_visible, character_ids, "character")
-            _require_all_known(beat.important_objects, object_ids, "important object")
+            _require_known(
+                beat.location_id,
+                location_ids,
+                "location",
+                owner_type="VisualBeat",
+                owner_id=beat.id,
+                field="location_id",
+            )
+            _require_all_known(
+                beat.characters_visible,
+                character_ids,
+                "character",
+                owner_type="VisualBeat",
+                owner_id=beat.id,
+                field="characters_visible",
+            )
+            _require_all_known(
+                beat.important_objects,
+                object_ids,
+                "important object",
+                owner_type="VisualBeat",
+                owner_id=beat.id,
+                field="important_objects",
+            )
             if (
                 beat.location_id in recurring_location_ids & mastered_location_ids
                 and beat.master_scene_id is None
@@ -268,7 +375,14 @@ class VisualPlan(_VisualModel):
                 )
             if beat.source_visual_id is not None:
                 valid_sources = master_scene_ids | previous_beat_ids
-                _require_known(beat.source_visual_id, valid_sources, "source visual")
+                _require_known(
+                    beat.source_visual_id,
+                    valid_sources,
+                    "source visual",
+                    owner_type="VisualBeat",
+                    owner_id=beat.id,
+                    field="source_visual_id",
+                )
             if (
                 beat.camera_framing in {ShotFraming.CLOSE, ShotFraming.DETAIL}
                 and beat.geography_established_by is None
@@ -282,17 +396,49 @@ class VisualPlan(_VisualModel):
                     beat.geography_established_by,
                     valid_geography,
                     "geography visual",
+                    owner_type="VisualBeat",
+                    owner_id=beat.id,
+                    field="geography_established_by",
                 )
                 established_location = visual_locations[beat.geography_established_by]
                 if established_location != beat.location_id:
-                    raise ValueError(
-                        "geography visual must establish the same location"
+                    raise VisualPlanReferenceError(
+                        category="INVALID_REFERENCE_TYPE",
+                        owner_type="VisualBeat",
+                        owner_id=beat.id,
+                        field="geography_established_by",
+                        invalid_id=beat.geography_established_by,
+                        reference_type="geography visual for the same location",
+                        available_ids={
+                            visual_id
+                            for visual_id in valid_geography
+                            if visual_locations[visual_id] == beat.location_id
+                        },
                     )
             if beat.master_scene_id is not None:
-                _require_known(beat.master_scene_id, master_scene_ids, "master scene")
+                _require_known(
+                    beat.master_scene_id,
+                    master_scene_ids,
+                    "master scene",
+                    owner_type="VisualBeat",
+                    owner_id=beat.id,
+                    field="master_scene_id",
+                )
                 master_location = visual_locations[beat.master_scene_id]
                 if master_location != beat.location_id:
-                    raise ValueError("master scene must belong to the beat location")
+                    raise VisualPlanReferenceError(
+                        category="INVALID_REFERENCE_TYPE",
+                        owner_type="VisualBeat",
+                        owner_id=beat.id,
+                        field="master_scene_id",
+                        invalid_id=beat.master_scene_id,
+                        reference_type="master scene for the beat location",
+                        available_ids={
+                            master_id
+                            for master_id in master_scene_ids
+                            if visual_locations[master_id] == beat.location_id
+                        },
+                    )
                 for reference_id in (
                     beat.source_visual_id,
                     beat.geography_established_by,
@@ -307,6 +453,9 @@ class VisualPlan(_VisualModel):
                     beat.progressive_change.subject_id,
                     valid_subjects,
                     "progressive change subject",
+                    owner_type="VisualBeat",
+                    owner_id=beat.id,
+                    field="progressive_change.subject_id",
                 )
             previous_beat_ids.add(beat.id)
             visual_locations[beat.id] = beat.location_id
@@ -319,15 +468,47 @@ class VisualPlan(_VisualModel):
 def _unique_ids(items: Sequence[_Identified], label: str) -> set[str]:
     ids = [item.id for item in items]
     if len(ids) != len(set(ids)):
-        raise ValueError(f"duplicate {label} id")
+        duplicate_id = next(item_id for item_id in ids if ids.count(item_id) > 1)
+        raise VisualPlanDuplicateIdError(label, duplicate_id)
     return set(ids)
 
 
-def _require_known(value: str, known: set[str], label: str) -> None:
+def _require_known(
+    value: str,
+    known: set[str],
+    label: str,
+    *,
+    owner_type: str,
+    owner_id: str,
+    field: str,
+) -> None:
     if value not in known:
-        raise ValueError(f"unknown {label} id: {value}")
+        raise VisualPlanReferenceError(
+            category="UNKNOWN_REFERENCE",
+            owner_type=owner_type,
+            owner_id=owner_id,
+            field=field,
+            invalid_id=value,
+            reference_type=label,
+            available_ids=known,
+        )
 
 
-def _require_all_known(values: list[str], known: set[str], label: str) -> None:
+def _require_all_known(
+    values: list[str],
+    known: set[str],
+    label: str,
+    *,
+    owner_type: str,
+    owner_id: str,
+    field: str,
+) -> None:
     for value in values:
-        _require_known(value, known, label)
+        _require_known(
+            value,
+            known,
+            label,
+            owner_type=owner_type,
+            owner_id=owner_id,
+            field=field,
+        )

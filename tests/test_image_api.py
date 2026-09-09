@@ -403,6 +403,40 @@ def test_qwen_uses_explicit_constructor_config(
     assert result == "https://example.com/qwen.png"
 
 
+def test_qwen_image_2_model_is_sent_to_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert json.loads(request.content)["model"] == "qwen-image-2.0"
+        return httpx.Response(
+            200,
+            json={
+                "output": {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": [
+                                    {"image": "https://example.com/qwen-2.png"}
+                                ]
+                            }
+                        }
+                    ]
+                }
+            },
+        )
+
+    install_mock_transport(monkeypatch, handler)
+    client = QwenImageApiClient(
+        api_key="explicit-key",
+        endpoint="https://custom.example.com/qwen",
+        model="qwen-image-2.0",
+    )
+
+    result = asyncio.run(client.generate("A mountain"))
+
+    assert result == "https://example.com/qwen-2.png"
+
+
 def test_qwen_edit_sends_images_before_instruction(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

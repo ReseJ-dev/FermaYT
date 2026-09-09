@@ -209,7 +209,13 @@ def test_bound_provider_always_prepends_approved_style_reference(
         supports_references=True,
     )
 
-    result = asyncio.run(bound.generate("A mine cutaway"))
+    result = asyncio.run(
+        bound.generate(
+            "A mine cutaway; no photorealism; avoid realistic materials; "
+            "without realistic anatomy; do not use cinematic lighting; "
+            "no polished vector art; no 3D render"
+        )
+    )
 
     assert result == "https://example.com/image.png"
     assert provider.received is not None

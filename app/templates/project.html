@@ -33,8 +33,13 @@
             <div class="provider-selection-grid">
               <section class="provider-selection-card">
                 <div class="provider-selection-heading"><span class="provider-step">00</span><div><h3>Планирование истории</h3><p>Visual Director анализирует весь готовый сценарий до генерации изображений.</p></div></div>
-                <input type="hidden" name="planning_provider" value="dashscope">
-                <label>Planning model<input name="planning_model" required value="{{ project.planning_model }}"></label>
+                <label>Оператор планирования
+                  <select name="planning_provider" id="planning-provider">
+                    <option value="dashscope" {% if project.planning_provider == 'dashscope' %}selected{% endif %}>Alibaba · Qwen</option>
+                    <option value="kimi" {% if project.planning_provider == 'kimi' %}selected{% endif %}>Moonshot AI · Kimi</option>
+                  </select>
+                </label>
+                <label>Planning model<input id="planning-model" name="planning_model" required value="{{ project.planning_model }}"><small id="planning-provider-help"></small></label>
                 <label>Style contract<input name="style_id" required value="{{ project.style_id }}"><small>{{ 'Style reference зарегистрирован' if style_reference else 'Используется текстовый style contract' }}</small></label>
                 <label class="qa-toggle"><input name="visual_qa_enabled" type="checkbox" value="1" {% if project.visual_qa_enabled %}checked{% endif %}> Проверять каждый AI-кадр через Visual QA</label>
                 <input type="hidden" name="visual_qa_provider" value="dashscope">
@@ -50,8 +55,9 @@
                 </label>
                 <label>Модель
                   <select id="image-model" name="image_model">
-                    <option value="seedream-5-0-260128" {% if project.image_model == 'seedream-5-0-260128' %}selected{% endif %}>Seedream 5.0 Lite</option>
-                    <option value="qwen-image-3.0" {% if project.image_model == 'qwen-image-3.0' %}selected{% endif %}>Qwen Image 3.0</option>
+                    <option value="seedream-5-0-260128" data-provider="seedream" {% if project.image_model == 'seedream-5-0-260128' %}selected{% endif %}>Seedream 5.0 Lite</option>
+                    <option value="qwen-image-2.0" data-provider="qwen" {% if project.image_model == 'qwen-image-2.0' %}selected{% endif %}>Qwen Image 2.0</option>
+                    <option value="qwen-image-3.0" data-provider="qwen" {% if project.image_model == 'qwen-image-3.0' %}selected{% endif %}>Qwen Image 3.0</option>
                   </select>
                   <small id="image-provider-help"></small>
                 </label>

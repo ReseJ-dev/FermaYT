@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from copy import deepcopy
 
 import pytest
 
@@ -137,6 +138,27 @@ class FakePlanningClient:
         return self.response
 
 
+class SequencedPlanningClient:
+    def __init__(self, responses: list[str]) -> None:
+        self.responses = responses
+        self.prompts: list[str] = []
+
+    async def generate(self, prompt: str) -> str:
+        self.prompts.append(prompt)
+        return self.responses[len(self.prompts) - 1]
+
+
+def plan_with_unknown_geography(
+    invalid_id: str = "beat_5_main_tunnel_wide",
+) -> dict[str, object]:
+    payload = valid_plan_payload()
+    beats = payload["visual_beats"]
+    assert isinstance(beats, list)
+    assert isinstance(beats[1], dict)
+    beats[1]["geography_established_by"] = invalid_id
+    return payload
+
+
 def test_director_sends_complete_narration_and_returns_validated_plan() -> None:
     narration = "First the miners descend. Later their ladder collapses."
     client = FakePlanningClient(json.dumps(valid_plan_payload()))
@@ -151,6 +173,11 @@ def test_director_sends_complete_narration_and_returns_validated_plan() -> None:
     assert "DISTANCE FROM SAFETY" in client.prompt
     assert "REUSE STRONG IMAGES" in client.prompt
     assert "ADD INFORMATION" in client.prompt
+    assert "ID REFERENCE RULES AND FINAL VALIDATION CHECKLIST" in client.prompt
+    assert "Every ID is non-empty and unique" in client.prompt
+    assert "OVERLAY always provides overlay_description" in client.prompt
+    assert "Use only keys defined by the JSON Schema" in client.prompt
+    assert "EARLIER beat" in client.prompt
     assert "automated visual storytelling system" in client.prompt
     priorities = [
         "1. storytelling clarity",
@@ -189,8 +216,21 @@ def test_director_fails_safely_for_invalid_schema() -> None:
     payload["visual_beats"] = []
     client = FakePlanningClient(json.dumps(payload))
 
-    with pytest.raises(VisualDirectorError, match="invalid structured visual plan"):
+    with pytest.raises(VisualDirectorError, match="visual_beats: List should have at least 1 item"):
         asyncio.run(VisualDirector(client).create_plan("Complete narration"))
+
+
+def test_director_schema_diagnostic_does_not_include_generated_values() -> None:
+    payload = valid_plan_payload()
+    payload["unexpected_secret_field"] = "provider-generated-sensitive-value"
+    client = FakePlanningClient(json.dumps(payload))
+
+    with pytest.raises(VisualDirectorError) as exc_info:
+        asyncio.run(VisualDirector(client).create_plan("Complete narration"))
+
+    message = str(exc_info.value)
+    assert "unexpected_secret_field: Extra inputs are not permitted" in message
+    assert "provider-generated-sensitive-value" not in message
 
 
 def test_director_rejects_unknown_and_forward_source_references() -> None:
@@ -240,3 +280,137 @@ def test_director_hides_provider_error_details() -> None:
 
     assert str(exc_info.value) == "Visual planning provider failed"
     assert "secret" not in str(exc_info.value)
+
+
+def test_unknown_geography_is_repaired_to_existing_canonical_id() -> None:
+    invalid = plan_with_unknown_geography()
+    repaired = deepcopy(invalid)
+    repaired["visual_beats"][1]["geography_established_by"] = "beat_1"  # type: ignore[index]
+    client = SequencedPlanningClient(
+        [json.dumps(invalid), json.dumps(repaired)]
+    )
+
+    plan = asyncio.run(VisualDirector(client).create_plan("Complete narration"))
+
+    assert plan.visual_beats[1].geography_established_by == "beat_1"
+    assert len(client.prompts) == 2
+    assert "UNKNOWN_REFERENCE" in client.prompts[1]
+    assert "beat_5_main_tunnel_wide" in client.prompts[1]
+    assert "Repair ONLY the structural consistency" in client.prompts[1]
+
+
+def test_unknown_optional_geography_is_repaired_to_null() -> None:
+    invalid = plan_with_unknown_geography()
+    invalid["visual_beats"][1]["camera_framing"] = "MEDIUM"  # type: ignore[index]
+    repaired = deepcopy(invalid)
+    repaired["visual_beats"][1]["geography_established_by"] = None  # type: ignore[index]
+    client = SequencedPlanningClient(
+        [json.dumps(invalid), json.dumps(repaired)]
+    )
+
+    plan = asyncio.run(VisualDirector(client).create_plan("Complete narration"))
+
+    assert plan.visual_beats[1].geography_established_by is None
+    assert len(client.prompts) == 2
+
+
+def test_repair_can_add_a_genuine_missing_master_geography_definition() -> None:
+    invalid = plan_with_unknown_geography("lower_shaft_master")
+    repaired = deepcopy(invalid)
+    new_master = deepcopy(repaired["possible_master_scenes"][0])  # type: ignore[index]
+    new_master["id"] = "lower_shaft_master"
+    repaired["possible_master_scenes"].append(new_master)  # type: ignore[union-attr]
+    repaired["visual_beats"][1]["geography_established_by"] = "lower_shaft_master"  # type: ignore[index]
+    repaired["visual_beats"][1]["master_scene_id"] = "lower_shaft_master"  # type: ignore[index]
+    client = SequencedPlanningClient(
+        [json.dumps(invalid), json.dumps(repaired)]
+    )
+
+    plan = asyncio.run(VisualDirector(client).create_plan("Complete narration"))
+
+    assert {master.id for master in plan.possible_master_scenes} == {
+        "shaft_master",
+        "lower_shaft_master",
+    }
+    assert plan.visual_beats[1].geography_established_by == "lower_shaft_master"
+
+
+@pytest.mark.parametrize(
+    ("field", "invalid_value", "repaired_value"),
+    [
+        ("location_id", "unknown_location", "shaft"),
+        ("characters_visible", ["unknown_character"], ["miners"]),
+        ("important_objects", ["unknown_object"], ["ladder"]),
+        ("master_scene_id", "unknown_master", "shaft_master"),
+    ],
+)
+def test_other_unknown_registry_references_use_same_repair_flow(
+    field: str,
+    invalid_value: object,
+    repaired_value: object,
+) -> None:
+    invalid = valid_plan_payload()
+    invalid["visual_beats"][0][field] = invalid_value  # type: ignore[index]
+    repaired = deepcopy(invalid)
+    repaired["visual_beats"][0][field] = repaired_value  # type: ignore[index]
+    client = SequencedPlanningClient(
+        [json.dumps(invalid), json.dumps(repaired)]
+    )
+
+    plan = asyncio.run(VisualDirector(client).create_plan("Complete narration"))
+
+    assert len(plan.visual_beats) == 2
+    assert len(client.prompts) == 2
+
+
+def test_invalid_repairs_stop_at_the_configured_limit() -> None:
+    invalid = json.dumps(plan_with_unknown_geography())
+    client = SequencedPlanningClient([invalid, invalid, invalid])
+
+    with pytest.raises(VisualDirectorError) as exc_info:
+        asyncio.run(VisualDirector(client).create_plan("Complete narration"))
+
+    assert len(client.prompts) == 3
+    assert "after 2 repair attempt(s)" in str(exc_info.value)
+    assert exc_info.value.validation_category == "UNKNOWN_REFERENCE"
+    assert exc_info.value.diagnostic is not None
+    assert exc_info.value.diagnostic["owner_id"] == "beat_2"
+    assert exc_info.value.diagnostic["field"] == "geography_established_by"
+
+
+def test_valid_plan_does_not_call_repair() -> None:
+    client = SequencedPlanningClient([json.dumps(valid_plan_payload())])
+
+    asyncio.run(VisualDirector(client).create_plan("Complete narration"))
+
+    assert len(client.prompts) == 1
+
+
+def test_duplicate_ids_remain_invalid_after_bounded_repairs() -> None:
+    invalid = valid_plan_payload()
+    duplicate = deepcopy(invalid["visual_beats"][0])  # type: ignore[index]
+    invalid["visual_beats"].append(duplicate)  # type: ignore[union-attr]
+    raw = json.dumps(invalid)
+    client = SequencedPlanningClient([raw, raw, raw])
+
+    with pytest.raises(VisualDirectorError) as exc_info:
+        asyncio.run(VisualDirector(client).create_plan("Complete narration"))
+
+    assert exc_info.value.validation_category == "DUPLICATE_ID"
+    assert len(client.prompts) == 3
+
+
+def test_current_beat_id_cannot_masquerade_as_geography_id() -> None:
+    invalid = plan_with_unknown_geography("beat_2")
+    client = SequencedPlanningClient([json.dumps(invalid)])
+
+    with pytest.raises(VisualDirectorError) as exc_info:
+        asyncio.run(
+            VisualDirector(client, max_repair_attempts=0).create_plan(
+                "Complete narration"
+            )
+        )
+
+    assert exc_info.value.validation_category == "UNKNOWN_REFERENCE"
+    assert exc_info.value.diagnostic is not None
+    assert exc_info.value.diagnostic["invalid_id"] == "beat_2"

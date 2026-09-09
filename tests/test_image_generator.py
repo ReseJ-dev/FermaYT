@@ -5,6 +5,7 @@ import asyncio
 import pytest
 
 import app.generators.image as image_generator
+from app import style_contracts
 from app.clients.image_api import ImageApiClient
 from app.generators.image import (
     build_image_generation_prompt,
@@ -101,6 +102,36 @@ def test_generate_image_runs_complete_workflow(
         "output/image.png",
     )
     assert result == "output/image.png"
+
+
+def test_generate_image_validates_dynamic_prompt_before_provider_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = FakeImageApiClient("https://example.com/generated.png")
+    observed_dynamic_prompts: list[str] = []
+    real_validator = style_contracts.validate_image_style_prompt
+
+    def observe_dynamic_prompt(prompt: str, style_id: str) -> str:
+        observed_dynamic_prompts.append(prompt)
+        assert "STYLE CONTRACT [" not in prompt
+        return real_validator(prompt, style_id)
+
+    async def fake_download(url: str, output_path: str) -> str:
+        return output_path
+
+    monkeypatch.setattr(
+        style_contracts,
+        "validate_image_style_prompt",
+        observe_dynamic_prompt,
+    )
+    monkeypatch.setattr(image_generator, "download_file", fake_download)
+
+    asyncio.run(generate_image("no photorealism", "output/image.png", client))
+
+    assert observed_dynamic_prompts == ["no photorealism"]
+    assert client.received_prompt is not None
+    assert client.received_prompt.startswith("no photorealism\n\n")
+    assert "STYLE CONTRACT [rough_explainer_v1]" in client.received_prompt
 
 
 def test_generate_image_creates_default_client(

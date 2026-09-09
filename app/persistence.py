@@ -268,9 +268,9 @@ class Project(Base):
 
     @validates("planning_provider", "visual_qa_provider")
     def validate_structured_provider(self, key: str, value: str) -> str:
-        del key
         normalized = value.strip().lower()
-        if normalized != "dashscope":
+        supported = {"dashscope", "kimi"} if key == "planning_provider" else {"dashscope"}
+        if normalized not in supported:
             raise ValueError("unsupported structured AI provider")
         return normalized
 

@@ -14,7 +14,12 @@ from app.errors import (
     StaleProjectVisualPlanError,
     VisualDirectorError,
 )
-from app.generators.visual_director import VisualDirector, VisualPlanningClient
+from app.generators.visual_director import (
+    MAX_VISUAL_PLAN_REPAIR_ATTEMPTS,
+    VisualDirector,
+    VisualPlanningClient,
+    VisualPlanRepairEvent,
+)
 from app.models.visual_plan import VisualPlan
 from app.repositories import (
     get_project,
@@ -58,6 +63,7 @@ async def create_project_visual_plan(
     *,
     job_id: str | None = None,
     budget_guard: ProjectBudgetGuard | None = None,
+    max_repair_attempts: int = MAX_VISUAL_PLAN_REPAIR_ATTEMPTS,
 ) -> VisualPlan:
     """Generate, validate, and atomically persist a Project's current plan."""
     project = get_project(session, project_id)
@@ -74,17 +80,45 @@ async def create_project_visual_plan(
         project_id=project_id,
         event="planning_start",
     )
-    if budget_guard is not None:
-        budget_guard.check_paid_call(
-            pipeline_stage="PLANNING",
-            provider=project.planning_provider,
-            model=project.planning_model,
-            operation="PLANNING",
-            unit_type=PricingUnit.PER_REQUEST,
-            input_units=1,
+
+    def before_provider_call(request_number: int, is_repair: bool) -> None:
+        del request_number, is_repair
+        if budget_guard is not None:
+            budget_guard.check_paid_call(
+                pipeline_stage="PLANNING",
+                provider=project.planning_provider,
+                model=project.planning_model,
+                operation="PLANNING",
+                unit_type=PricingUnit.PER_REQUEST,
+                input_units=1,
+            )
+
+    def log_repair_event(repair: VisualPlanRepairEvent) -> None:
+        _log(
+            logging.INFO if repair.succeeded else logging.WARNING,
+            "Visual plan repair succeeded"
+            if repair.succeeded
+            else "Visual plan validation failed",
+            project_id=project_id,
+            event=(
+                "repair_success"
+                if repair.succeeded
+                else "repair_validation_failure"
+            ),
+            planning_attempt=1,
+            repair_attempt=repair.repair_attempt,
+            validation_category=repair.category,
+            validation_issue=repair.issue,
         )
+
+    director = VisualDirector(
+        planning_client,
+        max_repair_attempts=max_repair_attempts,
+        on_repair_event=log_repair_event,
+        before_provider_call=before_provider_call,
+    )
     try:
-        plan = await VisualDirector(planning_client).create_plan(story_text)
+        plan = await director.create_plan(story_text)
     except VisualDirectorError as exc:
         if job_id is not None:
             record_provider_usage(
@@ -92,12 +126,13 @@ async def create_project_visual_plan(
                 pipeline_stage="PLANNING", provider=project.planning_provider,
                 model=project.planning_model, operation="PLANNING",
                 request_revision=usage_revision(hash_story_text(story_text), "planning"),
-                unit_type=PricingUnit.PER_REQUEST, input_units=1,
+                unit_type=PricingUnit.PER_REQUEST,
+                input_units=max(exc.provider_requests, 1),
                 status=UsageStatus.FAILED,
             )
         failure_type = (
             "provider_failure"
-            if str(exc) == "Visual planning provider failed"
+            if "provider failed" in str(exc)
             else "validation_failure"
         )
         _log(
@@ -105,6 +140,10 @@ async def create_project_visual_plan(
             "Visual planning failed",
             project_id=project_id,
             event=failure_type,
+            planning_attempt=1,
+            repair_attempt=max(director.provider_requests - 1, 0),
+            validation_category=exc.validation_category,
+            validation_issue=exc.diagnostic,
         )
         raise
 
@@ -114,7 +153,7 @@ async def create_project_visual_plan(
             pipeline_stage="PLANNING", provider=project.planning_provider,
             model=project.planning_model, operation="PLANNING",
             request_revision=usage_revision(hash_story_text(story_text), "planning"),
-            unit_type=PricingUnit.PER_REQUEST, input_units=1,
+            unit_type=PricingUnit.PER_REQUEST, input_units=director.provider_requests,
             status=UsageStatus.SUCCEEDED,
         )
 
@@ -231,8 +270,12 @@ def _log(
     event: str,
     beat_count: int | None = None,
     plan_id: str | None = None,
+    planning_attempt: int | None = None,
+    repair_attempt: int | None = None,
+    validation_category: str | None = None,
+    validation_issue: dict[str, object] | None = None,
 ) -> None:
-    extra: dict[str, str | int] = {
+    extra: dict[str, object] = {
         "project_id": project_id,
         "visual_planning_event": event,
         "schema_version": VISUAL_PLAN_SCHEMA_VERSION,
@@ -242,4 +285,12 @@ def _log(
         extra["beat_count"] = beat_count
     if plan_id is not None:
         extra["plan_id"] = plan_id
+    if planning_attempt is not None:
+        extra["planning_attempt"] = planning_attempt
+    if repair_attempt is not None:
+        extra["repair_attempt"] = repair_attempt
+    if validation_category is not None:
+        extra["validation_category"] = validation_category
+    if validation_issue is not None:
+        extra["validation_issue"] = validation_issue
     logger.log(level, message, extra=extra)

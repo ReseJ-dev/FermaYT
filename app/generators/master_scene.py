@@ -50,6 +50,7 @@ from app.style_contracts import (
     DEFAULT_IMAGE_STYLE_ID,
     apply_image_style_contract,
     get_image_style_contract,
+    prepare_image_prompt_for_provider,
 )
 from app.utils.download import download_file
 
@@ -501,7 +502,7 @@ async def generate_continuity_image(
     downloader: Callable[[str, str], Awaitable[str]] | None = None,
 ) -> str:
     """Execute a prepared request without silently ignoring reference images."""
-    contracted_prompt = apply_image_style_contract(
+    contracted_prompt = prepare_image_prompt_for_provider(
         request.prompt,
         request.style_version or DEFAULT_IMAGE_STYLE_ID,
     )
@@ -679,7 +680,7 @@ def _build_master_candidate_generator(
                 )
             elif use_direct_download:
                 image_url = await client.generate(
-                    apply_image_style_contract(candidate_prompt, style_id)
+                    prepare_image_prompt_for_provider(candidate_prompt, style_id)
                 )
                 result = await downloader(image_url, candidate_path)
             else:
