@@ -30,7 +30,7 @@
             <p>{{ project.story_text | truncate(110) }}</p>
             <dl class="project-meta">
               <div><dt>Сцен</dt><dd>{{ card.scene_count }}</dd></div>
-              <div><dt>Изображения</dt><dd>{{ 'Seedream' if project.image_provider == 'seedream' else 'Qwen' }}</dd></div>
+              <div><dt>Изображения</dt><dd>{{ 'Seedream' if project.image_provider == 'seedream' else ('Z-Image' if project.image_provider == 'zimage' else 'Qwen') }}</dd></div>
               <div><dt>Формат</dt><dd>{{ project.width }}×{{ project.height }}</dd></div>
             </dl>
             <div class="card-actions">

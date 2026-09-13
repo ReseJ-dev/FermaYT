@@ -3,15 +3,13 @@
 from __future__ import annotations
 
 import base64
-import json
 import mimetypes
 import os
 from pathlib import Path
 from typing import Any, ClassVar
 
-import httpx
-
 from app.errors import StructuredAIProviderError
+from app.clients.structured_completion import complete_json_chat, missing_key_error
 
 
 class _DashScopeStructuredClient:
@@ -19,6 +17,9 @@ class _DashScopeStructuredClient:
         "https://dashscope-intl.aliyuncs.com/compatible-mode/v1/chat/completions"
     )
     TIMEOUT_SECONDS: ClassVar[float] = 300.0
+    MAX_ATTEMPTS: ClassVar[int] = 3
+    RETRY_BASE_DELAY_SECONDS: ClassVar[float] = 1.0
+    MAX_OUTPUT_TOKENS: ClassVar[int] = 32_768
     provider: ClassVar[str] = "dashscope"
 
     def __init__(
@@ -28,61 +29,55 @@ class _DashScopeStructuredClient:
         model: str,
         endpoint: str | None = None,
         timeout: float = TIMEOUT_SECONDS,
+        max_attempts: int = MAX_ATTEMPTS,
+        retry_base_delay: float = RETRY_BASE_DELAY_SECONDS,
+        max_output_tokens: int = MAX_OUTPUT_TOKENS,
     ) -> None:
         self.api_key = api_key
         self.model = model.strip()
         self.endpoint = endpoint or self.ENDPOINT
         self.timeout = timeout
+        self.max_attempts = max_attempts
+        self.retry_base_delay = retry_base_delay
+        self.max_output_tokens = max_output_tokens
         if not self.model:
             raise ValueError("DashScope model must not be empty")
         if timeout <= 0:
             raise ValueError("DashScope timeout must be positive")
+        if max_attempts < 1:
+            raise ValueError("DashScope max_attempts must be positive")
+        if retry_base_delay < 0:
+            raise ValueError("DashScope retry_base_delay must not be negative")
+        if max_output_tokens < 1:
+            raise ValueError("DashScope max_output_tokens must be positive")
 
-    async def _complete(self, messages: list[dict[str, Any]]) -> str:
+    async def _complete(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        operation: str,
+    ) -> str:
         api_key = self.api_key or os.getenv("DASHSCOPE_API_KEY", "").strip()
         if not api_key:
-            raise StructuredAIProviderError("DASHSCOPE_API_KEY is not configured")
-        payload = {
-            "model": self.model,
-            "messages": messages,
-            "response_format": {"type": "json_object"},
-            "temperature": 0.1,
-        }
-        try:
-            async with httpx.AsyncClient(timeout=self.timeout) as client:
-                response = await client.post(
-                    self.endpoint,
-                    headers={
-                        "Authorization": f"Bearer {api_key}",
-                        "Content-Type": "application/json",
-                    },
-                    json=payload,
-                )
-                response.raise_for_status()
-        except httpx.TimeoutException as exc:
-            raise StructuredAIProviderError("DashScope request timed out") from exc
-        except httpx.HTTPStatusError as exc:
-            raise StructuredAIProviderError(
-                f"DashScope returned HTTP {exc.response.status_code}"
-            ) from exc
-        except httpx.RequestError as exc:
-            raise StructuredAIProviderError("DashScope request failed") from exc
-        try:
-            body = response.json()
-            content = body["choices"][0]["message"]["content"]
-        except (ValueError, KeyError, IndexError, TypeError) as exc:
-            raise StructuredAIProviderError(
-                "DashScope returned an invalid structured response"
-            ) from exc
-        if not isinstance(content, str) or not content.strip():
-            raise StructuredAIProviderError("DashScope returned empty content")
-        try:
-            json.loads(content)
-        except json.JSONDecodeError as exc:
-            raise StructuredAIProviderError(
-                "DashScope returned invalid JSON content"
-            ) from exc
-        return content.strip()
+            raise missing_key_error(
+                provider=self.provider,
+                model=self.model,
+                operation=operation,
+                environment_name="DASHSCOPE_API_KEY",
+            )
+        return await complete_json_chat(
+            provider=self.provider,
+            model=self.model,
+            operation=operation,
+            endpoint=self.endpoint,
+            api_key=api_key,
+            messages=messages,
+            timeout=self.timeout,
+            max_attempts=self.max_attempts,
+            retry_base_delay=self.retry_base_delay,
+            max_output_tokens=self.max_output_tokens,
+            temperature=0.1,
+        )
 
 
 class DashScopeVisualPlanningClient(_DashScopeStructuredClient):
@@ -94,14 +89,26 @@ class DashScopeVisualPlanningClient(_DashScopeStructuredClient):
         api_key: str | None = None,
         model: str = "qwen-plus",
         endpoint: str | None = None,
-        timeout: float = _DashScopeStructuredClient.TIMEOUT_SECONDS,
+        timeout: float = 600.0,
+        max_attempts: int = _DashScopeStructuredClient.MAX_ATTEMPTS,
+        retry_base_delay: float = _DashScopeStructuredClient.RETRY_BASE_DELAY_SECONDS,
+        max_output_tokens: int = _DashScopeStructuredClient.MAX_OUTPUT_TOKENS,
     ) -> None:
         super().__init__(
-            api_key=api_key, model=model, endpoint=endpoint, timeout=timeout
+            api_key=api_key,
+            model=model,
+            endpoint=endpoint,
+            timeout=timeout,
+            max_attempts=max_attempts,
+            retry_base_delay=retry_base_delay,
+            max_output_tokens=max_output_tokens,
         )
 
     async def generate(self, prompt: str) -> str:
-        return await self._complete([{"role": "user", "content": prompt}])
+        return await self._complete(
+            [{"role": "user", "content": prompt}],
+            operation="visual_planning",
+        )
 
 
 class DashScopeVisualQAClient(_DashScopeStructuredClient):
@@ -127,7 +134,10 @@ class DashScopeVisualQAClient(_DashScopeStructuredClient):
             for path in image_paths
         ]
         content.append({"type": "text", "text": prompt})
-        return await self._complete([{"role": "user", "content": content}])
+        return await self._complete(
+            [{"role": "user", "content": content}],
+            operation="visual_qa",
+        )
 
 
 def _image_data_url(path: str) -> str:

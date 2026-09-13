@@ -12,6 +12,7 @@ from app.clients.dashscope_ai import (
     DashScopeVisualQAClient,
 )
 from app.errors import StructuredAIProviderError
+from app.provider_diagnostics import find_structured_ai_provider_diagnostic
 
 
 def test_planning_client_sends_json_mode_and_returns_content(
@@ -40,6 +41,7 @@ def test_planning_client_sends_json_mode_and_returns_content(
     assert result == '{"visual_beats": []}'
     assert captured["response_format"] == {"type": "json_object"}
     assert captured["model"] == "qwen-plus"
+    assert captured["max_tokens"] == 32_768
 
 
 def test_visual_qa_client_embeds_candidate_and_references(
@@ -100,5 +102,217 @@ def test_structured_provider_fails_safely(
     )
     with pytest.raises(StructuredAIProviderError):
         asyncio.run(
-            DashScopeVisualPlanningClient(api_key="never-exposed").generate("story")
+            DashScopeVisualPlanningClient(
+                api_key="never-exposed",
+                max_attempts=1,
+            ).generate("story")
         )
+
+
+@pytest.mark.parametrize(
+    ("status", "category"),
+    [
+        (400, "PLANNING_BAD_REQUEST"),
+        (401, "PLANNING_AUTH_ERROR"),
+        (403, "PLANNING_AUTH_ERROR"),
+        (404, "PLANNING_NOT_FOUND"),
+        (429, "PLANNING_RATE_LIMIT"),
+        (500, "PLANNING_PROVIDER_5XX"),
+    ],
+)
+def test_planning_http_failures_have_safe_stable_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    status: int,
+    category: str,
+) -> None:
+    async_client = httpx.AsyncClient
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            status,
+            request=request,
+            headers={"x-request-id": "request-123"},
+            json={
+                "code": "ProviderCode",
+                "message": "safe failure; Authorization: Bearer private-token",
+            },
+        )
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: async_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+
+    with pytest.raises(StructuredAIProviderError) as error:
+        asyncio.run(
+            DashScopeVisualPlanningClient(
+                api_key="never-exposed",
+                max_attempts=1,
+            ).generate("story")
+        )
+
+    diagnostic = find_structured_ai_provider_diagnostic(error.value)
+    assert diagnostic is not None
+    assert diagnostic.category == category
+    assert diagnostic.http_status == status
+    assert diagnostic.request_id == "request-123"
+    assert "ProviderCode" in (diagnostic.provider_error or "")
+    assert "private-token" not in (diagnostic.provider_error or "")
+
+
+def test_planning_timeout_records_duration(monkeypatch: pytest.MonkeyPatch) -> None:
+    async_client = httpx.AsyncClient
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        raise httpx.ReadTimeout("slow", request=request)
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: async_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    with pytest.raises(StructuredAIProviderError) as error:
+        asyncio.run(
+            DashScopeVisualPlanningClient(
+                api_key="key", timeout=42, max_attempts=1
+            ).generate("story")
+        )
+    diagnostic = find_structured_ai_provider_diagnostic(error.value)
+    assert diagnostic is not None
+    assert diagnostic.category == "PLANNING_TIMEOUT"
+    assert diagnostic.timeout_seconds == 42
+    assert diagnostic.retry_exhausted is True
+
+
+def test_planning_retries_transient_http_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async_client = httpx.AsyncClient
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            return httpx.Response(429, request=request, json={"message": "busy"})
+        return httpx.Response(
+            200,
+            request=request,
+            json={
+                "choices": [
+                    {
+                        "finish_reason": "stop",
+                        "message": {"content": '{"visual_beats":[]}'},
+                    }
+                ]
+            },
+        )
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: async_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    result = asyncio.run(
+        DashScopeVisualPlanningClient(
+            api_key="key", max_attempts=3, retry_base_delay=0
+        ).generate("story")
+    )
+    assert result == '{"visual_beats":[]}'
+    assert calls == 3
+
+
+def test_planning_does_not_retry_auth_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async_client = httpx.AsyncClient
+    calls = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(401, request=request)
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: async_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+    with pytest.raises(StructuredAIProviderError):
+        asyncio.run(
+            DashScopeVisualPlanningClient(
+                api_key="key", max_attempts=3, retry_base_delay=0
+            ).generate("story")
+        )
+    assert calls == 1
+
+
+@pytest.mark.parametrize(
+    ("response", "category"),
+    [
+        (
+            {"choices": [{"finish_reason": "stop", "message": {"content": ""}}]},
+            "PLANNING_EMPTY_RESPONSE",
+        ),
+        (
+            {"choices": [{"finish_reason": "length", "message": {"content": '{"a":'}}]},
+            "PLANNING_TRUNCATED_OUTPUT",
+        ),
+        (
+            {"choices": [{"finish_reason": "stop", "message": {"content": "not"}}]},
+            "PLANNING_INVALID_JSON",
+        ),
+        ({"choices": []}, "PLANNING_STRUCTURED_JSON_INCOMPATIBILITY"),
+    ],
+)
+def test_planning_response_failures_are_distinguished(
+    monkeypatch: pytest.MonkeyPatch,
+    response: dict[str, object],
+    category: str,
+) -> None:
+    async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: async_client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, request=request, json=response)
+            ),
+            **kwargs,
+        ),
+    )
+    with pytest.raises(StructuredAIProviderError) as error:
+        asyncio.run(
+            DashScopeVisualPlanningClient(api_key="key").generate("story")
+        )
+    diagnostic = find_structured_ai_provider_diagnostic(error.value)
+    assert diagnostic is not None
+    assert diagnostic.category == category
+
+
+def test_planning_malformed_http_json_is_distinguished(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async_client = httpx.AsyncClient
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: async_client(
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(
+                    200, request=request, content=b"not-json"
+                )
+            ),
+            **kwargs,
+        ),
+    )
+    with pytest.raises(StructuredAIProviderError) as error:
+        asyncio.run(
+            DashScopeVisualPlanningClient(api_key="key").generate("story")
+        )
+    diagnostic = find_structured_ai_provider_diagnostic(error.value)
+    assert diagnostic is not None
+    assert diagnostic.category == "PLANNING_INVALID_JSON"
+    assert diagnostic.response_length == len(b"not-json")
+    assert diagnostic.response_preview == "not-json"

@@ -95,7 +95,10 @@ def test_generate_image_runs_complete_workflow(
     )
 
     assert client.received_prompt is not None
-    assert client.received_prompt.startswith("cinematic mountain\n\n")
+    assert client.received_prompt.startswith(
+        "Create one illustration containing absolutely no visible text"
+    )
+    assert "cinematic mountain\n\n" in client.received_prompt
     assert "STYLE CONTRACT [rough_explainer_v1]" in client.received_prompt
     assert download_call == (
         "https://example.com/generated.png",
@@ -130,7 +133,10 @@ def test_generate_image_validates_dynamic_prompt_before_provider_request(
 
     assert observed_dynamic_prompts == ["no photorealism"]
     assert client.received_prompt is not None
-    assert client.received_prompt.startswith("no photorealism\n\n")
+    assert client.received_prompt.startswith(
+        "Create one illustration containing absolutely no visible text"
+    )
+    assert "no photorealism\n\n" in client.received_prompt
     assert "STYLE CONTRACT [rough_explainer_v1]" in client.received_prompt
 
 
@@ -148,6 +154,9 @@ def test_generate_image_creates_default_client(
     result = asyncio.run(generate_image("A forest", "output/default.png"))
 
     assert client.received_prompt is not None
-    assert client.received_prompt.startswith("A forest\n\n")
+    assert client.received_prompt.startswith(
+        "Create one illustration containing absolutely no visible text"
+    )
+    assert "A forest\n\n" in client.received_prompt
     assert "STYLE CONTRACT [rough_explainer_v1]" in client.received_prompt
     assert result == "output/default.png"

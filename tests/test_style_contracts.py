@@ -182,6 +182,36 @@ def test_negative_section_heading_applies_to_each_bullet() -> None:
 @pytest.mark.parametrize(
     "prompt",
     [
+        (
+            "Do not mix realistic tunnel walls, realistic lighting, or realistic "
+            "materials with cartoon foreground elements."
+        ),
+        "remove realistic stone, concrete, wood, or metal rendering",
+        "Remove fine surface detail and realistic stone texture.",
+    ],
+)
+def test_negative_imperatives_cover_coordinated_lists(prompt: str) -> None:
+    assert validate_image_style_prompt(prompt) == prompt
+
+
+@pytest.mark.parametrize(
+    "prompt, expected_concept",
+    [
+        ("remove flat colors, then use realistic materials", "realistic materials"),
+        ("avoid complex shadows, but add realistic stone", "realistic stone"),
+    ],
+)
+def test_positive_instruction_ends_coordinated_negation_scope(
+    prompt: str,
+    expected_concept: str,
+) -> None:
+    with pytest.raises(StyleContractError, match=expected_concept):
+        validate_image_style_prompt(prompt)
+
+
+@pytest.mark.parametrize(
+    "prompt",
+    [
         "photorealistic mine shaft",
         "use realistic materials",
         "realistic human anatomy",
@@ -339,7 +369,11 @@ def test_provider_boundary_does_not_rescan_assembled_contract(
         fail_if_called,
     )
 
-    assert prepare_image_prompt_for_provider(assembled) == assembled
+    prepared = prepare_image_prompt_for_provider(assembled)
+    assert prepared.endswith(assembled)
+    assert prepared.startswith(
+        "Create one illustration containing absolutely no visible text"
+    )
 
 
 def test_validator_uses_rules_from_selected_contract(

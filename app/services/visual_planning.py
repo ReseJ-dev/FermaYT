@@ -21,6 +21,7 @@ from app.generators.visual_director import (
     VisualPlanRepairEvent,
 )
 from app.models.visual_plan import VisualPlan
+from app.provider_diagnostics import find_structured_ai_provider_diagnostic
 from app.repositories import (
     get_project,
     get_project_visual_plan_record,
@@ -145,6 +146,12 @@ async def create_project_visual_plan(
             validation_category=exc.validation_category,
             validation_issue=exc.diagnostic,
         )
+        provider_diagnostic = find_structured_ai_provider_diagnostic(exc)
+        if provider_diagnostic is not None:
+            logger.warning(
+                "%s",
+                provider_diagnostic.format("Visual planning provider diagnostic"),
+            )
         raise
 
     if job_id is not None:

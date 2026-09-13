@@ -6,7 +6,11 @@ from copy import deepcopy
 
 import pytest
 
-from app.errors import VisualDirectorError
+from app.errors import StructuredAIProviderError, VisualDirectorError
+from app.provider_diagnostics import (
+    StructuredAIProviderDiagnostic,
+    find_structured_ai_provider_diagnostic,
+)
 from app.generators.visual_director import VisualDirector
 from app.models.visual_plan import VisualOperation
 
@@ -280,6 +284,45 @@ def test_director_hides_provider_error_details() -> None:
 
     assert str(exc_info.value) == "Visual planning provider failed"
     assert "secret" not in str(exc_info.value)
+    diagnostic = find_structured_ai_provider_diagnostic(exc_info.value)
+    assert diagnostic is not None
+    assert diagnostic.category == "PLANNING_UNKNOWN_ERROR"
+    assert diagnostic.provider_error == "RuntimeError"
+
+
+def test_director_preserves_safe_provider_diagnostic() -> None:
+    expected = StructuredAIProviderDiagnostic(
+        provider="dashscope",
+        model="qwen-plus",
+        operation="visual_planning",
+        category="PLANNING_BAD_REQUEST",
+        attempt=1,
+        max_attempts=3,
+        http_status=400,
+        provider_error='{"message":"Invalid response_format"}',
+        request_id="request-123",
+    )
+
+    class FailingClient:
+        provider = "dashscope"
+        model = "qwen-plus"
+
+        async def generate(self, prompt: str) -> str:
+            raise StructuredAIProviderError(
+                "safe diagnostic",
+                diagnostic=expected,
+                user_summary="Visual planning provider failed",
+            )
+
+    with pytest.raises(VisualDirectorError) as error:
+        asyncio.run(VisualDirector(FailingClient()).create_plan("Narration"))
+
+    diagnostic = find_structured_ai_provider_diagnostic(error.value)
+    assert diagnostic is not None
+    assert diagnostic.category == "PLANNING_BAD_REQUEST"
+    assert diagnostic.http_status == 400
+    assert diagnostic.request_id == "request-123"
+    assert diagnostic.repair_attempt == 0
 
 
 def test_unknown_geography_is_repaired_to_existing_canonical_id() -> None:
@@ -376,6 +419,11 @@ def test_invalid_repairs_stop_at_the_configured_limit() -> None:
     assert exc_info.value.diagnostic is not None
     assert exc_info.value.diagnostic["owner_id"] == "beat_2"
     assert exc_info.value.diagnostic["field"] == "geography_established_by"
+    provider_diagnostic = find_structured_ai_provider_diagnostic(exc_info.value)
+    assert provider_diagnostic is not None
+    assert provider_diagnostic.category == "PLANNING_REPAIR_EXHAUSTED"
+    assert provider_diagnostic.validation_category == "PLANNING_REFERENCE_ERROR"
+    assert provider_diagnostic.repair_attempt == 2
 
 
 def test_valid_plan_does_not_call_repair() -> None:

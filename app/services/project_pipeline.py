@@ -139,6 +139,35 @@ class ProjectPipelineReport:
         return asdict(self)
 
 
+@dataclass(frozen=True, slots=True)
+class ProjectStylePreviewReport:
+    pipeline_version: str
+    project_id: str
+    story_revision: str
+    visual_beats: int
+    semantic_visual_beats: int
+    master_assets: int
+    generated_or_edited_candidates: int
+    accepted_visual_assets: int
+    preview_result_ids: tuple[str, ...]
+    reused: dict[str, int | bool]
+    estimated_cost_before_run: dict[str, Any]
+    actual_run_cost: float | None
+    historical_project_asset_cost: float | None
+    qa_retry_cost: float | None
+    cost_currency: str | None
+    unpriced_usage_records: int
+    cost_run_id: str
+    generation_budget: dict[str, object]
+    production_profile: str
+    production_profile_version: str
+    generation_scope: dict[str, str | float | int | None]
+    final_render_id: None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
 async def run_project_video_pipeline(
     session: Session,
     project_id: str,
@@ -149,7 +178,7 @@ async def run_project_video_pipeline(
     budget_override: bool = False,
     production_profile: ProductionProfile | str = ProductionProfile.FINAL,
     generation_scope: GenerationScope | None = None,
-) -> ProjectPipelineReport:
+) -> ProjectPipelineReport | ProjectStylePreviewReport:
     """Run every required current stage, reusing valid persisted revisions."""
     cost_run_id = job_id or f"direct-{uuid4()}"
     profile = ProductionProfile(production_profile)
@@ -161,7 +190,11 @@ async def run_project_video_pipeline(
     project = get_project(session, project_id)
     if project is None:
         raise ValueError("Project not found")
-    _validate_project_preflight(project, dependencies)
+    _validate_project_preflight(
+        project,
+        dependencies,
+        require_video_tools=not scope.is_image_only,
+    )
     budget_guard = ProjectBudgetGuard(session, project_id, override=budget_override)
     narration_kwargs: dict[str, Any] = {
         "provider_resolver": dependencies.tts_provider_resolver,
@@ -293,21 +326,26 @@ async def run_project_video_pipeline(
         total_beats,
         None,
     )
-    masters = await generate_required_master_scenes(
-        session,
-        project,
-        plan,
-        provider,
-        projects_root=dependencies.projects_root,
-        style_id=project.style_id,
-        style_reference=style_reference,
-        capabilities=capabilities,
-        qa_service=dependencies.visual_qa_service,
-        downloader=dependencies.downloader,
-        job_id=cost_run_id,
-        budget_guard=budget_guard,
-        required_beat_ids=selected_beat_id_set,
-    )
+    if not capabilities.reference_generation:
+        # Text-only providers receive the immutable master geometry through every
+        # semantic beat prompt. Do not buy PNG masters they cannot attach later.
+        masters = list_master_scene_assets(session, project_id)
+    else:
+        masters = await generate_required_master_scenes(
+            session,
+            project,
+            plan,
+            provider,
+            projects_root=dependencies.projects_root,
+            style_id=project.style_id,
+            style_reference=style_reference,
+            capabilities=capabilities,
+            qa_service=dependencies.visual_qa_service,
+            downloader=dependencies.downloader,
+            job_id=cost_run_id,
+            budget_guard=budget_guard,
+            required_beat_ids=selected_beat_id_set,
+        )
     execution = resolve_project_visual_operations(
         session,
         project_id,
@@ -382,6 +420,59 @@ async def run_project_video_pipeline(
         total_beats,
         None,
     )
+
+    if scope.is_image_only:
+        operation_counts = Counter(item.resolved_operation for item in results)
+        costs = summarize_project_cost(session, project_id, job_id=cost_run_id)
+        report = ProjectStylePreviewReport(
+            pipeline_version=PIPELINE_VERSION,
+            project_id=project_id,
+            story_revision=hash_story_text(project.story_text),
+            visual_beats=total_beats,
+            semantic_visual_beats=semantic_total_beats,
+            master_assets=len(masters),
+            generated_or_edited_candidates=sum(
+                operation_counts[name]
+                for name in ("NEW_IMAGE", "REFERENCE_GENERATION", "EDIT_EXISTING")
+            ),
+            accepted_visual_assets=sum(item.is_accepted for item in results),
+            preview_result_ids=tuple(
+                item.id for item in results if item.is_accepted and item.output_path
+            ),
+            reused={
+                "visual_plan": plan_reused,
+                "master_assets": min(masters_before, len(masters)),
+                "accepted_visual_assets": sum(
+                    result.id in accepted_before
+                    or (
+                        result.resolved_operation == "REUSE"
+                        and result.source_result_id in accepted_before
+                    )
+                    for result in results
+                ),
+            },
+            estimated_cost_before_run=estimate.as_dict(),
+            actual_run_cost=costs.run_cost,
+            historical_project_asset_cost=costs.historical_project_cost,
+            qa_retry_cost=costs.qa_retry_cost,
+            cost_currency=costs.currency,
+            unpriced_usage_records=costs.unpriced_records,
+            cost_run_id=cost_run_id,
+            generation_budget=budget_guard.snapshot().as_dict(),
+            production_profile=profile.value,
+            production_profile_version=execution.production_profile_version,
+            generation_scope=scope.snapshot(),
+        )
+        await emit(
+            ProjectPipelineStage.COMPLETED,
+            100,
+            100,
+            f"Превью стиля готово: {len(report.preview_result_ids)} кадра",
+            total_beats,
+            total_beats,
+            None,
+        )
+        return report
 
     await emit(
         ProjectPipelineStage.GENERATING_NARRATION,
@@ -603,7 +694,10 @@ async def run_project_video_pipeline(
 
 
 def _validate_project_preflight(
-    project: Any, dependencies: ProjectPipelineDependencies
+    project: Any,
+    dependencies: ProjectPipelineDependencies,
+    *,
+    require_video_tools: bool = True,
 ) -> None:
     if not project.story_text.strip():
         raise ValueError("Добавьте готовый текст истории")
@@ -612,7 +706,9 @@ def _validate_project_preflight(
     if project.visual_qa_enabled and dependencies.visual_qa_service is None:
         raise ValueError("Visual QA включён, но vision provider не настроен")
     get_image_style_contract(project.style_id)
-    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+    if require_video_tools and (
+        shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None
+    ):
         raise ValueError("FFmpeg и ffprobe должны быть установлены")
     root = Path(dependencies.projects_root)
     root.mkdir(parents=True, exist_ok=True)

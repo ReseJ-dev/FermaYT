@@ -316,6 +316,17 @@ class VisualOperationDecisionEngine:
         }:
             if not context.references:
                 scores[operation] = float("-inf")
+        # An overlay is an executable instruction, not merely a cheap fallback.
+        # The semantic plan may prefer another operation and therefore legitimately
+        # omit overlay_description; the resolver must never invent OVERLAY later.
+        if beat.overlay_description is None:
+            scores[VisualOperation.OVERLAY] = float("-inf")
+        if context.physical_state_changed:
+            # Cropping, reusing, or decorating an old frame cannot depict a new
+            # physical state. Require an edit-capable or newly generated image.
+            scores[VisualOperation.REUSE] = float("-inf")
+            scores[VisualOperation.TRANSFORM] = float("-inf")
+            scores[VisualOperation.OVERLAY] = float("-inf")
         return scores
 
     @staticmethod
@@ -357,6 +368,8 @@ class VisualOperationDecisionEngine:
             return context.capabilities.reference_generation
         if operation is VisualOperation.EDIT_EXISTING:
             return context.capabilities.image_editing
+        if operation is VisualOperation.OVERLAY:
+            return context.beat.overlay_description is not None
         return True
 
     @staticmethod

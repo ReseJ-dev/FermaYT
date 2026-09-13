@@ -473,10 +473,11 @@ def estimate_project_generation_cost(
         )
         is not None
     )
-    remaining_operations.extend(
-        ("REFERENCE_GENERATION" if has_style_reference else "NEW_IMAGE")
-        for master_id in required_masters - existing_masters
-    )
+    if bool(execution.capability_snapshot.get("reference_generation")):
+        remaining_operations.extend(
+            ("REFERENCE_GENERATION" if has_style_reference else "NEW_IMAGE")
+            for master_id in required_masters - existing_masters
+        )
     estimate = estimate_operations(
         session,
         provider=execution.provider,

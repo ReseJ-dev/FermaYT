@@ -13,6 +13,7 @@
           <select name="default_image_provider" id="default-image-provider">
             <option value="seedream" {% if application_settings.image_provider == 'seedream' %}selected{% endif %}>BytePlus · Seedream</option>
             <option value="qwen" {% if application_settings.image_provider == 'qwen' %}selected{% endif %}>Alibaba · Qwen Image</option>
+            <option value="zimage" {% if application_settings.image_provider == 'zimage' %}selected{% endif %}>Kie.ai · Z-Image</option>
           </select>
         </label>
         <label>Qwen Image endpoint<input name="qwen_image_endpoint" value="{{ application_settings.qwen_image_endpoint or '' }}" placeholder="https://{WorkspaceId}.ap-southeast-1.maas.aliyuncs.com/..."><small>Нужен только при выборе Alibaba Qwen Image.</small></label>
@@ -42,6 +43,12 @@
       <label class="secret-field">DashScope API key<input name="dashscope_api_key" type="password" value="" autocomplete="new-password" placeholder="{{ 'Введите новый ключ для замены' if dashscope_configured else 'Введите DashScope API key' }}"></label>
       {% if dashscope_configured %}<label class="delete-secret"><input name="delete_dashscope_api_key" type="checkbox"> Удалить сохранённый DashScope key</label>{% endif %}
       <dl class="settings-list"><div><dt>Image endpoint</dt><dd>{{ 'Настроен' if qwen_image_endpoint_configured else 'Нужно настроить отдельно' }}</dd></div><div><dt>TTS</dt><dd>qwen3-tts-flash · Cherry · Russian</dd></div></dl>
+    </section>
+    <section class="panel provider-card">
+      <div class="provider-heading"><div class="provider-logo zimage">Z</div><div><h2>Kie.ai · Z-Image</h2><p>Генерация изображений</p></div><span class="config-status {{ 'configured' if kie_configured else '' }}">{{ 'Настроено' if kie_configured else 'Не настроено' }}</span></div>
+      <label class="secret-field">Kie.ai API key<input name="kie_api_key" type="password" value="" autocomplete="new-password" placeholder="{{ 'Введите новый ключ для замены' if kie_configured else 'Введите Kie.ai API key' }}"></label>
+      {% if kie_configured %}<label class="delete-secret"><input name="delete_kie_api_key" type="checkbox"> Удалить сохранённый Kie.ai key</label>{% endif %}
+      <dl class="settings-list"><div><dt>Модель</dt><dd>z-image</dd></div><div><dt>Возможности</dt><dd>Text-to-image</dd></div></dl>
     </section>
     <section class="panel provider-card">
       <div class="provider-heading"><div class="provider-logo kimi">K</div><div><h2>Moonshot AI · Kimi</h2><p>Планирование истории</p></div><span class="config-status {{ 'configured' if kimi_configured else '' }}">{{ 'Настроено' if kimi_configured else 'Не настроено' }}</span></div>

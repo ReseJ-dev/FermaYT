@@ -147,11 +147,12 @@ def test_provider_references_put_global_style_first(
         (style_reference, continuity_reference)
     )
 
-    assert "REFERENCE 1 [STYLE]" in instruction
+    assert "first attached image controls line thickness" in instruction
+    assert "second attached image controls content" in instruction
+    assert "IMAGE REFERENCE" not in instruction
     assert "do not copy its objects or environment" in instruction
-    assert "REFERENCE 2 [CONTENT_CONTINUITY]" in instruction
-    assert "STYLE wins for realism, detail, and rendering style" in instruction
-    assert "CONTENT_CONTINUITY wins for location layout" in instruction
+    assert "drawing style wins for realism, detail, and rendering style" in instruction
+    assert "Content continuity wins for location layout" in instruction
 
 
 def test_style_reference_cannot_be_placed_after_content_reference(
@@ -223,7 +224,8 @@ def test_bound_provider_always_prepends_approved_style_reference(
     assert [reference.role for reference in references] == [
         ImageReferenceRole.STYLE
     ]
-    assert "REFERENCE 1 [STYLE]" in prompt
+    assert "first attached image controls line thickness" in prompt
+    assert "IMAGE REFERENCE" not in prompt
     assert prompt.count("STYLE CONTRACT [rough_explainer_v1]") == 1
 
 

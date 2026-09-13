@@ -665,6 +665,42 @@ def test_reference_selection_orders_roles_and_respects_provider_limit(
         "PREVIOUS_STATE",
     ]
 
+    master.provider = "user"
+    user_master_for_new_image = select_visual_references(
+        beat,
+        VisualOperation.NEW_IMAGE,
+        ImageProviderCapabilities(
+            reference_generation=True,
+            multiple_references=True,
+            max_reference_images=2,
+        ),
+        style_reference=style,
+        master_asset=master,
+        source=None,
+    )
+    assert [item.semantic_role for item in user_master_for_new_image] == [
+        "STYLE",
+        "MASTER_LOCATION",
+    ]
+
+    master.provider = "user"
+    user_master_for_new_image = select_visual_references(
+        beat,
+        VisualOperation.NEW_IMAGE,
+        ImageProviderCapabilities(
+            reference_generation=True,
+            multiple_references=True,
+            max_reference_images=2,
+        ),
+        style_reference=style,
+        master_asset=master,
+        source=None,
+    )
+    assert [item.semantic_role for item in user_master_for_new_image] == [
+        "STYLE",
+        "MASTER_LOCATION",
+    ]
+
 
 def test_pending_attempt_is_marked_failed_after_restart(tmp_path: Path) -> None:
     database_path = tmp_path / "restart.db"
@@ -740,7 +776,7 @@ def test_generated_candidate_passes_qa_and_becomes_accepted(
     assert result.qa_status == "PASS"
     assert result.qa_provider == "fake-vision"
     assert result.qa_model == "fake-vision-model"
-    assert result.qa_prompt_version == "visual_qa_v1"
+    assert result.qa_prompt_version == "visual_qa_v3"
     assert result.accepted_at is not None
     assert len(result.qa_evaluations) == 1
     assert client.calls[0][1][0] == result.output_path
@@ -1118,7 +1154,7 @@ def test_visual_qa_result_and_immutable_evaluation_survive_restart(
         assert persisted.qa_revision is not None
         assert persisted.is_accepted is True
         assert len(persisted.qa_evaluations) == 1
-        assert persisted.qa_evaluations[0].prompt_version == "visual_qa_v1"
+        assert persisted.qa_evaluations[0].prompt_version == "visual_qa_v3"
     engine.dispose()
 
 

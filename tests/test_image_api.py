@@ -10,7 +10,9 @@ import pytest
 from app.clients.image_api import (
     BytePlusImageApiClient,
     ImageGenerationError,
+    KieZImageApiClient,
     QwenImageApiClient,
+    _fit_kie_zimage_prompt,
 )
 from app.providers import ImageReference, ImageReferenceRole
 
@@ -36,6 +38,226 @@ def run_generate(prompt: str = "A mountain") -> str:
 
 def run_qwen_generate(prompt: str = "A mountain") -> str:
     return asyncio.run(QwenImageApiClient().generate(prompt))
+
+
+def run_zimage_generate(prompt: str = "A mountain") -> str:
+    return asyncio.run(KieZImageApiClient(poll_interval=0).generate(prompt))
+
+
+def test_zimage_generate_creates_and_polls_kie_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.headers["Authorization"] == "Bearer kie-secret"
+        if request.method == "POST":
+            assert request.url == KieZImageApiClient.CREATE_URL
+            assert json.loads(request.content) == {
+                "model": "z-image",
+                "input": {
+                    "prompt": "A mountain",
+                    "aspect_ratio": "9:16",
+                    "nsfw_checker": True,
+                },
+            }
+            return httpx.Response(
+                200,
+                json={"code": 200, "msg": "success", "data": {"taskId": "task-1"}},
+            )
+        assert request.url.params["taskId"] == "task-1"
+        return httpx.Response(
+            200,
+            json={
+                "code": 200,
+                "msg": "success",
+                "data": {
+                    "state": "success",
+                    "resultJson": json.dumps(
+                        {"resultUrls": ["https://kie.example/result.png"]}
+                    ),
+                },
+            },
+        )
+
+    monkeypatch.setenv("KIE_API_KEY", "kie-secret")
+    install_mock_transport(monkeypatch, handler)
+
+    assert run_zimage_generate() == "https://kie.example/result.png"
+
+
+def test_zimage_polling_recovers_without_creating_a_second_task(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    posts = 0
+    polls = 0
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal posts, polls
+        if request.method == "POST":
+            posts += 1
+            return httpx.Response(
+                200,
+                json={"code": 200, "data": {"taskId": "task-slow"}},
+            )
+        polls += 1
+        if polls == 1:
+            return httpx.Response(503, json={"message": "temporary overload"})
+        if polls == 2:
+            raise httpx.ReadTimeout("temporary polling timeout", request=request)
+        return httpx.Response(
+            200,
+            json={
+                "code": 200,
+                "data": {
+                    "state": "success",
+                    "resultJson": '{"resultUrls":["https://kie.example/recovered.png"]}',
+                },
+            },
+        )
+
+    monkeypatch.setenv("KIE_API_KEY", "kie-secret")
+    install_mock_transport(monkeypatch, handler)
+
+    result = asyncio.run(
+        KieZImageApiClient(poll_interval=0, generation_timeout=10).generate(
+            "A mountain"
+        )
+    )
+
+    assert result == "https://kie.example/recovered.png"
+    assert posts == 1
+    assert polls == 3
+
+
+def test_zimage_generation_timeout_is_configurable(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("KIE_ZIMAGE_GENERATION_TIMEOUT_SECONDS", "2400")
+
+    client = KieZImageApiClient()
+
+    assert client.generation_timeout == 2400
+
+
+def test_zimage_default_generation_timeout_is_ten_minutes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("KIE_ZIMAGE_GENERATION_TIMEOUT_SECONDS", raising=False)
+
+    assert KieZImageApiClient().generation_timeout == 600
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_zimage_rejects_non_positive_generation_timeout(value: float) -> None:
+    with pytest.raises(ValueError, match="generation timeout must be positive"):
+        KieZImageApiClient(generation_timeout=value)
+
+
+def test_zimage_rejects_missing_key(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("KIE_API_KEY", raising=False)
+
+    with pytest.raises(ImageGenerationError, match="KIE_API_KEY") as raised:
+        run_zimage_generate()
+
+    assert raised.value.safe_diagnostic is not None
+    assert raised.value.safe_diagnostic.provider == "zimage"
+
+
+def test_zimage_compacts_assembled_prompt_to_kie_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed_prompt = ""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal observed_prompt
+        if request.method == "POST":
+            observed_prompt = json.loads(request.content)["input"]["prompt"]
+            return httpx.Response(
+                200, json={"code": 200, "data": {"taskId": "task-compact"}}
+            )
+        return httpx.Response(
+            200,
+            json={
+                "code": 200,
+                "data": {
+                    "state": "success",
+                    "resultJson": '{"resultUrls":["https://kie.example/image.png"]}',
+                },
+            },
+        )
+
+    monkeypatch.setenv("KIE_API_KEY", "kie-secret")
+    install_mock_transport(monkeypatch, handler)
+    prompt = "Scene semantics " * 100 + "STYLE CONTRACT [rough_explainer_v1] " * 20
+
+    run_zimage_generate(prompt)
+
+    assert 1 <= len(observed_prompt) <= 800
+    assert "Scene semantics" in observed_prompt
+    assert "NO photorealism" in observed_prompt
+
+
+def test_zimage_compaction_preserves_beat_semantics_over_verbose_project_style() -> None:
+    verbose_style = "canonical master style direction " * 100
+    common = f"""Create one illustration with no visible text.
+LOCATION CONTINUITY:
+Long mine tunnel with the exit at the far end.
+PROJECT STYLE DIRECTION:
+{verbose_style}
+CHARACTER CONTINUITY:
+Three miners in helmets.
+OBJECT CONTINUITY:
+Ceiling duct and work lights.
+CURRENT CAMERA / COMPOSITION:
+Medium view toward the far exit.
+CURRENT PHYSICAL STATE:
+Dust and small rocks fall from the ceiling near the exit.
+WHAT CHANGED:
+The stable tunnel begins shedding debris and the lights flicker.
+VISUAL FOCUS:
+The viewer first notices falling rock and dust near the far passage.
+DO NOT SHOW:
+The completed collapse.
+STYLE CONTRACT [rough_explainer_v1]
+Permanent style details.
+"""
+
+    compact = _fit_kie_zimage_prompt(common)
+    calm = _fit_kie_zimage_prompt(
+        common.replace(
+            "The viewer first notices falling rock and dust near the far passage.",
+            "The viewer first notices the open and safely lit far passage.",
+        )
+    )
+
+    assert 1 <= len(compact) <= 800
+    assert "falling rock and dust" in compact
+    assert "Dust and small rocks fall" in compact
+    assert "begins shedding debris" in compact
+    assert "canonical master style direction" not in compact
+    assert "NO photorealism" in compact
+    assert compact != calm
+
+
+def test_zimage_prompt_compaction_enforces_exact_provider_boundary() -> None:
+    assert _fit_kie_zimage_prompt("x" * 800) == "x" * 800
+
+    compact = _fit_kie_zimage_prompt("x" * 801)
+
+    assert 1 <= len(compact) <= 800
+
+
+def test_zimage_compaction_prioritizes_first_notice_instruction() -> None:
+    prompt = f"""VISUAL FOCUS:
+Purpose: {"context " * 40}
+First notice: Falling rock above the tunnel exit.
+STYLE CONTRACT [rough_explainer_v1]
+{"style " * 200}
+"""
+
+    compact = _fit_kie_zimage_prompt(prompt)
+
+    assert len(compact) <= 800
+    assert "First notice: Falling rock above the tunnel exit" in compact
 
 
 def configure_qwen(

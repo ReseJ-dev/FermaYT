@@ -2,10 +2,13 @@
 
 import asyncio
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
+from test_master_scene import _plan
 
 import app.main as main_module
 from app.database import (
@@ -17,7 +20,9 @@ from app.errors import MasterSceneError
 from app.jobs import GenerationJobManager, GenerationJobType
 from app.provider_diagnostics import ImageProviderDiagnostic
 from app.repositories import (
+    create_master_scene_asset,
     create_scene,
+    get_master_scene_asset,
     get_project,
     list_scenes,
     update_project,
@@ -26,6 +31,7 @@ from app.secret_store import (
     BYTEPLUS_API_KEY,
     DASHSCOPE_API_KEY,
     ELEVENLABS_API_KEY,
+    KIE_API_KEY,
     KIMI_API_KEY,
 )
 
@@ -148,7 +154,8 @@ def test_completed_job_does_not_restart_page_polling(web_app: tuple) -> None:
 
     assert page.status_code == 200
     assert 'data-job-status="completed"' in page.text
-    assert "/static/app.js?v=20260907-1" in page.text
+    assert "/static/app.js?v=20260912-1" in page.text
+    assert "/static/app.css?v=20260911-3" in page.text
     assert script.status_code == 200
     assert '["queued", "running"].includes(existingJobStatus)' in script.text
     assert "fermayt-completed-job-reloaded" in script.text
@@ -167,6 +174,8 @@ def test_dashboard_creates_and_opens_project(web_app: tuple) -> None:
     assert "История и стиль" in editor.text
     assert "Сцены" in editor.text
     assert "Сгенерировать видео" in editor.text
+    assert "Проверить стиль — 3 картинки" in editor.text
+    assert 'data-scope="STYLE_PREVIEW"' in editor.text
     assert "Visual Director" in editor.text
     assert "Qwen Image 2.0" in editor.text
     assert "Qwen Image 3.0" in editor.text
@@ -177,6 +186,159 @@ def test_dashboard_creates_and_opens_project(web_app: tuple) -> None:
         project = get_project(session, project_id)
         assert project is not None
         assert project.scene_count == 3
+
+
+def test_completed_videos_are_displayed_newest_first(
+    web_app: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _, projects_root = web_app
+    project_id = _create_project(client)
+    render_dir = projects_root / project_id / "renders"
+    render_dir.mkdir(parents=True)
+    old_path = render_dir / "old-final.mp4"
+    newest_path = render_dir / "newest-draft.mp4"
+    middle_path = render_dir / "middle-pilot.mp4"
+    for path in (old_path, newest_path, middle_path):
+        path.write_bytes(b"video")
+    renders = [
+        SimpleNamespace(
+            id="old",
+            status="SUCCEEDED",
+            output_path=str(old_path),
+            production_profile="FINAL",
+            generation_scope_type="FULL",
+            duration=30.0,
+            width=1920,
+            height=1080,
+            fps=30.0,
+            created_at=datetime(2026, 1, 1, tzinfo=UTC),
+            completed_at=datetime(2026, 1, 1, tzinfo=UTC),
+        ),
+        SimpleNamespace(
+            id="newest",
+            status="SUCCEEDED",
+            output_path=str(newest_path),
+            production_profile="DRAFT",
+            generation_scope_type="FULL",
+            duration=20.0,
+            width=960,
+            height=540,
+            fps=24.0,
+            created_at=datetime(2026, 1, 3, tzinfo=UTC),
+            completed_at=datetime(2026, 1, 3, tzinfo=UTC),
+        ),
+        SimpleNamespace(
+            id="middle",
+            status="SUCCEEDED",
+            output_path=str(middle_path),
+            production_profile="FINAL",
+            generation_scope_type="FIRST_SECONDS",
+            duration=15.0,
+            width=1920,
+            height=1080,
+            fps=30.0,
+            created_at=datetime(2026, 1, 2, tzinfo=UTC),
+            completed_at=datetime(2026, 1, 2, tzinfo=UTC),
+        ),
+    ]
+    monkeypatch.setattr(main_module, "list_project_video_renders", lambda *_: renders)
+
+    page = client.get(f"/projects/{project_id}")
+
+    assert page.status_code == 200
+    assert "Готовые видео" in page.text
+    assert page.text.index("newest-draft.mp4") < page.text.index("middle-pilot.mp4")
+    assert page.text.index("middle-pilot.mp4") < page.text.index("old-final.mp4")
+    assert page.text.count("ПОСЛЕДНЕЕ") == 1
+
+
+def test_project_displays_persisted_master_scene_images(web_app: tuple) -> None:
+    client, session_factory, projects_root = web_app
+    project_id = _create_project(client)
+    image_path = projects_root / project_id / "master_scenes" / "shaft-master.png"
+    image_path.parent.mkdir(parents=True)
+    image_path.write_bytes(b"persisted-master-image")
+    with session_factory() as session:
+        create_master_scene_asset(
+            session,
+            project_id=project_id,
+            master_scene_id="shaft_master",
+            file_path=str(image_path),
+            file_sha256="0" * 64,
+            style_version="rough_explainer_v1",
+            generation_prompt="Wide cutaway of the shaft",
+            provider="zimage",
+            model="z-image",
+        )
+
+    page = client.get(f"/projects/{project_id}")
+
+    assert page.status_code == 200
+    assert "Мастер-картинки проекта" in page.text
+    assert "shaft_master" in page.text
+    assert "z-image · rough_explainer_v1" in page.text
+    media_url = f"/media/{project_id}/master_scenes/shaft-master.png"
+    assert media_url in page.text
+    media = client.get(media_url)
+    assert media.status_code == 200
+    assert media.content == b"persisted-master-image"
+
+
+def test_project_can_upload_and_delete_own_master_scene(
+    web_app: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_factory, _ = web_app
+    project_id = _create_project(client)
+    monkeypatch.setattr(
+        main_module,
+        "load_project_visual_plan_state",
+        lambda session, requested_project_id: SimpleNamespace(
+            plan=_plan(),
+            is_current=requested_project_id == project_id,
+        ),
+    )
+
+    empty_page = client.get(f"/projects/{project_id}")
+    uploaded = client.post(
+        f"/api/projects/{project_id}/master-scenes",
+        params={"master_scene_id": "shaft_master"},
+        content=b"\x89PNG\r\n\x1a\nmy-master",
+        headers={"Content-Type": "image/png"},
+    )
+
+    assert empty_page.status_code == 200
+    assert 'data-master-id="shaft_master"' in empty_page.text
+    assert "Добавить PNG" in empty_page.text
+    assert uploaded.status_code == 200
+    with session_factory() as session:
+        asset = get_master_scene_asset(session, project_id, "shaft_master")
+        assert asset is not None
+        asset_id = asset.id
+        stored_path = Path(asset.file_path)
+        assert asset.provider == "user"
+        assert stored_path.is_file()
+        update_project(
+            session,
+            project_id,
+            image_provider="zimage",
+            image_model="z-image",
+        )
+
+    filled_page = client.get(f"/projects/{project_id}")
+    deleted = client.post(
+        f"/api/projects/{project_id}/master-scenes/{asset_id}/delete"
+    )
+
+    assert "свой PNG · rough_explainer_v1" in filled_page.text
+    assert 'data-delete-master' in filled_page.text
+    assert "Z-Image" in filled_page.text
+    assert "Z-Image не поддерживает reference input" in filled_page.text
+    assert deleted.status_code == 200
+    assert not stored_path.exists()
+    with session_factory() as session:
+        assert get_master_scene_asset(session, project_id, "shaft_master") is None
 
 
 def test_dashboard_saves_permanent_image_prompt(web_app: tuple) -> None:
@@ -371,13 +533,19 @@ def test_settings_save_preserve_and_delete_api_keys(
             "dashscope_api_key": "dashscope-private",
             "elevenlabs_api_key": "elevenlabs-private",
             "kimi_api_key": "kimi-private",
+            "kie_api_key": "kie-private",
         },
         follow_redirects=False,
     )
     page = client.get("/settings")
     preserved = client.post(
         "/settings",
-        data={"byteplus_api_key": "", "dashscope_api_key": "", "kimi_api_key": ""},
+        data={
+            "byteplus_api_key": "",
+            "dashscope_api_key": "",
+            "kimi_api_key": "",
+            "kie_api_key": "",
+        },
         follow_redirects=False,
     )
     deleted = client.post(
@@ -391,11 +559,13 @@ def test_settings_save_preserve_and_delete_api_keys(
         DASHSCOPE_API_KEY: "dashscope-private",
         ELEVENLABS_API_KEY: "elevenlabs-private",
         KIMI_API_KEY: "kimi-private",
+        KIE_API_KEY: "kie-private",
     }
     assert "byteplus-private" not in page.text
     assert "dashscope-private" not in page.text
     assert "elevenlabs-private" not in page.text
     assert "kimi-private" not in page.text
+    assert "kie-private" not in page.text
     assert page.text.count("Настроено") >= 3
     assert BYTEPLUS_API_KEY not in store.values
 
@@ -439,6 +609,28 @@ def test_project_can_select_kimi_for_story_planning(web_app: tuple) -> None:
         assert project is not None
         assert project.planning_provider == "kimi"
         assert project.planning_model == "kimi-k3"
+
+
+def test_zimage_can_be_selected_as_default_for_new_projects(
+    web_app: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_factory, _ = web_app
+    monkeypatch.setattr(main_module, "secret_store", FakeSecretStore())
+
+    saved = client.post(
+        "/settings",
+        data={"default_image_provider": "zimage"},
+        follow_redirects=False,
+    )
+    project_id = _create_project(client)
+
+    assert saved.status_code == 303
+    with session_factory() as session:
+        project = get_project(session, project_id)
+        assert project is not None
+        assert project.image_provider == "zimage"
+        assert project.image_model == "z-image"
 
 
 def test_global_provider_selection_is_visible_and_used_for_new_project(

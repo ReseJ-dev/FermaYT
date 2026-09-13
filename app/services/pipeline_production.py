@@ -14,6 +14,7 @@ from app.clients.dashscope_ai import (
     DashScopeVisualQAClient,
 )
 from app.clients.kimi_ai import KimiVisualPlanningClient
+from app.clients.structured_completion import missing_key_error
 from app.pipeline.visual_qa import VisualQAService
 from app.providers import (
     ImageProvider,
@@ -26,6 +27,7 @@ from app.secret_store import (
     BYTEPLUS_API_KEY,
     DASHSCOPE_API_KEY,
     ELEVENLABS_API_KEY,
+    KIE_API_KEY,
     KIMI_API_KEY,
     SecretStore,
 )
@@ -38,22 +40,55 @@ def build_production_pipeline_dependencies(
     secret_store: SecretStore,
     *,
     projects_root: str | Path = "data/projects",
+    require_tts: bool = True,
 ) -> ProjectPipelineDependencies:
     project = get_project(session, project_id)
     if project is None:
         raise ValueError("Project not found")
     settings = get_application_settings(session)
+    planning_timeout = _environment_float(
+        "VISUAL_PLANNING_TIMEOUT_SECONDS", 600.0, minimum=1.0
+    )
+    planning_max_attempts = _environment_int(
+        "VISUAL_PLANNING_MAX_ATTEMPTS", 3, minimum=1
+    )
+    planning_retry_delay = _environment_float(
+        "VISUAL_PLANNING_RETRY_BASE_SECONDS", 1.0, minimum=0.0
+    )
+    planning_max_tokens = _environment_int(
+        "VISUAL_PLANNING_MAX_OUTPUT_TOKENS", 32_768, minimum=1
+    )
+    planning_reasoning_effort = os.getenv(
+        "VISUAL_PLANNING_REASONING_EFFORT", "low"
+    ).strip().lower()
+    if planning_reasoning_effort not in {"low", "high", "max"}:
+        raise ValueError(
+            "VISUAL_PLANNING_REASONING_EFFORT must be low, high, or max"
+        )
+    elevenlabs_timeout = _environment_float(
+        "ELEVENLABS_TTS_TIMEOUT_SECONDS", 300.0, minimum=1.0
+    )
     needs_dashscope = (
         project.planning_provider == "dashscope"
         or project.visual_qa_enabled
         or project.image_provider == "qwen"
-        or project.tts_provider == "qwen"
+        or (require_tts and project.tts_provider == "qwen")
     )
     dashscope_key = (
-        _secret(secret_store, DASHSCOPE_API_KEY, "DASHSCOPE_API_KEY")
+        secret_store.get_secret(DASHSCOPE_API_KEY)
+        or os.getenv("DASHSCOPE_API_KEY", "").strip()
         if needs_dashscope
         else None
     )
+    if needs_dashscope and not dashscope_key:
+        if project.planning_provider == "dashscope":
+            raise missing_key_error(
+                provider="dashscope",
+                model=project.planning_model,
+                operation="visual_planning",
+                environment_name="DASHSCOPE_API_KEY",
+            )
+        raise ValueError("Добавьте DASHSCOPE_API_KEY в Settings")
 
     image_key: str
     image_endpoint: str | None = None
@@ -67,22 +102,35 @@ def build_production_pipeline_dependencies(
         )
         if not image_endpoint:
             raise ValueError("Настройте Qwen Image endpoint в Settings")
+    elif project.image_provider == "zimage":
+        image_key = (
+            secret_store.get_secret(KIE_API_KEY)
+            or os.getenv("KIE_API_KEY", "").strip()
+        )
+        if not image_key:
+            raise ValueError("Добавьте KIE_API_KEY в Settings")
     else:
         raise ValueError("Выбран неизвестный image provider")
 
-    if project.tts_provider == "qwen":
-        assert dashscope_key is not None
-        tts_key = dashscope_key
-    elif project.tts_provider == "elevenlabs":
-        tts_key = _secret(secret_store, ELEVENLABS_API_KEY, "ELEVENLABS_API_KEY")
-    else:
-        raise ValueError("Выбран неизвестный TTS provider")
+    tts_key: str | None = None
+    if require_tts:
+        if project.tts_provider == "qwen":
+            assert dashscope_key is not None
+            tts_key = dashscope_key
+        elif project.tts_provider == "elevenlabs":
+            tts_key = _secret(secret_store, ELEVENLABS_API_KEY, "ELEVENLABS_API_KEY")
+        else:
+            raise ValueError("Выбран неизвестный TTS provider")
 
     if project.planning_provider == "dashscope":
         assert dashscope_key is not None
         planning_client = DashScopeVisualPlanningClient(
             api_key=dashscope_key,
             model=project.planning_model,
+            timeout=planning_timeout,
+            max_attempts=planning_max_attempts,
+            retry_base_delay=planning_retry_delay,
+            max_output_tokens=planning_max_tokens,
         )
     elif project.planning_provider == "kimi":
         kimi_key = (
@@ -91,10 +139,20 @@ def build_production_pipeline_dependencies(
             or os.getenv("KIMI_API_KEY", "").strip()
         )
         if not kimi_key:
-            raise ValueError("Добавьте MOONSHOT_API_KEY в Settings")
+            raise missing_key_error(
+                provider="kimi",
+                model=project.planning_model,
+                operation="visual_planning",
+                environment_name="MOONSHOT_API_KEY",
+            )
         planning_client = KimiVisualPlanningClient(
             api_key=kimi_key,
             model=project.planning_model,
+            timeout=planning_timeout,
+            max_attempts=planning_max_attempts,
+            retry_base_delay=planning_retry_delay,
+            max_output_tokens=planning_max_tokens,
+            reasoning_effort=planning_reasoning_effort,
         )
     else:
         raise ValueError("Выбран неизвестный planning provider")
@@ -119,14 +177,20 @@ def build_production_pipeline_dependencies(
         options["api_key"] = image_key
         if name == "qwen":
             options["endpoint"] = image_endpoint
+        elif name == "zimage":
+            options["aspect_ratio"] = _kie_aspect_ratio(project.width, project.height)
         return get_image_provider(name, options)
 
     def tts_resolver(
         name: str,
         config: Mapping[str, Any] | None,
     ) -> TTSProvider:
+        if tts_key is None:
+            raise RuntimeError("TTS is not available in image-only preview mode")
         options = dict(config or {})
         options["api_key"] = tts_key
+        if name == "elevenlabs":
+            options["timeout"] = elevenlabs_timeout
         return get_tts_provider(name, options)
 
     return ProjectPipelineDependencies(
@@ -135,7 +199,9 @@ def build_production_pipeline_dependencies(
         tts_provider_resolver=tts_resolver,
         visual_qa_service=qa_service,
         projects_root=projects_root,
-        preflight_validator=lambda current: _validate_models(current),
+        preflight_validator=lambda current: _validate_models(
+            current, require_tts=require_tts
+        ),
     )
 
 
@@ -152,12 +218,41 @@ def _required_key(value: str | None) -> str:
     return value
 
 
-def _validate_models(project: Any) -> None:
+def _environment_float(name: str, default: float, *, minimum: float) -> float:
+    raw = os.getenv(name, "").strip()
+    try:
+        value = float(raw) if raw else default
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return value
+
+
+def _environment_int(name: str, default: int, *, minimum: int) -> int:
+    raw = os.getenv(name, "").strip()
+    try:
+        value = int(raw) if raw else default
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if value < minimum:
+        raise ValueError(f"{name} must be at least {minimum}")
+    return value
+
+
+def _kie_aspect_ratio(width: int, height: int) -> str:
+    if width == height:
+        return "1:1"
+    return "9:16" if height > width else "16:9"
+
+
+def _validate_models(project: Any, *, require_tts: bool = True) -> None:
     required = {
         "planning model": project.planning_model,
         "image model": project.image_model,
-        "TTS model": project.tts_model,
     }
+    if require_tts:
+        required["TTS model"] = project.tts_model
     if project.visual_qa_enabled:
         required["Visual QA model"] = project.visual_qa_model
     missing = [

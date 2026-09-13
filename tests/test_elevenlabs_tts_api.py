@@ -57,6 +57,36 @@ def test_elevenlabs_generate_returns_audio_bytes(
     assert result == b"mp3-audio"
 
 
+def test_elevenlabs_uses_configured_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, object] = {}
+    real_async_client = httpx.AsyncClient
+
+    def create_mock_client(*args: object, **kwargs: object) -> httpx.AsyncClient:
+        captured["timeout"] = kwargs.get("timeout")
+        kwargs["transport"] = httpx.MockTransport(
+            lambda request: httpx.Response(
+                200,
+                request=request,
+                content=b"audio",
+                headers={"content-type": "audio/mpeg"},
+            )
+        )
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", create_mock_client)
+    client = ElevenLabsTTSApiClient(api_key="key", timeout=240)
+
+    assert asyncio.run(client.generate("Hello")) == b"audio"
+    assert captured["timeout"] == 240
+
+
+def test_elevenlabs_rejects_non_positive_timeout() -> None:
+    with pytest.raises(ValueError, match="timeout must be positive"):
+        ElevenLabsTTSApiClient(api_key="key", timeout=0)
+
+
 def test_elevenlabs_uses_environment_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -99,7 +129,7 @@ def test_elevenlabs_handles_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
         )
 
 
-@pytest.mark.parametrize("status_code", [400, 401, 429, 500])
+@pytest.mark.parametrize("status_code", [400, 401, 402, 429, 500])
 def test_elevenlabs_handles_http_errors(
     monkeypatch: pytest.MonkeyPatch,
     status_code: int,
@@ -117,6 +147,35 @@ def test_elevenlabs_handles_http_errors(
         asyncio.run(
             ElevenLabsTTSApiClient(api_key="key").generate("Hello")
         )
+
+
+def test_elevenlabs_includes_safe_payment_error_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    install_mock_transport(
+        monkeypatch,
+        lambda request: httpx.Response(
+            402,
+            request=request,
+            json={
+                "detail": {
+                    "code": "paid_plan_required",
+                    "status": "payment_required",
+                    "message": "Free users cannot use library voices via the API.",
+                }
+            },
+        ),
+    )
+
+    with pytest.raises(TTSGenerationError) as error:
+        asyncio.run(
+            ElevenLabsTTSApiClient(api_key="key").generate("Hello")
+        )
+
+    message = str(error.value)
+    assert "HTTP 402" in message
+    assert "paid_plan_required" in message
+    assert "Free users cannot use library voices" in message
 
 
 @pytest.mark.parametrize(

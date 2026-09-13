@@ -354,7 +354,7 @@ class ApplicationSettings(Base):
     @validates("image_provider")
     def validate_image_provider(self, key: str, value: str) -> str:
         del key
-        if value not in {"seedream", "qwen"}:
+        if value not in {"seedream", "qwen", "zimage"}:
             raise ValueError("unsupported image provider")
         return value
 

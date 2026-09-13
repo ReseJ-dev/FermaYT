@@ -120,7 +120,32 @@ label small, .helper-text { color: #8a94a7; font-size: .7rem; font-weight: 500; 
 .provider-step { display: grid; flex: 0 0 2rem; height: 2rem; place-items: center; border-radius: .55rem; color: white; background: var(--primary); font-size: .65rem; font-weight: 800; }
 .render-settings-title { margin: 1.5rem 0 1rem; padding-top: 1.25rem; border-top: 1px solid #e2e6ee; font-size: .95rem; }
 
-.scenes-section { margin-top: 2.5rem; }
+.video-renders-section, .master-assets-section, .style-preview-section, .scenes-section { margin-top: 2.5rem; }
+.video-renders-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1rem; }
+.video-render-card { display: grid; gap: .75rem; overflow: hidden; padding: 1rem; }
+.video-render-heading { display: flex; align-items: flex-start; justify-content: space-between; gap: .75rem; }
+.video-render-heading > div { display: grid; gap: .2rem; }
+.video-render-heading small, .video-render-card > small { color: var(--muted); font-size: .68rem; }
+.video-render-card .final-preview { margin-top: 0; border-radius: .65rem; background: #111; }
+.master-assets-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); gap: .65rem; }
+.master-asset-card { overflow: hidden; padding: 0; }
+.master-asset-preview { display: block; background: #e8ebf1; }
+.master-asset-preview img { display: block; width: 100%; aspect-ratio: 16 / 10; object-fit: cover; }
+.master-asset-body { display: grid; gap: .35rem; padding: .65rem; }
+.master-asset-body .asset-label { margin: 0; }
+.master-asset-body h3, .master-asset-body p { margin: 0; }
+.master-asset-body h3 { overflow-wrap: anywhere; font-size: .78rem; }
+.master-asset-body p { display: -webkit-box; overflow: hidden; -webkit-box-orient: vertical; -webkit-line-clamp: 2; }
+.master-asset-body p, .master-asset-body small { color: var(--muted); font-size: .62rem; line-height: 1.35; }
+.master-asset-body .text-link { margin-top: .15rem; }
+.master-asset-actions { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: .35rem; margin-top: .2rem; }
+.master-file-input { width: 100%; padding: .3rem; font-size: .6rem; }
+.master-assets-warning { margin: 0 0 .7rem; padding: .65rem .8rem; border: 1px solid #efcf83; border-radius: .65rem; color: #775916; background: #fff8e5; font-size: .7rem; line-height: 1.45; }
+.style-preview-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: .75rem; }
+.style-preview-card { overflow: hidden; padding: 0; }
+.style-preview-card img { display: block; width: 100%; aspect-ratio: 16 / 9; object-fit: cover; }
+.style-preview-card div { display: flex; align-items: center; justify-content: space-between; gap: .5rem; padding: .65rem .75rem; }
+.style-preview-card small { overflow-wrap: anywhere; color: var(--muted); font-size: .65rem; }
 .scene-list { display: grid; gap: 1rem; }
 .scene-card { display: grid; grid-template-columns: 4.4rem minmax(0, 1fr); overflow: hidden; }
 .scene-number { display: flex; flex-direction: column; align-items: center; padding-top: 1.5rem; color: white; background: linear-gradient(180deg, #252a47, #353b62); }
@@ -186,6 +211,7 @@ label small, .helper-text { color: #8a94a7; font-size: .7rem; font-weight: 500; 
 .provider-logo.seedream { background: linear-gradient(135deg, #5660d8, #9b6de1); }
 .provider-logo.qwen { background: linear-gradient(135deg, #e37542, #cc3f70); }
 .provider-logo.kimi { background: linear-gradient(135deg, #151515, #5d6673); }
+.provider-logo.zimage { background: linear-gradient(135deg, #106c65, #35ad8e); }
 .provider-logo.elevenlabs { color: #111; background: #efefef; font-size: .75rem; }
 .config-status { padding: .3rem .55rem; border-radius: 2rem; color: #985050; background: #fff0f0; font-size: .65rem; font-weight: 750; }
 .config-status.configured { color: #18704a; background: #e7f8ef; }
@@ -220,7 +246,7 @@ label small, .helper-text { color: #8a94a7; font-size: .7rem; font-weight: 500; 
   .local-badge { display: none; }
   .page-heading { align-items: flex-start; flex-direction: column; }
   .page-heading .button { width: 100%; }
-  .two-columns, .settings-grid, .scene-editor-grid, .provider-selection-grid { grid-template-columns: 1fr; }
+  .two-columns, .settings-grid, .scene-editor-grid, .provider-selection-grid, .video-renders-grid, .master-assets-grid { grid-template-columns: 1fr; }
   .asset-stack { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .scene-card { grid-template-columns: 3rem minmax(0, 1fr); }
   .scene-content { padding: 1rem; }

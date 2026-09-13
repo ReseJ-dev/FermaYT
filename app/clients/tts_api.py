@@ -7,6 +7,7 @@ from urllib.parse import quote
 import httpx
 
 from app.errors import TTSGenerationError
+from app.provider_diagnostics import safe_provider_response
 from app.tts_capabilities import TTSProviderCapabilities
 
 
@@ -82,8 +83,10 @@ class QwenTTSApiClient:
         except httpx.TimeoutException as exc:
             raise TTSGenerationError("TTS API request timed out") from exc
         except httpx.HTTPStatusError as exc:
+            provider_error = safe_provider_response(exc.response)
+            detail = f": {provider_error}" if provider_error else ""
             raise TTSGenerationError(
-                f"TTS API returned HTTP {exc.response.status_code}"
+                f"TTS API returned HTTP {exc.response.status_code}{detail}"
             ) from exc
         except httpx.RequestError as exc:
             raise TTSGenerationError("TTS API request failed") from exc
@@ -134,7 +137,7 @@ class ElevenLabsTTSApiClient:
     API_URL: ClassVar[str] = "https://api.elevenlabs.io/v1/text-to-speech"
     MODEL_ID: ClassVar[str] = "eleven_multilingual_v2"
     OUTPUT_FORMAT: ClassVar[str] = "mp3_44100_128"
-    TIMEOUT_SECONDS: ClassVar[float] = 60.0
+    TIMEOUT_SECONDS: ClassVar[float] = 300.0
     capabilities: ClassVar[TTSProviderCapabilities] = TTSProviderCapabilities()
 
     def __init__(
@@ -144,12 +147,16 @@ class ElevenLabsTTSApiClient:
         model: str = MODEL_ID,
         voice: str = "JBFqnCBsd6RMkjVDRZzb",
         output_format: str = OUTPUT_FORMAT,
+        timeout: float = TIMEOUT_SECONDS,
     ) -> None:
         self.api_key = api_key
         self.endpoint = endpoint if endpoint is not None else self.API_URL
         self.model = model
         self.voice = voice
         self.output_format = output_format
+        self.timeout = timeout
+        if timeout <= 0:
+            raise ValueError("ElevenLabs timeout must be positive")
 
     async def generate(self, text: str) -> bytes:
         """Generate speech and return the audio response bytes."""
@@ -186,7 +193,7 @@ class ElevenLabsTTSApiClient:
 
         try:
             async with httpx.AsyncClient(
-                timeout=self.TIMEOUT_SECONDS
+                timeout=self.timeout
             ) as client:
                 response = await client.post(
                     url,
@@ -200,8 +207,11 @@ class ElevenLabsTTSApiClient:
                 "ElevenLabs API request timed out"
             ) from exc
         except httpx.HTTPStatusError as exc:
+            provider_error = safe_provider_response(exc.response)
+            detail = f": {provider_error}" if provider_error else ""
             raise TTSGenerationError(
-                f"ElevenLabs API returned HTTP {exc.response.status_code}"
+                "ElevenLabs API returned HTTP "
+                f"{exc.response.status_code}{detail}"
             ) from exc
         except httpx.RequestError as exc:
             raise TTSGenerationError("ElevenLabs API request failed") from exc

@@ -105,6 +105,7 @@ document.addEventListener("DOMContentLoaded", () => {
   const updateImageProviderFields = (changedByUser = false) => {
     if (!(imageProvider instanceof HTMLSelectElement)) return;
     const isQwen = imageProvider.value === "qwen";
+    const isZImage = imageProvider.value === "zimage";
     if (imageModel instanceof HTMLSelectElement) {
       Array.from(imageModel.options).forEach((option) => {
         option.disabled = option.dataset.provider !== imageProvider.value;
@@ -113,10 +114,16 @@ document.addEventListener("DOMContentLoaded", () => {
     if (imageProviderHelp) {
       imageProviderHelp.textContent = isQwen
         ? "Выберите Qwen Image 2.0 или 3.0. Используются DashScope key и настроенный endpoint."
-        : "Используется BytePlus API key.";
+        : isZImage
+          ? "Z-Image через Kie.ai и Kie.ai API key. Только создание новых изображений."
+          : "Используется BytePlus API key.";
     }
     if (changedByUser && (imageModel instanceof HTMLInputElement || imageModel instanceof HTMLSelectElement)) {
-      imageModel.value = isQwen ? "qwen-image-3.0" : "seedream-5-0-260128";
+      imageModel.value = isQwen
+        ? "qwen-image-3.0"
+        : isZImage
+          ? "z-image"
+          : "seedream-5-0-260128";
     }
   };
 
@@ -154,7 +161,20 @@ document.addEventListener("DOMContentLoaded", () => {
     if (progressStage) progressStage.textContent = job.current_stage || job.status;
     if (progressPercent) progressPercent.textContent = `${job.progress || 0}%`;
     if (progressMessage) progressMessage.textContent = job.message || "";
-    if (progressError) progressError.textContent = job.budget_pause?.message || job.error || "";
+    if (progressError) {
+      let failureMessage = job.budget_pause?.message || job.error || "";
+      if (job.diagnostic && !job.budget_pause) {
+        const provider = [job.diagnostic.provider, job.diagnostic.model]
+          .filter(Boolean)
+          .join(" / ");
+        const reason = job.diagnostic.provider_error || job.diagnostic.error_type;
+        const details = [provider, job.diagnostic.operation, reason]
+          .filter(Boolean)
+          .join(" · ");
+        if (details) failureMessage = `${failureMessage} — ${details}`;
+      }
+      progressError.textContent = failureMessage;
+    }
     if (job.cost) {
       const suffix = job.cost.currency ? ` ${job.cost.currency}` : "";
       if (costRun) costRun.textContent = job.cost.run_cost === null ? "—" : `${Number(job.cost.run_cost).toFixed(4)}${suffix}`;
@@ -285,6 +305,52 @@ document.addEventListener("DOMContentLoaded", () => {
         window.alert(payload.detail || "Не удалось сохранить style reference");
         uploadStyle.disabled = false;
       }
+    });
+  }
+
+  const masterAssets = document.querySelector("[data-master-assets]");
+  if (masterAssets instanceof HTMLElement) {
+    const projectId = masterAssets.dataset.projectId || "";
+    masterAssets.querySelectorAll("[data-upload-master]").forEach((element) => {
+      if (!(element instanceof HTMLButtonElement)) return;
+      element.addEventListener("click", async () => {
+        const input = document.getElementById(element.dataset.fileInput || "");
+        const file = input instanceof HTMLInputElement ? input.files?.[0] : null;
+        if (!file) {
+          window.alert("Выберите PNG-файл");
+          return;
+        }
+        element.disabled = true;
+        const query = new URLSearchParams({master_scene_id: element.dataset.masterId || ""});
+        const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/master-scenes?${query}`, {
+          method: "POST",
+          headers: {"Content-Type": "image/png"},
+          body: file,
+        });
+        if (response.ok) window.location.reload();
+        else {
+          const payload = await response.json();
+          window.alert(payload.detail || "Не удалось добавить мастер-картинку");
+          element.disabled = false;
+        }
+      });
+    });
+    masterAssets.querySelectorAll("[data-delete-master]").forEach((element) => {
+      if (!(element instanceof HTMLButtonElement)) return;
+      element.addEventListener("click", async () => {
+        if (!window.confirm(`Удалить мастер-картинку ${element.dataset.masterId || ""}?`)) return;
+        element.disabled = true;
+        const response = await fetch(
+          `/api/projects/${encodeURIComponent(projectId)}/master-scenes/${encodeURIComponent(element.dataset.assetId || "")}/delete`,
+          {method: "POST"},
+        );
+        if (response.ok) window.location.reload();
+        else {
+          const payload = await response.json();
+          window.alert(payload.detail || "Не удалось удалить мастер-картинку");
+          element.disabled = false;
+        }
+      });
     });
   }
 });

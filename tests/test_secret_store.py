@@ -8,6 +8,7 @@ from app.secret_store import (
     BYTEPLUS_API_KEY,
     DASHSCOPE_API_KEY,
     ELEVENLABS_API_KEY,
+    KIE_API_KEY,
     KIMI_API_KEY,
     SERVICE_NAME,
     SecretStore,
@@ -38,6 +39,8 @@ def test_secret_store_uses_keyring_without_exposing_value(
     assert SecretStore().get_secret(ELEVENLABS_API_KEY) is None
     SecretStore().set_secret(KIMI_API_KEY, "kimi-private")
     assert SecretStore().get_secret(KIMI_API_KEY) == "kimi-private"
+    SecretStore().set_secret(KIE_API_KEY, "kie-private")
+    assert SecretStore().get_secret(KIE_API_KEY) == "kie-private"
     assert "private-key" not in repr(SecretStore())
 
 

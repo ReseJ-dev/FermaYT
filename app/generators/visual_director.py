@@ -7,7 +7,11 @@ from typing import Any, Protocol
 
 from pydantic import ValidationError
 
-from app.errors import VisualDirectorError
+from app.errors import StructuredAIProviderError, VisualDirectorError
+from app.provider_diagnostics import (
+    StructuredAIProviderDiagnostic,
+    find_structured_ai_provider_diagnostic,
+)
 from app.models.visual_plan import (
     VisualPlan,
     VisualPlanDuplicateIdError,
@@ -82,6 +86,21 @@ class VisualDirector:
                     )
                 )
                 if repair_attempt >= self.max_repair_attempts:
+                    stable_category = _stable_validation_category(
+                        last_diagnostic.category
+                    )
+                    provider_diagnostic = StructuredAIProviderDiagnostic(
+                        provider=str(getattr(self._client, "provider", "unknown")),
+                        model=getattr(self._client, "model", None),
+                        operation="visual_planning",
+                        category="PLANNING_REPAIR_EXHAUSTED",
+                        attempt=self.provider_requests,
+                        max_attempts=self.provider_requests,
+                        repair_attempt=repair_attempt,
+                        provider_error=last_diagnostic.summary,
+                        response_length=len(raw_plan),
+                        validation_category=stable_category,
+                    )
                     raise VisualDirectorError(
                         "Visual planning provider returned an invalid structured "
                         f"visual plan after {repair_attempt} repair attempt(s): "
@@ -89,6 +108,7 @@ class VisualDirector:
                         validation_category=last_diagnostic.category,
                         diagnostic=last_diagnostic.issue,
                         provider_requests=self.provider_requests,
+                        safe_diagnostic=provider_diagnostic,
                     ) from exc
                 repair_prompt = build_visual_plan_repair_request(
                     raw_plan,
@@ -118,16 +138,48 @@ class VisualDirector:
         self.provider_requests = next_request
         try:
             return await self._client.generate(prompt)
+        except StructuredAIProviderError as exc:
+            message = (
+                f"Visual plan repair provider failed on request {next_request}"
+                if is_repair
+                else "Visual planning provider failed"
+            )
+            diagnostic = find_structured_ai_provider_diagnostic(exc)
+            if diagnostic is not None:
+                diagnostic = diagnostic.with_context(
+                    repair_attempt=max(next_request - 1, 0)
+                )
+            raise VisualDirectorError(
+                message,
+                validation_category=(
+                    diagnostic.category
+                    if diagnostic is not None
+                    else "PLANNING_UNKNOWN_ERROR"
+                ),
+                provider_requests=self.provider_requests,
+                safe_diagnostic=diagnostic,
+            ) from exc
         except Exception as exc:
             message = (
                 f"Visual plan repair provider failed on request {next_request}"
                 if is_repair
                 else "Visual planning provider failed"
             )
+            diagnostic = StructuredAIProviderDiagnostic(
+                provider=str(getattr(self._client, "provider", "unknown")),
+                model=getattr(self._client, "model", None),
+                operation="visual_planning",
+                category="PLANNING_UNKNOWN_ERROR",
+                attempt=next_request,
+                max_attempts=next_request,
+                provider_error=type(exc).__name__,
+                repair_attempt=max(next_request - 1, 0),
+            )
             raise VisualDirectorError(
                 message,
-                validation_category="OTHER_VISUAL_PLAN_ERROR",
+                validation_category="PLANNING_UNKNOWN_ERROR",
                 provider_requests=self.provider_requests,
+                safe_diagnostic=diagnostic,
             ) from exc
 
     def _emit_repair_event(self, event: VisualPlanRepairEvent) -> None:
@@ -186,6 +238,19 @@ def _validation_diagnostic(error: Exception) -> VisualPlanValidationDiagnostic:
         category="OTHER_VISUAL_PLAN_ERROR",
         summary="response has an unsupported JSON shape",
     )
+
+
+def _stable_validation_category(category: str) -> str:
+    if category in {
+        "UNKNOWN_REFERENCE",
+        "FORWARD_REFERENCE",
+        "REFERENCE_TYPE_MISMATCH",
+        "DUPLICATE_ID",
+    }:
+        return "PLANNING_REFERENCE_ERROR"
+    if category == "JSON_PARSE_ERROR":
+        return "PLANNING_INVALID_JSON"
+    return "PLANNING_SCHEMA_ERROR"
 
 
 def build_visual_plan_repair_request(

@@ -6,13 +6,16 @@ from pathlib import Path
 
 import pytest
 
-from app.errors import MasterSceneError
+from app.errors import MasterSceneError, VisualDirectorError
 from app.jobs import (
     GenerationJobManager,
     GenerationJobStatus,
     GenerationJobType,
 )
-from app.provider_diagnostics import ImageProviderDiagnostic
+from app.provider_diagnostics import (
+    ImageProviderDiagnostic,
+    StructuredAIProviderDiagnostic,
+)
 
 
 def test_create_job_persists_queued_metadata(tmp_path: Path) -> None:
@@ -136,6 +139,52 @@ def test_image_provider_diagnostic_is_persisted_and_logged_safely(
     assert "provider=\"seedream\"" in caplog.text
     assert "http_status=400" in caplog.text
     assert "Invalid size parameter" in caplog.text
+
+
+def test_planning_provider_diagnostic_is_persisted_and_logged_safely(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def scenario() -> None:
+        manager = GenerationJobManager(tmp_path / "app.db")
+        diagnostic = StructuredAIProviderDiagnostic(
+            provider="kimi",
+            model="kimi-k3",
+            operation="visual_planning",
+            category="PLANNING_TIMEOUT",
+            attempt=3,
+            max_attempts=3,
+            timeout_seconds=600,
+            repair_attempt=0,
+        )
+
+        async def operation(job_id: str) -> None:
+            del job_id
+            raise VisualDirectorError(
+                "Visual planning provider failed",
+                safe_diagnostic=diagnostic,
+                user_summary="Visual planning provider failed",
+            )
+
+        job = await manager.enqueue(
+            "project-1",
+            GenerationJobType.GENERATE_VIDEO,
+            operation,
+        )
+        failed = await manager.wait(job.id)
+
+        assert failed is not None
+        assert failed.error == "Visual planning provider failed"
+        assert failed.report is not None
+        assert failed.report["summary"] == failed.error
+        assert failed.report["failure"] == diagnostic.as_dict()
+
+    with caplog.at_level(logging.ERROR):
+        asyncio.run(scenario())
+
+    assert 'provider="kimi"' in caplog.text
+    assert 'category="PLANNING_TIMEOUT"' in caplog.text
+    assert "timeout_seconds=600" in caplog.text
 
 
 def test_startup_marks_running_jobs_as_interrupted(tmp_path: Path) -> None:

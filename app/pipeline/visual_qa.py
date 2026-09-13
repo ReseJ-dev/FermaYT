@@ -29,7 +29,7 @@ from app.style_contracts import (
 
 logger = logging.getLogger(__name__)
 
-VISUAL_QA_PROMPT_VERSION = "visual_qa_v1"
+VISUAL_QA_PROMPT_VERSION = "visual_qa_v3"
 
 
 class VisualQAClient(Protocol):
@@ -319,6 +319,11 @@ redesign. CHECK STYLE: reject realism, excess detail, polish, cinematic treatmen
 childishness, and unwanted textures. CHECK COMPOSITION: action prominence, clutter,
 scale of important objects, and overcrowding. CHECK VIDEO READABILITY: rapid
 understanding, needed simplification, and whether crop/framing should change.
+CHECK UNWANTED TEXT: reject any visible prompt wording, section heading, operation name,
+technical label, watermark, or interface text unless readable story-world text is
+explicitly required by the scene. Any visible phrase such as VISUAL OPERATION, VISUAL
+REFERENCE, REFERENCE INSTRUCTIONS, IMAGE REFERENCE, or STYLE CONTRACT is always a hard
+REGENERATE with problem category UNWANTED_TEXT, never PASS or PASS_WITH_WARNING.
 CHECK VISUAL PROGRESSION: compared with the previous frame when supplied, confirm
 that the beat advances state, understanding, framing, or route information without
 an arbitrary location switch or needless repetition.
@@ -356,6 +361,7 @@ _HARD_FAILURE_CATEGORIES = {
     VisualQAProblemCategory.STYLE_DRIFT_REALISM,
     VisualQAProblemCategory.EDIT_CHANGED_TOO_MUCH,
     VisualQAProblemCategory.COMPOSITION_UNCLEAR,
+    VisualQAProblemCategory.UNWANTED_TEXT,
     VisualQAProblemCategory.VIDEO_READABILITY,
 }
 

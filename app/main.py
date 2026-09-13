@@ -25,12 +25,17 @@ from app.costs import (
 )
 from app.database import SessionLocal, init_database
 from app.database import engine as database_engine
-from app.errors import MediaProbeError, TTSGenerationError
+from app.errors import (
+    MediaProbeError,
+    StructuredAIProviderError,
+    TTSGenerationError,
+)
 from app.generation_scope import GenerationScope, GenerationScopeType
 from app.generators.image import (
     build_image_generation_prompt,
     generate_image,
 )
+from app.generators.master_scene import register_uploaded_master_scene
 from app.generators.style_reference import register_approved_style_reference
 from app.generators.voice import generate_voice
 from app.jobs import GenerationJob, GenerationJobManager, GenerationJobType
@@ -41,12 +46,15 @@ from app.providers import get_image_provider, get_tts_provider
 from app.repositories import (
     create_project,
     create_scene,
+    delete_master_scene_asset,
     delete_project,
     delete_scene,
     get_application_settings,
+    get_beat_visual_result,
     get_project,
     get_scene,
     get_style_reference_asset,
+    list_master_scene_assets,
     list_project_video_renders,
     list_projects,
     list_scenes,
@@ -59,6 +67,7 @@ from app.secret_store import (
     BYTEPLUS_API_KEY,
     DASHSCOPE_API_KEY,
     ELEVENLABS_API_KEY,
+    KIE_API_KEY,
     KIMI_API_KEY,
     SecretStore,
     SecretStoreError,
@@ -146,7 +155,11 @@ async def create_project_route(request: Request) -> RedirectResponse:
                 image_model=(
                     "qwen-image-3.0"
                     if application_settings.image_provider == "qwen"
-                    else "seedream-5-0-260128"
+                    else (
+                        "z-image"
+                        if application_settings.image_provider == "zimage"
+                        else "seedream-5-0-260128"
+                    )
                 ),
                 tts_provider=default_tts_provider,
                 tts_model=(
@@ -190,44 +203,106 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
             project.draft_video_path,
         )
         pilot_video_url = _stored_media_url(project_id, project.pilot_video_path)
-        final_video_download_url = (
-            f"/api/projects/{quote(project_id)}/video/download"
-            if final_video_url is not None
-            else None
-        )
         style_reference = get_style_reference_asset(
             session, project_id, project.style_id
         )
         renders = list_project_video_renders(session, project_id)
-        final_render = next(
-            (
-                item
-                for item in reversed(renders)
-                if item.status == "SUCCEEDED"
-                and item.production_profile == "FINAL"
-                and item.generation_scope_type == "FULL"
-            ),
-            None,
+        video_render_cards: list[dict[str, object]] = []
+        rendered_paths: set[str] = set()
+        current_final_path = (
+            str(Path(project.final_video_path).resolve())
+            if project.final_video_path
+            else None
         )
-        draft_render = next(
-            (
-                item
-                for item in reversed(renders)
-                if item.status == "SUCCEEDED"
-                and item.production_profile == "DRAFT"
-                and item.generation_scope_type == "FULL"
-            ),
-            None,
+        for render in renders:
+            if render.status != "SUCCEEDED" or not render.output_path:
+                continue
+            video_url = _stored_media_url(project_id, render.output_path)
+            if video_url is None:
+                continue
+            rendered_paths.add(str(Path(render.output_path).resolve()))
+            if render.generation_scope_type != GenerationScopeType.FULL.value:
+                label = "PILOT / PARTIAL"
+            elif render.production_profile == ProductionProfile.DRAFT.value:
+                label = "DRAFT VIDEO"
+            else:
+                label = "FULL VIDEO"
+            video_render_cards.append(
+                {
+                    "id": render.id,
+                    "label": label,
+                    "video_url": video_url,
+                    "download_url": (
+                        f"/api/projects/{quote(project_id)}/video/download"
+                        if str(Path(render.output_path).resolve()) == current_final_path
+                        else video_url
+                    ),
+                    "duration": render.duration,
+                    "width": render.width,
+                    "height": render.height,
+                    "fps": render.fps,
+                    "completed_at": render.completed_at or render.created_at,
+                }
+            )
+        legacy_videos = (
+            ("FULL VIDEO", project.final_video_path, project.rendered_at),
+            ("DRAFT VIDEO", project.draft_video_path, project.draft_rendered_at),
+            ("PILOT / PARTIAL", project.pilot_video_path, project.pilot_rendered_at),
         )
-        pilot_render = next(
-            (
-                item
-                for item in reversed(renders)
-                if item.status == "SUCCEEDED" and item.generation_scope_type != "FULL"
+        for label, output_path, completed_at in legacy_videos:
+            if not output_path or str(Path(output_path).resolve()) in rendered_paths:
+                continue
+            video_url = _stored_media_url(project_id, output_path)
+            if video_url is not None:
+                video_render_cards.append(
+                    {
+                        "id": None,
+                        "label": label,
+                        "video_url": video_url,
+                        "download_url": (
+                            f"/api/projects/{quote(project_id)}/video/download"
+                            if str(Path(output_path).resolve()) == current_final_path
+                            else video_url
+                        ),
+                        "duration": None,
+                        "width": None,
+                        "height": None,
+                        "fps": None,
+                        "completed_at": completed_at,
+                    }
+                )
+        video_render_cards.sort(
+            key=lambda card: (
+                card["completed_at"].timestamp()
+                if card["completed_at"] is not None
+                else 0.0
             ),
-            None,
+            reverse=True,
         )
         latest_job = await job_manager.get_latest_project_job(project_id)
+        style_preview_cards: list[dict[str, object]] = []
+        if (
+            latest_job is not None
+            and latest_job.generation_scope_type == GenerationScopeType.STYLE_PREVIEW.value
+            and isinstance(latest_job.report, dict)
+        ):
+            result_ids = latest_job.report.get("preview_result_ids", [])
+            if isinstance(result_ids, list):
+                for result_id in result_ids[:3]:
+                    if not isinstance(result_id, str):
+                        continue
+                    result = get_beat_visual_result(session, result_id)
+                    if result is None or not result.is_accepted:
+                        continue
+                    image_url = _stored_media_url(project_id, result.output_path)
+                    if image_url is not None:
+                        style_preview_cards.append(
+                            {
+                                "beat_id": result.beat_id,
+                                "operation": result.resolved_operation,
+                                "image_url": image_url,
+                            }
+                        )
         cost_summary = summarize_project_cost(
             session,
             project_id,
@@ -241,8 +316,52 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
             session, project_id, production_profile="FINAL"
         )
         plan_state = load_project_visual_plan_state(session, project_id)
+        master_definitions = (
+            list(plan_state.plan.possible_master_scenes)
+            if plan_state is not None and plan_state.is_current
+            else []
+        )
+        master_assets_by_id = {
+            asset.master_scene_id: asset
+            for asset in list_master_scene_assets(session, project_id)
+        }
+        master_scene_cards = [
+            {
+                "master_scene_id": definition.id,
+                "asset": master_assets_by_id.get(definition.id),
+                "definition": definition,
+                "image_url": _stored_media_url(
+                    project_id,
+                    master_assets_by_id[definition.id].file_path,
+                ) if definition.id in master_assets_by_id else None,
+            }
+            for definition in master_definitions
+        ]
+        defined_master_ids = {definition.id for definition in master_definitions}
+        master_scene_cards.extend(
+            {
+                "master_scene_id": asset.master_scene_id,
+                "asset": asset,
+                "definition": None,
+                "image_url": _stored_media_url(project_id, asset.file_path),
+            }
+            for asset in master_assets_by_id.values()
+            if asset.master_scene_id not in defined_master_ids
+        )
         pilot_cost_estimates: dict[int, object] = {}
+        style_preview_cost_estimate = None
         if plan_state is not None and plan_state.is_current:
+            style_preview_scope = GenerationScope(
+                GenerationScopeType.STYLE_PREVIEW
+            )
+            style_preview_cost_estimate = estimate_project_generation_cost(
+                session,
+                project_id,
+                production_profile="FINAL",
+                beat_ids=frozenset(
+                    style_preview_scope.select_beat_ids(plan_state.plan)
+                ),
+            )
             for seconds in (30, 60):
                 pilot_scope = GenerationScope(
                     GenerationScopeType.FIRST_SECONDS, seconds
@@ -261,13 +380,12 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
                 "title": f"{project.name} — FermaYT",
                 "project": project,
                 "scene_cards": scene_cards,
+                "master_scene_cards": master_scene_cards,
+                "style_preview_cards": style_preview_cards,
                 "final_video_url": final_video_url,
                 "draft_video_url": draft_video_url,
                 "pilot_video_url": pilot_video_url,
-                "final_video_download_url": final_video_download_url,
-                "final_render": final_render,
-                "draft_render": draft_render,
-                "pilot_render": pilot_render,
+                "video_render_cards": video_render_cards,
                 "style_reference": style_reference,
                 "latest_job": latest_job,
                 "cost_summary": cost_summary,
@@ -275,6 +393,7 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
                 "draft_cost_estimate": draft_cost_estimate,
                 "final_cost_estimate": final_cost_estimate,
                 "pilot_cost_estimates": pilot_cost_estimates,
+                "style_preview_cost_estimate": style_preview_cost_estimate,
                 "budget_snapshot": budget_snapshot,
                 "notice": request.query_params.get("notice"),
                 "error": request.query_params.get("error"),
@@ -345,8 +464,9 @@ async def generate_project_video_route(
                 project_id,
                 secret_store,
                 projects_root=PROJECTS_ROOT,
+                require_tts=not generation_scope.is_image_only,
             )
-        except (SecretStoreError, ValueError) as exc:
+        except (SecretStoreError, StructuredAIProviderError, ValueError) as exc:
             raise HTTPException(
                 status_code=422, detail=_safe_validation_message(exc)
             ) from exc
@@ -416,6 +536,85 @@ async def upload_style_reference(request: Request, project_id: str) -> dict[str,
         finally:
             staging.unlink(missing_ok=True)
     return {"status": "registered", "style_id": asset.style_id}
+
+
+@app.post("/api/projects/{project_id}/master-scenes")
+async def upload_master_scene(
+    request: Request,
+    project_id: str,
+    master_scene_id: str,
+) -> dict[str, str]:
+    """Register a user PNG in one master slot from the current visual plan."""
+    if await job_manager.get_active_project_job(project_id) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Нельзя менять мастер-картинки во время генерации.",
+        )
+    if request.headers.get("content-type", "").split(";", 1)[0] != "image/png":
+        raise HTTPException(status_code=415, detail="Мастер-картинка должна быть PNG")
+    body = await request.body()
+    if not body or len(body) > 20 * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail="Размер мастер-картинки должен быть от 1 байта до 20 МБ",
+        )
+    with SessionLocal() as session:
+        project = get_project(session, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        plan_state = load_project_visual_plan_state(session, project_id)
+        if plan_state is None or not plan_state.is_current:
+            raise HTTPException(
+                status_code=409,
+                detail="Сначала создайте актуальный VisualPlan проекта.",
+            )
+        staging = ProjectMediaPaths(
+            project_id,
+            PROJECTS_ROOT,
+        ).uploads_dir / f"{uuid4()}.png"
+        try:
+            await asyncio.to_thread(staging.write_bytes, body)
+            asset = register_uploaded_master_scene(
+                session,
+                project,
+                plan_state.plan,
+                master_scene_id,
+                staging,
+                projects_root=PROJECTS_ROOT,
+                style_id=project.style_id,
+            )
+        except Exception as exc:
+            raise HTTPException(
+                status_code=422,
+                detail=_safe_validation_message(exc),
+            ) from exc
+        finally:
+            staging.unlink(missing_ok=True)
+    return {
+        "status": "registered",
+        "master_scene_id": asset.master_scene_id,
+    }
+
+
+@app.post("/api/projects/{project_id}/master-scenes/{asset_id}/delete")
+async def delete_master_scene(project_id: str, asset_id: str) -> dict[str, str]:
+    """Delete one user-selected master record and its project-local image."""
+    if await job_manager.get_active_project_job(project_id) is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Нельзя менять мастер-картинки во время генерации.",
+        )
+    with SessionLocal() as session:
+        asset = delete_master_scene_asset(session, project_id, asset_id)
+        if asset is None:
+            raise HTTPException(status_code=404, detail="Master scene not found")
+        stored_path = asset.file_path
+        master_scene_id = asset.master_scene_id
+    project_root = (PROJECTS_ROOT / project_id).resolve()
+    candidate = Path(stored_path).resolve()
+    if candidate.is_relative_to(project_root):
+        candidate.unlink(missing_ok=True)
+    return {"status": "deleted", "master_scene_id": master_scene_id}
 
 
 @app.post("/projects/{project_id}/delete")
@@ -716,6 +915,7 @@ async def settings(request: Request) -> HTMLResponse:
         KIMI_API_KEY,
         "MOONSHOT_API_KEY",
     )
+    kie_configured, kie_store_error = _secret_status(KIE_API_KEY, "KIE_API_KEY")
     with SessionLocal() as session:
         application_settings = get_application_settings(session)
     return templates.TemplateResponse(
@@ -727,6 +927,7 @@ async def settings(request: Request) -> HTMLResponse:
             "dashscope_configured": dashscope_configured,
             "elevenlabs_configured": elevenlabs_configured,
             "kimi_configured": kimi_configured,
+            "kie_configured": kie_configured,
             "qwen_image_endpoint_configured": bool(
                 application_settings.qwen_image_endpoint
                 or os.getenv("QWEN_IMAGE_ENDPOINT", "").strip()
@@ -737,6 +938,7 @@ async def settings(request: Request) -> HTMLResponse:
                 or dashscope_store_error
                 or elevenlabs_store_error
                 or kimi_store_error
+                or kie_store_error
             ),
             "notice": request.query_params.get("notice"),
             "error": request.query_params.get("error"),
@@ -784,13 +986,19 @@ async def update_settings(request: Request) -> RedirectResponse:
             delete_field="delete_kimi_api_key",
             secret_name=KIMI_API_KEY,
         )
+        _update_secret_from_form(
+            form,
+            field="kie_api_key",
+            delete_field="delete_kie_api_key",
+            secret_name=KIE_API_KEY,
+        )
         with SessionLocal() as session:
             update_application_settings(
                 session,
                 image_provider=_choice(
                     form,
                     "default_image_provider",
-                    {"seedream", "qwen"},
+                    {"seedream", "qwen", "zimage"},
                     "Нейросеть изображений",
                 ),
                 tts_provider=_choice(
@@ -940,7 +1148,19 @@ def _image_provider_config(project: Project) -> dict[str, str]:
             "endpoint": endpoint,
             "model": project.image_model or "qwen-image-3.0",
         }
+    if project.image_provider == "zimage":
+        return {
+            "api_key": _configured_secret(KIE_API_KEY, "KIE_API_KEY"),
+            "model": project.image_model or "z-image",
+            "aspect_ratio": _kie_aspect_ratio(project.width, project.height),
+        }
     raise ValueError("Неизвестный провайдер изображений.")
+
+
+def _kie_aspect_ratio(width: int, height: int) -> str:
+    if width == height:
+        return "1:1"
+    return "9:16" if height > width else "16:9"
 
 
 def _configured_secret(secret_name: str, environment_name: str) -> str:
@@ -1076,7 +1296,10 @@ def _update_project_from_form(
         draft_width=int(_required(form, "draft_width", "Ширина Draft")),
         draft_height=int(_required(form, "draft_height", "Высота Draft")),
         image_provider=_choice(
-            form, "image_provider", {"seedream", "qwen"}, "Провайдер изображений"
+            form,
+            "image_provider",
+            {"seedream", "qwen", "zimage"},
+            "Провайдер изображений",
         ),
         image_model=form.get("image_model", "").strip() or None,
         tts_provider=_choice(

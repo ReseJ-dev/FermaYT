@@ -51,6 +51,7 @@
                   <select name="image_provider" id="image-provider">
                     <option value="seedream" {% if project.image_provider == 'seedream' %}selected{% endif %}>BytePlus · Seedream</option>
                     <option value="qwen" {% if project.image_provider == 'qwen' %}selected{% endif %}>Alibaba · Qwen Image</option>
+                    <option value="zimage" {% if project.image_provider == 'zimage' %}selected{% endif %}>Kie.ai · Z-Image</option>
                   </select>
                 </label>
                 <label>Модель
@@ -58,6 +59,7 @@
                     <option value="seedream-5-0-260128" data-provider="seedream" {% if project.image_model == 'seedream-5-0-260128' %}selected{% endif %}>Seedream 5.0 Lite</option>
                     <option value="qwen-image-2.0" data-provider="qwen" {% if project.image_model == 'qwen-image-2.0' %}selected{% endif %}>Qwen Image 2.0</option>
                     <option value="qwen-image-3.0" data-provider="qwen" {% if project.image_model == 'qwen-image-3.0' %}selected{% endif %}>Qwen Image 3.0</option>
+                    <option value="z-image" data-provider="zimage" {% if project.image_model == 'z-image' %}selected{% endif %}>Z-Image</option>
                   </select>
                   <small id="image-provider-help"></small>
                 </label>
@@ -107,6 +109,87 @@
           </div>
         </section>
       </form>
+
+      {% if video_render_cards %}
+      <section class="video-renders-section" aria-labelledby="video-renders-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">Render history</p><h2 id="video-renders-title">Готовые видео</h2><p class="provider-section-note">Сначала показаны последние созданные рендеры.</p></div>
+          <span class="status-pill">{{ video_render_cards | length }} VIDEO</span>
+        </div>
+        <div class="video-renders-grid">
+          {% for card in video_render_cards %}
+          <article class="panel video-render-card">
+            <div class="video-render-heading">
+              <div><strong>{{ card.label }}</strong>{% if card.completed_at %}<small>{{ card.completed_at.strftime('%d.%m.%Y %H:%M') }}</small>{% endif %}</div>
+              {% if loop.first %}<span class="status-pill status-ready">ПОСЛЕДНЕЕ</span>{% endif %}
+            </div>
+            <video class="final-preview" controls preload="metadata" src="{{ card.video_url }}"></video>
+            {% if card.duration is not none %}<small>{{ '%.2f' | format(card.duration) }} сек. · {{ card.width }}×{{ card.height }} · {{ card.fps | int }} FPS</small>{% endif %}
+            <a class="button button-secondary button-full" href="{{ card.download_url }}" download>Скачать MP4</a>
+          </article>
+          {% endfor %}
+        </div>
+      </section>
+      {% endif %}
+
+      <section class="master-assets-section" aria-labelledby="master-assets-title" data-master-assets data-project-id="{{ project.id }}">
+        <div class="section-heading">
+          <div><p class="eyebrow">Continuity assets</p><h2 id="master-assets-title">Мастер-картинки проекта</h2><p class="provider-section-note">Постоянные опорные кадры сохраняются в проекте и повторно используются для визуальной непрерывности.</p></div>
+          {% if master_scene_cards %}<span class="status-pill">{{ master_scene_cards | length }} MASTER</span>{% endif %}
+        </div>
+        {% if master_scene_cards and project.image_provider == 'zimage' %}
+          <p class="master-assets-warning"><strong>Z-Image не поддерживает reference input.</strong> Пайплайн продолжит работу без ошибки: для непрерывности каждый кадр получит одну и ту же текстовую спецификацию геометрии, объектов и композиции из VisualPlan. Чтобы использовать именно master PNG как входное изображение, выберите Seedream или Qwen Image.</p>
+        {% endif %}
+        {% if master_scene_cards %}
+          <div class="master-assets-grid">
+            {% for card in master_scene_cards %}
+              <article class="panel master-asset-card">
+                {% if card.image_url %}
+                  <a class="master-asset-preview" href="{{ card.image_url }}" target="_blank" rel="noopener" title="Открыть оригинал">
+                    <img src="{{ card.image_url }}" alt="Мастер-картинка {{ card.asset.master_scene_id }}" loading="lazy">
+                  </a>
+                {% else %}
+                  <div class="asset-placeholder"><span>▧</span><small>Файл мастер-картинки недоступен</small></div>
+                {% endif %}
+                <div class="master-asset-body">
+                  <div class="asset-label"><span>MASTER</span><span>{{ card.asset.provider if card.asset else 'EMPTY' }}</span></div>
+                  <h3>{{ card.master_scene_id }}</h3>
+                  {% if card.definition %}<p>{{ card.definition.description }}</p>{% endif %}
+                  {% if card.asset %}<small>{{ card.asset.model or 'свой PNG' }} · {{ card.asset.style_version }}</small>{% endif %}
+                  <div class="master-asset-actions">
+                    {% if card.image_url %}<a class="text-link" href="{{ card.image_url }}" target="_blank" rel="noopener">Оригинал</a>{% endif %}
+                    {% if card.asset %}
+                      <button class="button button-danger-ghost button-small" type="button" data-delete-master data-asset-id="{{ card.asset.id }}" data-master-id="{{ card.master_scene_id }}">Удалить</button>
+                    {% else %}
+                      <input id="master-file-{{ loop.index }}" class="master-file-input" type="file" accept="image/png" data-master-file>
+                      <button class="button button-secondary button-small" type="button" data-upload-master data-master-id="{{ card.master_scene_id }}" data-file-input="master-file-{{ loop.index }}">Добавить PNG</button>
+                    {% endif %}
+                  </div>
+                </div>
+              </article>
+            {% endfor %}
+          </div>
+        {% else %}
+          <div class="empty-state compact-empty"><h3>Мастер-картинок пока нет</h3><p>Они появятся здесь после этапа GENERATING_MASTERS и сохранятся даже при ошибке на следующих этапах.</p></div>
+        {% endif %}
+      </section>
+
+      {% if style_preview_cards %}
+      <section class="style-preview-section" aria-labelledby="style-preview-title">
+        <div class="section-heading">
+          <div><p class="eyebrow">Style preview</p><h2 id="style-preview-title">Три тестовых кадра</h2><p class="provider-section-note">Только изображения: без озвучки и рендера видео.</p></div>
+          <span class="status-pill">{{ style_preview_cards | length }} PREVIEW</span>
+        </div>
+        <div class="style-preview-grid">
+          {% for card in style_preview_cards %}
+          <article class="panel style-preview-card">
+            <a href="{{ card.image_url }}" target="_blank" rel="noopener" title="Открыть оригинал"><img src="{{ card.image_url }}" alt="Тестовый кадр {{ loop.index }}" loading="lazy"></a>
+            <div><strong>Кадр {{ loop.index }}</strong><small>{{ card.beat_id }}</small></div>
+          </article>
+          {% endfor %}
+        </div>
+      </section>
+      {% endif %}
 
       <section class="scenes-section">
         <div class="section-heading">
@@ -172,6 +255,8 @@
         </ol>
         <div class="sidebar-actions">
           <div id="generation-actions" data-project-id="{{ project.id }}" data-job-id="{{ latest_job.id if latest_job else '' }}" data-job-status="{{ latest_job.status.value if latest_job else '' }}" data-job-profile="{{ latest_job.production_profile if latest_job else '' }}" data-job-scope="{{ latest_job.generation_scope_type if latest_job else 'FULL' }}" data-job-scope-value="{{ latest_job.generation_scope_value if latest_job and latest_job.generation_scope_value is not none else '' }}">
+            <button class="button button-secondary button-full generate-profile" type="button" data-profile="FINAL" data-scope="STYLE_PREVIEW">Проверить стиль — 3 картинки</button>
+            <small>Без TTS и MP4. Оценка: {% if style_preview_cost_estimate and style_preview_cost_estimate.minimum is not none %}{{ '%.4f' | format(style_preview_cost_estimate.minimum) }}–{{ '%.4f' | format(style_preview_cost_estimate.maximum) }} {{ style_preview_cost_estimate.currency }}{% else %}после visual plan / настройки тарифов{% endif %}</small>
             {% for seconds in [30, 60] %}{% set pilot_estimate = pilot_cost_estimates.get(seconds) %}
             <button class="button button-secondary button-full generate-profile" type="button" data-profile="FINAL" data-scope="FIRST_SECONDS" data-scope-value="{{ seconds }}">PILOT — первые {{ seconds }} сек.</button>
             <small>Оценка: {% if pilot_estimate and pilot_estimate.minimum is not none %}{{ '%.4f' | format(pilot_estimate.minimum) }}–{{ '%.4f' | format(pilot_estimate.maximum) }} {{ pilot_estimate.currency }}{% else %}после visual plan / настройки тарифов{% endif %}</small>
@@ -206,9 +291,6 @@
           <small>{{ style_reference.style_id if style_reference else 'Не загружен — используется style contract' }}</small>
           {% if not style_reference %}<input id="style-reference-file" type="file" accept="image/png"><button class="button button-secondary button-small" id="upload-style-reference" type="button" data-project-id="{{ project.id }}">Загрузить PNG</button>{% endif %}
         </section>
-        {% if final_video_url %}<div class="final-video-result"><strong>COMPLETED</strong>{% if final_render %}<small>{{ '%.2f' | format(final_render.duration) }} sec · {{ final_render.width }}×{{ final_render.height }} · {{ final_render.fps | int }} FPS</small>{% endif %}<video class="final-preview" controls src="{{ final_video_url }}"></video><a class="button button-secondary button-full" href="{{ final_video_download_url }}">Скачать MP4</a></div>{% endif %}
-        {% if draft_video_url %}<div class="final-video-result"><strong>DRAFT PREVIEW</strong>{% if draft_render %}<small>{{ '%.2f' | format(draft_render.duration) }} sec · {{ draft_render.width }}×{{ draft_render.height }} · {{ draft_render.fps | int }} FPS</small>{% endif %}<video class="final-preview" controls src="{{ draft_video_url }}"></video></div>{% endif %}
-        {% if pilot_video_url %}<div class="final-video-result"><strong>PILOT / PARTIAL</strong>{% if pilot_render %}<small>{{ '%.2f' | format(pilot_render.duration) }} sec · {{ pilot_render.width }}×{{ pilot_render.height }} · {{ pilot_render.fps | int }} FPS</small>{% endif %}<video class="final-preview" controls src="{{ pilot_video_url }}"></video></div>{% endif %}
         <p class="helper-text">Настройте API-провайдеры перед генерацией.</p>
         <a class="text-link" href="/settings">Открыть настройки →</a>
       </section>

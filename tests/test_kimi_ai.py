@@ -39,6 +39,9 @@ def test_kimi_planning_client_uses_json_mode(
     assert result == '{"visual_beats": []}'
     assert captured["model"] == "kimi-k3"
     assert captured["response_format"] == {"type": "json_object"}
+    assert captured["max_completion_tokens"] == 32_768
+    assert "max_tokens" not in captured
+    assert captured["reasoning_effort"] == "low"
 
 
 @pytest.mark.parametrize("mode", ["timeout", "http", "invalid-json", "shape"])
@@ -65,7 +68,10 @@ def test_kimi_planning_client_fails_safely(
 
     with pytest.raises(StructuredAIProviderError) as raised:
         asyncio.run(
-            KimiVisualPlanningClient(api_key="private-kimi-key").generate("story")
+            KimiVisualPlanningClient(
+                api_key="private-kimi-key",
+                max_attempts=1,
+            ).generate("story")
         )
 
     assert "private-kimi-key" not in str(raised.value)

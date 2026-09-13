@@ -164,7 +164,9 @@ def select_visual_references(
                 reason="permanent project style and detail ceiling",
             )
         )
-    if operation is not VisualOperation.NEW_IMAGE and master_asset is not None:
+    if master_asset is not None and (
+        operation is not VisualOperation.NEW_IMAGE or master_asset.provider == "user"
+    ):
         candidates.append(
             SelectedVisualReference(
                 reference=ImageReference(

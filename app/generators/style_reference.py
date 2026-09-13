@@ -113,7 +113,10 @@ class StyleReferenceBoundProvider:
         with_roles = normalized_prompt
         if role_instruction not in with_roles:
             with_roles = f"{with_roles}\n\n{role_instruction}"
-        return apply_image_style_contract(with_roles, self._style_id)
+        return prepare_image_prompt_for_provider(
+            apply_image_style_contract(with_roles, self._style_id),
+            self._style_id,
+        )
 
     def _reference_provider(self) -> ReferenceImageProvider:
         if not isinstance(self._provider, ReferenceImageProvider):
@@ -194,7 +197,7 @@ def build_reference_role_instruction(
 ) -> str:
     """Explain reference responsibilities and deterministic conflict precedence."""
     _validate_reference_order(references)
-    lines = ["IMAGE REFERENCE RESPONSIBILITIES:"]
+    lines = ["Use the attached images only as visual guidance; copy no visible text."]
     for index, reference in enumerate(references, start=1):
         if reference.role is ImageReferenceRole.STYLE:
             responsibility = (
@@ -207,14 +210,21 @@ def build_reference_role_instruction(
                 "controls content, location layout, recurring objects, character "
                 "identity, and physical continuity"
             )
-        lines.append(
-            f"REFERENCE {index} [{reference.role.value}]: {responsibility}."
+        ordinals = ("first", "second", "third", "fourth", "fifth")
+        ordinal = (
+            ordinals[index - 1]
+            if index <= len(ordinals)
+            else f"number {index}"
         )
+        lines.append(f"The {ordinal} attached image {responsibility}.")
     lines.extend(
         (
-            "If references conflict, STYLE wins for realism, detail, and rendering style.",
             (
-                "CONTENT_CONTINUITY wins for location layout, objects, character "
+                "When attached images conflict, drawing style wins for realism, "
+                "detail, and rendering style."
+            ),
+            (
+                "Content continuity wins for location layout, objects, character "
                 "identity, and physical continuity."
             ),
         )

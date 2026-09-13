@@ -15,6 +15,7 @@ from uuid import uuid4
 from app.budgets import GenerationBudgetError
 from app.provider_diagnostics import (
     find_image_provider_diagnostic,
+    find_structured_ai_provider_diagnostic,
     sanitize_provider_message,
 )
 
@@ -206,7 +207,7 @@ class GenerationJobManager:
         self,
         job_id: str,
         *,
-        final_render_id: str,
+        final_render_id: str | None,
         report: dict[str, object],
     ) -> None:
         await asyncio.to_thread(
@@ -249,7 +250,10 @@ class GenerationJobManager:
             await asyncio.to_thread(self._mark_budget_paused, job_id, exc)
         except Exception as exc:  # noqa: BLE001 - job boundary must persist all failures
             error = _safe_job_error(exc)
-            diagnostic = find_image_provider_diagnostic(exc)
+            diagnostic = (
+                find_structured_ai_provider_diagnostic(exc)
+                or find_image_provider_diagnostic(exc)
+            )
             failure_report = None
             if diagnostic is not None:
                 failure_report = {
@@ -466,7 +470,7 @@ class GenerationJobManager:
     def _set_pipeline_result(
         self,
         job_id: str,
-        final_render_id: str,
+        final_render_id: str | None,
         report: dict[str, object],
     ) -> None:
         now = _serialize_datetime(_utc_now())

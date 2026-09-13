@@ -14,7 +14,12 @@ from app.models.visual_plan import (
     VisualPlan,
 )
 from app.providers import ImageReference
-from app.style_contracts import DEFAULT_IMAGE_STYLE_ID, apply_image_style_contract
+from app.style_contracts import (
+    DEFAULT_IMAGE_STYLE_ID,
+    NO_VISIBLE_TEXT_INSTRUCTION,
+    append_image_style_contract,
+    validate_image_style_prompt,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -33,6 +38,9 @@ class ImagePromptBuilder:
         style_id: str = DEFAULT_IMAGE_STYLE_ID,
         project_style_prompt: str | None = None,
     ) -> str:
+        # The operation controls which provider method the pipeline invokes. It is
+        # never visual content and must not be exposed to an image model.
+        del operation
         location = next(
             (item for item in plan.locations if item.id == beat.location_id),
             None,
@@ -48,8 +56,11 @@ class ImagePromptBuilder:
             None,
         )
 
-        sections = [
-            self._reference_section(references),
+        sections: list[tuple[str, str]] = []
+        reference_section = self._reference_section(references)
+        if reference_section is not None:
+            sections.append(reference_section)
+        sections.extend([
             (
                 "LOCATION CONTINUITY",
                 self._location_content(location, master),
@@ -76,7 +87,7 @@ class ImagePromptBuilder:
                     f"{beat.visual_focus or beat.what_viewer_should_understand}."
                 ),
             ),
-        ]
+        ])
         if project_style_prompt is not None and project_style_prompt.strip():
             sections.insert(
                 1,
@@ -96,18 +107,14 @@ class ImagePromptBuilder:
                 ),
             )
         )
-        semantic_prompt = "\n\n".join(
-            f"{heading}:\n{content.strip()}"
-            for heading, content in sections
-            if content.strip()
+        semantic_prompt = _render_sections(NO_VISIBLE_TEXT_INSTRUCTION, sections)
+        validate_image_style_prompt(semantic_prompt, style_id)
+        semantic_prompt = _fit_semantic_sections(
+            NO_VISIBLE_TEXT_INSTRUCTION,
+            sections,
+            self.max_semantic_characters,
         )
-        operation_line = f"VISUAL OPERATION:\n{operation.value}"
-        semantic_prompt = f"{operation_line}\n\n{semantic_prompt}"
-        if len(semantic_prompt) > self.max_semantic_characters:
-            raise ImagePromptBuildError(
-                "Semantic image prompt is too long; simplify the visual plan"
-            )
-        return apply_image_style_contract(semantic_prompt, style_id)
+        return append_image_style_contract(semantic_prompt, style_id)
 
     def build_edit(
         self,
@@ -155,7 +162,7 @@ class ImagePromptBuilder:
             )
         sections = [
             (
-                "REFERENCE INSTRUCTIONS",
+                "Attached image guidance",
                 build_reference_role_instruction(references),
             ),
             ("KEEP UNCHANGED", "\n".join(f"- {item}" for item in keep)),
@@ -176,24 +183,27 @@ class ImagePromptBuilder:
             )
         if beat.must_not_show:
             sections.append(("DO NOT SHOW", "; ".join(beat.must_not_show)))
-        prompt = "EDIT THE PROVIDED SOURCE IMAGE.\n\n" + "\n\n".join(
-            f"{heading}:\n{content}" for heading, content in sections
+        prefix = (
+            f"{NO_VISIBLE_TEXT_INSTRUCTION} Edit the provided source image; preserve "
+            "everything not explicitly changed below."
         )
-        if len(prompt) > self.max_semantic_characters:
-            raise ImagePromptBuildError("Semantic edit prompt is too long")
-        return apply_image_style_contract(prompt, style_id)
+        prompt = _render_sections(prefix, sections)
+        validate_image_style_prompt(prompt, style_id)
+        prompt = _fit_semantic_sections(
+            prefix,
+            sections,
+            self.max_semantic_characters,
+        )
+        return append_image_style_contract(prompt, style_id)
 
     @staticmethod
     def _reference_section(
         references: tuple[ImageReference, ...],
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str] | None:
         if not references:
-            return (
-                "REFERENCE INSTRUCTIONS",
-                "No image reference is attached; follow declared continuity exactly.",
-            )
+            return None
         return (
-            "REFERENCE INSTRUCTIONS",
+            "Attached image guidance",
             build_reference_role_instruction(references),
         )
 
@@ -208,7 +218,7 @@ class ImagePromptBuilder:
                 f"{location.spatial_layout}."
             )
         return (
-            f"Same {master.id} environment. "
+            "Use the same recurring environment. "
             f"Geometry: {master.environment_geometry}. "
             f"Composition anchor: {master.basic_composition}. "
             f"Keep palette: {master.color_palette}. "
@@ -276,3 +286,81 @@ class ImagePromptBuilder:
         if beat.anticipated_consequence is not None:
             parts.append(f"Visually prepare: {beat.anticipated_consequence}")
         return ". ".join(parts)
+
+
+def _render_sections(
+    prefix: str,
+    sections: list[tuple[str, str]],
+) -> str:
+    entries = [
+        (heading, content.strip())
+        for heading, content in sections
+        if content.strip()
+    ]
+    return prefix + "".join(
+        f"\n\n{heading}:\n{content}" for heading, content in entries
+    )
+
+
+def _fit_semantic_sections(
+    prefix: str,
+    sections: list[tuple[str, str]],
+    maximum: int,
+) -> str:
+    """Compact verbose model output while retaining every semantic section."""
+    entries = [
+        (heading, " ".join(content.split()))
+        for heading, content in sections
+        if content.strip()
+    ]
+    rendered = _render_sections(prefix, entries)
+    if len(rendered) <= maximum:
+        return rendered
+
+    fixed_length = len(prefix) + sum(
+        len(f"\n\n{heading}:\n") for heading, _ in entries
+    )
+    content_budget = maximum - fixed_length
+    minimum_per_section = 24
+    if content_budget < minimum_per_section * len(entries):
+        raise ImagePromptBuildError(
+            "Semantic image prompt is too long for the configured prompt budget"
+        )
+
+    lengths = [len(content) for _, content in entries]
+    allocations = [min(length, minimum_per_section) for length in lengths]
+    remaining = content_budget - sum(allocations)
+    while remaining > 0:
+        active = [
+            index
+            for index, length in enumerate(lengths)
+            if allocations[index] < length
+        ]
+        if not active:
+            break
+        share = max(1, remaining // len(active))
+        for index in active:
+            addition = min(share, lengths[index] - allocations[index], remaining)
+            allocations[index] += addition
+            remaining -= addition
+            if remaining == 0:
+                break
+
+    compacted = [
+        (heading, _ellipsize_middle(content, allocation))
+        for (heading, content), allocation in zip(entries, allocations, strict=True)
+    ]
+    result = _render_sections(prefix, compacted)
+    if len(result) > maximum:
+        raise ImagePromptBuildError(
+            "Semantic image prompt is too long for the configured prompt budget"
+        )
+    return result
+
+
+def _ellipsize_middle(value: str, maximum: int) -> str:
+    if len(value) <= maximum:
+        return value
+    head = (maximum - 3) * 2 // 3
+    tail = maximum - head - 3
+    return f"{value[:head].rstrip()}...{value[-tail:].lstrip()}"

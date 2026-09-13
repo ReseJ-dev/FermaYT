@@ -863,6 +863,24 @@ def list_master_scene_assets(
     return list(session.scalars(statement))
 
 
+def delete_master_scene_asset(
+    session: Session,
+    project_id: str,
+    asset_id: str,
+) -> MasterSceneAsset | None:
+    """Delete one explicitly selected master asset record."""
+    statement = select(MasterSceneAsset).where(
+        MasterSceneAsset.id == asset_id,
+        MasterSceneAsset.project_id == project_id,
+    )
+    asset = session.scalar(statement)
+    if asset is None:
+        return None
+    session.delete(asset)
+    session.commit()
+    return asset
+
+
 def create_style_reference_asset(
     session: Session,
     *,

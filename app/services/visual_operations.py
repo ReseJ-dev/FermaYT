@@ -42,6 +42,7 @@ from app.services.visual_planning import require_current_project_visual_plan
 logger = logging.getLogger(__name__)
 
 ProviderResolver = Callable[[str, Mapping[str, Any] | None], ImageProvider]
+VISUAL_OPERATION_POLICY_VERSION = "visual_operation_policy_v2"
 
 
 def resolve_project_visual_operations(
@@ -103,6 +104,7 @@ def resolve_project_visual_operations(
         },
         "production_profile": profile.value,
         "production_profile_version": profile_version,
+        "visual_operation_policy_version": VISUAL_OPERATION_POLICY_VERSION,
         "draft_policy": draft_selection.snapshot() if draft_selection else None,
     }
     plan_revision = _stable_hash(state.plan.model_dump(mode="json"))

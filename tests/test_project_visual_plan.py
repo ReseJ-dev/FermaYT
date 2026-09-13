@@ -29,7 +29,10 @@ from app.repositories import (
     list_scenes,
     update_project,
 )
-from app.services.visual_operations import resolve_project_visual_operations
+from app.services.visual_operations import (
+    VISUAL_OPERATION_POLICY_VERSION,
+    resolve_project_visual_operations,
+)
 from app.services.visual_planning import (
     VISUAL_DIRECTOR_VERSION,
     VISUAL_PLAN_SCHEMA_VERSION,
@@ -520,6 +523,61 @@ def test_unsupported_reference_fallback_and_reasons_are_persisted(
     assert second.fallback_used is True
     assert second.fallback_from == "REFERENCE_GENERATION"
     assert "provider does not support reference generation" in second.reason
+
+
+def test_resolution_never_invents_overlay_without_overlay_instructions(
+    session: Session,
+) -> None:
+    project = _create_project(session)
+    payload = _two_beat_plan_payload()
+    payload["visual_beats"][1].update(
+        {
+            "physical_state": "The ladder has snapped and blocks the route.",
+            "progressive_change": {
+                "subject_id": "ladder",
+                "previous_state": "Intact and usable",
+                "current_state": "Snapped and blocking the route",
+                "progression": "Open route to blocked route",
+            },
+            "change_from_previous_beat": "The ladder physically breaks.",
+            "preferred_visual_operation": "NEW_IMAGE",
+            "overlay_description": None,
+        }
+    )
+    asyncio.run(
+        create_project_visual_plan(
+            session,
+            project.id,
+            FakePlanningClient(json.dumps(payload)),
+        )
+    )
+
+    class TextOnlyProvider:
+        capabilities = ImageProviderCapabilities()
+        model = "text-only-model"
+
+        async def generate(self, prompt: str) -> str:
+            raise AssertionError(f"image generation must not run: {prompt}")
+
+    def resolver(
+        name: str,
+        config: Mapping[str, Any] | None,
+    ) -> TextOnlyProvider:
+        del name, config
+        return TextOnlyProvider()
+
+    resolution = resolve_project_visual_operations(
+        session,
+        project.id,
+        provider_resolver=resolver,
+    )
+    second = resolution.decisions[1]
+
+    assert second.preferred_operation == "NEW_IMAGE"
+    assert second.resolved_operation == "NEW_IMAGE"
+    assert resolution.decision_input_snapshot[
+        "visual_operation_policy_version"
+    ] == VISUAL_OPERATION_POLICY_VERSION
 
 
 def test_reference_availability_change_creates_new_resolution(

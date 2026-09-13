@@ -226,6 +226,21 @@ def test_programmatic_overlay_does_not_call_image_api() -> None:
     assert decision.requires_image_api is False
 
 
+def test_resolver_never_invents_overlay_without_instructions() -> None:
+    decision = VisualOperationDecisionEngine().decide(
+        _plan(
+            VisualOperation.NEW_IMAGE,
+            progressive_change=_state_change(),
+        ),
+        1,
+        capabilities=VisualProviderCapabilities(),
+        available_visuals={"beat_1": "/media/beat-1.png"},
+    )
+
+    assert decision.operation is VisualOperation.NEW_IMAGE
+    assert decision.scores[VisualOperation.OVERLAY] == float("-inf")
+
+
 def test_new_composition_can_use_reference_identity() -> None:
     decision = VisualOperationDecisionEngine().decide(
         _plan(

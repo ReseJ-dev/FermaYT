@@ -9,6 +9,12 @@ from typing import Final
 
 from app.errors import StyleContractError
 
+NO_VISIBLE_TEXT_INSTRUCTION: Final = (
+    "Create one illustration containing absolutely no visible text of any kind: no "
+    "letters, words, numbers, captions, signs, labels, titles, watermarks, prompt "
+    "wording, technical metadata, or UI. All instructions are metadata only."
+)
+
 
 @dataclass(frozen=True, slots=True)
 class StyleConflictRule:
@@ -131,8 +137,10 @@ IMAGE_STYLE_CONTRACTS: Final = MappingProxyType(
 
 _STYLE_MARKER = re.compile(r"STYLE CONTRACT \[([^\]]+)]")
 _TOKEN = re.compile(r"[a-z0-9]+(?:'[a-z]+)?")
-_CLAUSE_BOUNDARY = re.compile(r"[\n,.;:!?]+")
+_HARD_CLAUSE_BOUNDARY = re.compile(r"[\n.;:!?]+")
+_SOFT_CLAUSE_BOUNDARY = re.compile(r"[,]+")
 _CLAUSE_BOUNDARY_TOKEN: Final = "clauseboundarytoken"
+_HARD_BOUNDARY_TOKEN: Final = "hardboundarytoken"
 _NEGATION_TOKENS: Final = frozenset(
     {
         "no",
@@ -144,6 +152,30 @@ _NEGATION_TOKENS: Final = frozenset(
         "never",
         "exclude",
         "excluding",
+        "remove",
+        "removing",
+    }
+)
+_NEGATION_SCOPE_STARTERS: Final = frozenset(
+    {"avoid", "avoiding", "exclude", "excluding", "remove", "removing", "without"}
+)
+_POSITIVE_INSTRUCTION_RESETS: Final = frozenset(
+    {
+        "add",
+        "apply",
+        "but",
+        "create",
+        "depict",
+        "however",
+        "include",
+        "instead",
+        "make",
+        "render",
+        "request",
+        "show",
+        "then",
+        "use",
+        "using",
     }
 )
 _NEGATION_SCOPE_TOKENS: Final = 5
@@ -216,7 +248,23 @@ def apply_image_style_contract(
         )
 
     validate_image_style_prompt(normalized_prompt, style_id)
-    return f"{normalized_prompt}\n\n{rendered_contract}"
+    return append_image_style_contract(normalized_prompt, style_id)
+
+
+def append_image_style_contract(
+    validated_prompt: str,
+    style_id: str = DEFAULT_IMAGE_STYLE_ID,
+) -> str:
+    """Append a contract to dynamic content that was already fully validated."""
+    normalized_prompt = validated_prompt.strip()
+    if not normalized_prompt:
+        raise ValueError("image prompt must not be empty")
+    if _STYLE_MARKER.search(normalized_prompt):
+        raise StyleContractError(
+            "Validated image prompt must not already contain a style contract"
+        )
+    contract = get_image_style_contract(style_id)
+    return f"{normalized_prompt}\n\n{contract.render()}"
 
 
 def prepare_image_prompt_for_provider(
@@ -231,16 +279,23 @@ def prepare_image_prompt_for_provider(
     rendered_contract = contract.render()
     existing_markers = _STYLE_MARKER.findall(normalized_prompt)
     if not existing_markers:
-        return apply_image_style_contract(normalized_prompt, style_id)
+        assembled = apply_image_style_contract(normalized_prompt, style_id)
+        return _with_no_visible_text_instruction(assembled)
     if (
         existing_markers == [contract.style_id]
         and normalized_prompt.endswith(rendered_contract)
         and normalized_prompt.count(rendered_contract) == 1
     ):
-        return normalized_prompt
+        return _with_no_visible_text_instruction(normalized_prompt)
     raise StyleContractError(
         "Image prompt contains a different, duplicated, or misplaced style contract"
     )
+
+
+def _with_no_visible_text_instruction(prompt: str) -> str:
+    if prompt.startswith(NO_VISIBLE_TEXT_INSTRUCTION):
+        return prompt
+    return f"{NO_VISIBLE_TEXT_INSTRUCTION}\n\n{prompt}"
 
 
 def validate_image_style_prompt(
@@ -290,7 +345,12 @@ def _normalized_alias(alias: str) -> tuple[str, ...]:
 def _tokenize(value: str) -> tuple[str, ...]:
     normalized = _expand_negative_sections(value)
     normalized = normalized.lower().replace("’", "'").replace("‘", "'")
-    normalized = _CLAUSE_BOUNDARY.sub(f" {_CLAUSE_BOUNDARY_TOKEN} ", normalized)
+    normalized = _HARD_CLAUSE_BOUNDARY.sub(
+        f" {_HARD_BOUNDARY_TOKEN} ", normalized
+    )
+    normalized = _SOFT_CLAUSE_BOUNDARY.sub(
+        f" {_CLAUSE_BOUNDARY_TOKEN} ", normalized
+    )
     return tuple(match.group() for match in _TOKEN.finditer(normalized))
 
 
@@ -346,7 +406,10 @@ def _match_alias_end(
     for expected in alias[1:]:
         position += 1
         while position < len(tokens) and tokens[position] != expected:
-            if tokens[position] == _CLAUSE_BOUNDARY_TOKEN or remaining_gap == 0:
+            if tokens[position] in {
+                _CLAUSE_BOUNDARY_TOKEN,
+                _HARD_BOUNDARY_TOKEN,
+            } or remaining_gap == 0:
                 return None
             remaining_gap -= 1
             position += 1
@@ -363,11 +426,44 @@ def _is_locally_negated(tokens: tuple[str, ...], concept_start: int) -> bool:
     ]
     if not negation_positions:
         # Hyphen normalization turns "non-photorealistic" into two tokens.
-        return bool(prefix and prefix[-1] == "non")
+        if prefix and prefix[-1] == "non":
+            return True
+        return _is_governed_by_negative_instruction(tokens, concept_start)
 
     negation_index = negation_positions[-1]
     negation = prefix[negation_index]
     following = prefix[negation_index + 1 :]
     if negation == "not" and following[:1] == ("only",):
         return False
-    return all(token in _NEGATION_FILLER_TOKENS for token in following)
+    if all(token in _NEGATION_FILLER_TOKENS for token in following):
+        return True
+    return _is_governed_by_negative_instruction(tokens, concept_start)
+
+
+def _is_governed_by_negative_instruction(
+    tokens: tuple[str, ...],
+    concept_start: int,
+) -> bool:
+    """Recognize negative imperatives that govern a coordinated list."""
+    sentence_start = 0
+    for index in range(concept_start - 1, -1, -1):
+        if tokens[index] == _HARD_BOUNDARY_TOKEN:
+            sentence_start = index + 1
+            break
+    prefix = tokens[sentence_start:concept_start]
+    scope_start: int | None = None
+    for index, token in enumerate(prefix):
+        if token in _NEGATION_SCOPE_STARTERS:
+            scope_start = index
+        elif token in {"not", "never", "don't"}:
+            if token == "not" and prefix[index + 1 : index + 2] == ("only",):
+                continue
+            # The following verb ("use", "mix", "add", etc.) belongs to the
+            # negative command and must not reset its own scope.
+            scope_start = min(index + 1, len(prefix) - 1)
+    if scope_start is None:
+        return False
+    return not any(
+        token in _POSITIVE_INSTRUCTION_RESETS
+        for token in prefix[scope_start + 1 :]
+    )

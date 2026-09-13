@@ -2,7 +2,7 @@
 
 import pytest
 
-from app.clients.image_api import QwenImageProvider, SeedreamImageProvider
+from app.clients.image_api import QwenImageProvider, SeedreamImageProvider, ZImageProvider
 from app.clients.tts_api import ElevenLabsTTSApiClient, QwenTTSApiClient
 from app.providers import (
     ImageProvider,
@@ -39,6 +39,26 @@ def test_get_qwen_image_provider_with_config() -> None:
 
     assert isinstance(provider, QwenImageProvider)
     assert isinstance(provider, ImageProvider)
+
+
+def test_get_zimage_provider_with_config() -> None:
+    provider = get_image_provider(
+        "zimage",
+        {"api_key": "key", "aspect_ratio": "16:9"},
+    )
+
+    assert isinstance(provider, ZImageProvider)
+    assert isinstance(provider, ImageProvider)
+    assert provider.aspect_ratio == "16:9"
+
+
+def test_zimage_advertises_text_to_image_only() -> None:
+    capabilities = get_image_provider_capabilities(get_image_provider("zimage"))
+
+    assert capabilities.text_to_image is True
+    assert capabilities.reference_generation is False
+    assert capabilities.image_editing is False
+    assert capabilities.max_reference_images == 0
 
 
 @pytest.mark.parametrize("provider_name", ["seedream", "qwen"])

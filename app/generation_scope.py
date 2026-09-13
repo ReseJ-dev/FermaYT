@@ -14,6 +14,7 @@ class GenerationScopeType(str, Enum):
     FULL = "FULL"
     FIRST_SECONDS = "FIRST_SECONDS"
     FIRST_BEATS = "FIRST_BEATS"
+    STYLE_PREVIEW = "STYLE_PREVIEW"
 
 
 GENERATION_SCOPE_VERSION = "generation_scope_v1"
@@ -26,9 +27,12 @@ class GenerationScope:
     version: str = GENERATION_SCOPE_VERSION
 
     def __post_init__(self) -> None:
-        if self.type is GenerationScopeType.FULL:
+        if self.type in {
+            GenerationScopeType.FULL,
+            GenerationScopeType.STYLE_PREVIEW,
+        }:
             if self.value is not None:
-                raise ValueError("FULL generation scope must not have a value")
+                raise ValueError(f"{self.type.value} generation scope must not have a value")
             return
         if (
             self.value is None
@@ -47,12 +51,18 @@ class GenerationScope:
     def is_full(self) -> bool:
         return self.type is GenerationScopeType.FULL
 
+    @property
+    def is_image_only(self) -> bool:
+        return self.type is GenerationScopeType.STYLE_PREVIEW
+
     def select_beat_ids(self, plan: VisualPlan) -> tuple[str, ...]:
         """Select a prefix using semantic durations; persisted plan is untouched."""
         beats = plan.visual_beats
         if self.is_full:
             return tuple(beat.id for beat in beats)
-        if self.type is GenerationScopeType.FIRST_BEATS:
+        if self.type is GenerationScopeType.STYLE_PREVIEW:
+            count = min(3, len(beats))
+        elif self.type is GenerationScopeType.FIRST_BEATS:
             count = min(int(self.value or 0), len(beats))
         else:
             target = float(self.value or 0)

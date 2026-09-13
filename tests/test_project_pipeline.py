@@ -94,6 +94,20 @@ class FakeImageProvider:
         return f"fake://image/{self.calls}"
 
 
+class TextOnlyImageProvider:
+    capabilities = ImageProviderCapabilities()
+    model = "text-only-image"
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.prompts: list[str] = []
+
+    async def generate(self, prompt: str) -> str:
+        self.calls += 1
+        self.prompts.append(prompt)
+        return f"fake://image/{self.calls}"
+
+
 class FakeTTSProvider:
     capabilities = TTSProviderCapabilities()
     model = "fake-tts"
@@ -252,6 +266,80 @@ def _two_beat_plan() -> VisualPlan:
     return VisualPlan.model_validate(payload)
 
 
+def _four_beat_plan() -> VisualPlan:
+    payload = _two_beat_plan().model_dump(mode="json")
+    for index in (3, 4):
+        beat = dict(payload["visual_beats"][-1])
+        beat.update(
+            id=f"beat_{index}",
+            narration_segment=f"The danger advances, step {index}.",
+            source_visual_id=f"beat_{index - 1}",
+            change_from_previous_beat=f"Damage advances to step {index}",
+            physical_state=f"The ladder damage is now at step {index}",
+        )
+        beat["progressive_change"] = {
+            "subject_id": "ladder",
+            "previous_state": f"damage step {index - 1}",
+            "current_state": f"damage step {index}",
+            "progression": "safe route to unusable route",
+        }
+        payload["visual_beats"].append(beat)
+    return VisualPlan.model_validate(payload)
+
+
+def test_style_preview_stops_after_three_images_without_tts_or_video(
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    project = _project(session)
+    planning = FakePlanningClient(_four_beat_plan())
+    provider = FakeImageProvider()
+    qa = PassingQAClient()
+
+    async def downloader(url: str, output_path: str) -> str:
+        assert url.startswith("fake://image/")
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"preview-image")
+        return output_path
+
+    def image_resolver(name: str, config: Mapping[str, Any] | None) -> FakeImageProvider:
+        del name, config
+        return provider
+
+    def forbidden_tts_resolver(name: str, config: Mapping[str, Any] | None) -> FakeTTSProvider:
+        del name, config
+        raise AssertionError("Style preview must not resolve or call TTS")
+
+    dependencies = ProjectPipelineDependencies(
+        planning_client=planning,
+        image_provider_resolver=image_resolver,
+        tts_provider_resolver=forbidden_tts_resolver,
+        visual_qa_service=VisualQAService(qa),
+        projects_root=tmp_path / "projects",
+        downloader=downloader,
+    )
+
+    report = asyncio.run(
+        run_project_video_pipeline(
+            session,
+            project.id,
+            dependencies,
+            job_id="style-preview-run",
+            generation_scope=GenerationScope(GenerationScopeType.STYLE_PREVIEW),
+        )
+    )
+
+    assert report.generation_scope["type"] == "STYLE_PREVIEW"
+    assert report.visual_beats == 3
+    assert report.semantic_visual_beats == 4
+    assert len(report.preview_result_ids) == 3
+    assert len(list_project_narration_assets(session, project.id)) == 0
+    assert len(list_project_timelines(session, project.id)) == 0
+    assert len(list_project_video_renders(session, project.id)) == 0
+    assert project.final_video_path is None
+
+
 def _configure_budget_prices(session: Session) -> None:
     effective = datetime(2026, 1, 1, tzinfo=UTC)
     for provider, model, operation, unit, price in [
@@ -273,6 +361,52 @@ def _configure_budget_prices(session: Session) -> None:
             version="v1",
             effective_from=effective,
         )
+
+
+def test_full_pipeline_uses_semantic_master_fallback_for_text_only_provider(
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    image, audio = _assets(tmp_path)
+    project = _project(session)
+    project = update_project(session, project.id, visual_qa_enabled=False)
+    assert project is not None
+    provider = TextOnlyImageProvider()
+
+    def image_resolver(name: str, config: Mapping[str, Any] | None) -> TextOnlyImageProvider:
+        del name, config
+        return provider
+
+    async def downloader(url: str, output_path: str) -> str:
+        assert url.startswith("fake://image/")
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(image)
+        return output_path
+
+    dependencies = ProjectPipelineDependencies(
+        planning_client=FakePlanningClient(),
+        image_provider_resolver=image_resolver,
+        tts_provider_resolver=lambda name, config: FakeTTSProvider(audio),
+        visual_qa_service=None,
+        projects_root=tmp_path / "projects",
+        downloader=downloader,
+    )
+
+    report = asyncio.run(
+        run_project_video_pipeline(
+            session,
+            project.id,
+            dependencies,
+            job_id="text-only-master-run",
+        )
+    )
+
+    assert provider.calls == 1
+    assert "Use the same recurring environment" in provider.prompts[0]
+    assert "Vertical shaft, surface above, side tunnel below" in provider.prompts[0]
+    assert list_master_scene_assets(session, project.id) == []
+    assert Path(report.final_mp4).is_file()
 
 
 def test_full_pipeline_from_story_only_completes_background_job(

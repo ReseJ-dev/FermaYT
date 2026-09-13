@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import shutil
 from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +56,7 @@ from app.style_contracts import (
 from app.utils.download import download_file
 
 logger = logging.getLogger(__name__)
+_PNG_SIGNATURE = b"\x89PNG\r\n\x1a\n"
 
 
 class MasterSceneImageClient(Protocol):
@@ -109,6 +111,10 @@ async def generate_required_master_scenes(
         style_id,
         capabilities is not None and capabilities.reference_generation,
     )
+    existing_required = {
+        master_id: get_master_scene_asset(session, project.id, master_id)
+        for master_id in required_ids
+    }
 
     for master_scene_id in required_ids:
         definition = definitions[master_scene_id]
@@ -124,13 +130,13 @@ async def generate_required_master_scenes(
             base_prompt,
             style_id,
         )
-        existing = get_master_scene_asset(session, project.id, master_scene_id)
+        existing = existing_required[master_scene_id]
         if existing is not None:
             if existing.style_version != style_version:
                 raise MasterSceneError(
                     "Master scene style changed; create an explicit new master version"
                 )
-            if not _master_prompt_matches(
+            if existing.provider != "user" and not _master_prompt_matches(
                 existing.generation_prompt,
                 prompt,
                 style_id,
@@ -333,6 +339,52 @@ async def generate_required_master_scenes(
         assets.append(asset)
 
     return assets
+
+
+def register_uploaded_master_scene(
+    session: Session,
+    project: Project,
+    plan: VisualPlan,
+    master_scene_id: str,
+    source_path: str | Path,
+    *,
+    projects_root: str | Path = "data/projects",
+    style_id: str = DEFAULT_IMAGE_STYLE_ID,
+) -> MasterSceneAsset:
+    """Register a user PNG as the explicit continuity master for a planned slot."""
+    if master_scene_id not in {master.id for master in plan.possible_master_scenes}:
+        raise MasterSceneError("Unknown master scene slot")
+    if get_master_scene_asset(session, project.id, master_scene_id) is not None:
+        raise MasterSceneError("Delete the current master scene before uploading another")
+    source = Path(source_path)
+    if not source.is_file() or source.read_bytes()[:8] != _PNG_SIGNATURE:
+        raise MasterSceneError("Master scene must be a valid PNG file")
+    style_version = build_style_version(style_id)
+    destination = ProjectMediaPaths(
+        project.id,
+        projects_root,
+    ).master_scene_path(master_scene_id, style_version)
+    if destination.exists():
+        raise MasterSceneError("Untracked master scene file already exists")
+    try:
+        shutil.copyfile(source, destination)
+        file_sha256 = _sha256_file(destination)
+        return create_master_scene_asset(
+            session,
+            project_id=project.id,
+            master_scene_id=master_scene_id,
+            file_path=str(destination),
+            file_sha256=file_sha256,
+            style_version=style_version,
+            generation_prompt=f"USER UPLOAD FOR MASTER SCENE {master_scene_id}",
+            provider="user",
+            model=None,
+            seed=None,
+            reference_hashes=[],
+        )
+    except Exception:
+        destination.unlink(missing_ok=True)
+        raise
 
 
 def build_master_scene_generation_prompt(

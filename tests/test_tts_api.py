@@ -145,7 +145,7 @@ def test_generate_handles_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
         run_generate()
 
 
-@pytest.mark.parametrize("status_code", [400, 401, 429, 500])
+@pytest.mark.parametrize("status_code", [400, 401, 403, 429, 500])
 def test_generate_handles_http_errors(
     monkeypatch: pytest.MonkeyPatch,
     status_code: int,
@@ -157,6 +157,50 @@ def test_generate_handles_http_errors(
 
     with pytest.raises(TTSGenerationError, match=f"HTTP {status_code}"):
         run_generate()
+
+
+def test_generate_includes_safe_provider_error_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            json={
+                "code": "AllocationQuota.FreeTierOnly",
+                "message": "The free quota has been exhausted.",
+                "request_id": "request-123",
+            },
+        )
+
+    configure_client(monkeypatch, handler)
+
+    with pytest.raises(TTSGenerationError) as error:
+        run_generate()
+
+    message = str(error.value)
+    assert "HTTP 403" in message
+    assert "AllocationQuota.FreeTierOnly" in message
+    assert "free quota has been exhausted" in message
+    assert "request-123" in message
+
+
+def test_generate_redacts_secrets_from_provider_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            403,
+            json={"message": "Authorization: Bearer provider-secret"},
+        )
+
+    configure_client(monkeypatch, handler)
+
+    with pytest.raises(TTSGenerationError) as error:
+        run_generate()
+
+    message = str(error.value)
+    assert "provider-secret" not in message
+    assert "[redacted]" in message
 
 
 def test_generate_handles_invalid_json(

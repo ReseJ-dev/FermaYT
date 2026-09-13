@@ -21,6 +21,7 @@ from app.generators.master_scene import (
     generate_continuity_image,
     generate_continuity_image_with_qa,
     generate_required_master_scenes,
+    register_uploaded_master_scene,
 )
 from app.generators.style_reference import register_approved_style_reference
 from app.models.visual_plan import VisualOperation, VisualPlan
@@ -202,6 +203,105 @@ def test_generates_only_referenced_masters_and_persists_metadata(
     ]
 
 
+def test_uploaded_master_is_persisted_and_reused_without_generation(
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    project = _project(session)
+    source = tmp_path / "my-master.png"
+    source.write_bytes(b"\x89PNG\r\n\x1a\nuser-master")
+    asset = register_uploaded_master_scene(
+        session,
+        project,
+        _plan(),
+        "shaft_master",
+        source,
+        projects_root=tmp_path / "projects",
+    )
+
+    class NoGeneration:
+        async def generate(self, prompt: str) -> str:
+            raise AssertionError(f"uploaded master must be reused: {prompt}")
+
+    reused = asyncio.run(
+        generate_required_master_scenes(
+            session,
+            project,
+            _plan(),
+            client=NoGeneration(),
+            projects_root=tmp_path / "projects",
+        )
+    )
+
+    assert asset.provider == "user"
+    assert Path(asset.file_path).read_bytes() == source.read_bytes()
+    assert [item.id for item in reused] == [asset.id]
+
+
+def test_uploaded_master_is_reused_while_missing_functional_slots_are_generated(
+    session: Session,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = _project(session)
+    source = tmp_path / "my-master.png"
+    source.write_bytes(b"\x89PNG\r\n\x1a\nuser-master")
+    register_uploaded_master_scene(
+        session,
+        project,
+        _plan(),
+        "shaft_master",
+        source,
+        projects_root=tmp_path / "projects",
+    )
+    monkeypatch.setattr(
+        master_scene_module,
+        "_required_master_scene_ids",
+        lambda plan, required_beat_ids=None: ["shaft_master", "unused_master"],
+    )
+
+    class Client:
+        model = "fake-image"
+
+        def __init__(self) -> None:
+            self.prompts: list[str] = []
+
+        async def generate(self, prompt: str) -> str:
+            self.prompts.append(prompt)
+            return "https://example.com/unused-master.png"
+
+    async def fake_download(url: str, output_path: str) -> str:
+        assert url == "https://example.com/unused-master.png"
+        destination = Path(output_path)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_bytes(b"generated-functional-master")
+        return output_path
+
+    client = Client()
+    assets = asyncio.run(
+        generate_required_master_scenes(
+            session,
+            project,
+            _plan(),
+            client=client,
+            projects_root=tmp_path / "projects",
+            downloader=fake_download,
+        )
+    )
+
+    assert [asset.master_scene_id for asset in assets] == [
+        "shaft_master",
+        "unused_master",
+    ]
+    assert assets[0].provider == "user"
+    generated = get_master_scene_asset(session, project.id, "unused_master")
+    assert generated is not None
+    assert generated.provider == "qwen"
+    assert len(client.prompts) == 1
+    assert "An environment not used by any beat" in client.prompts[0]
+    assert "Vertical shaft, surface above, side tunnel below" in client.prompts[0]
+
+
 def test_master_generation_accepts_negative_project_style_and_calls_provider(
     session: Session,
     tmp_path: Path,
@@ -333,7 +433,8 @@ Avoid polished vector art. No 3D render.
     assert result == "frame.png"
     assert len(client.calls) == 1
     assert client.calls[0][0] == expected_method
-    assert client.calls[0][1] == assembled_prompt
+    assert client.calls[0][1].endswith(assembled_prompt)
+    assert "absolutely no visible text of any kind" in client.calls[0][1]
 
 
 def test_master_provider_failure_adds_safe_master_context_and_logs_it(
@@ -610,7 +711,10 @@ def test_continuity_executor_passes_references_to_capable_client(
 
     assert result == "frame.png"
     assert client.received is not None
-    assert client.received[0].startswith("Same environment, new composition")
+    assert "Same environment, new composition" in client.received[0]
+    assert client.received[0].startswith(
+        "Create one illustration containing absolutely no visible text"
+    )
     assert "STYLE CONTRACT [rough_explainer_v1]" in client.received[0]
     assert tuple(reference.file_path for reference in client.received[1]) == (
         "master.png",
@@ -659,8 +763,9 @@ def test_style_reference_precedes_master_continuity_reference(
     ]
     assert request.references[0].reference_id == "rough_explainer_v1"
     assert request.references[1].reference_id == "shaft_master"
-    assert "REFERENCE 1 [STYLE]" in request.prompt
-    assert "REFERENCE 2 [CONTENT_CONTINUITY]" in request.prompt
+    assert "first attached image controls line thickness" in request.prompt
+    assert "IMAGE REFERENCE" not in request.prompt
+    assert "second attached image controls content" in request.prompt
 
 
 def test_master_generation_attaches_approved_style_reference(
@@ -720,7 +825,8 @@ def test_master_generation_attaches_approved_style_reference(
         ImageReferenceRole.STYLE
     ]
     assert client.prompt is not None
-    assert "REFERENCE 1 [STYLE]" in client.prompt
+    assert "first attached image controls line thickness" in client.prompt
+    assert "IMAGE REFERENCE" not in client.prompt
     assert asset.reference_hashes == [style_asset.file_sha256]
 
 
@@ -889,7 +995,7 @@ def test_image_prompt_builder_uses_semantics_and_never_narration() -> None:
     )
 
     assert "UNIQUE NARRATION MUST NEVER REACH IMAGE API" not in prompt
-    assert "Same shaft_master environment" in prompt
+    assert "Use the same recurring environment" in prompt
     assert "Vertical shaft, surface above, side tunnel below" in prompt
     assert "Ladder: Main escape ladder" in prompt
     assert "VISUAL FOCUS:" in prompt
@@ -909,7 +1015,6 @@ def test_image_prompt_sections_have_concise_semantic_order() -> None:
         VisualOperation.NEW_IMAGE,
     )
     headings = [
-        "REFERENCE INSTRUCTIONS:",
         "LOCATION CONTINUITY:",
         "CHARACTER CONTINUITY:",
         "OBJECT CONTINUITY:",
@@ -924,6 +1029,58 @@ def test_image_prompt_sections_have_concise_semantic_order() -> None:
     assert positions == sorted(positions)
 
 
+@pytest.mark.parametrize(
+    "operation",
+    [VisualOperation.NEW_IMAGE, VisualOperation.REFERENCE_GENERATION],
+)
+def test_image_prompt_never_exposes_visual_operation_to_provider(
+    operation: VisualOperation,
+) -> None:
+    prompt = ImagePromptBuilder().build(
+        _plan(),
+        _plan().visual_beats[0],
+        operation,
+    )
+
+    assert "VISUAL OPERATION" not in prompt
+    assert operation.value not in prompt
+    assert "absolutely no visible text of any kind" in prompt
+    assert "All instructions are metadata only" in prompt
+    assert "REFERENCE INSTRUCTIONS" not in prompt
+
+
+def test_reference_and_edit_prompts_contain_no_internal_reference_labels() -> None:
+    reference = ImageReference(
+        reference_id="shaft_master",
+        file_path="master.png",
+        sha256="0" * 64,
+        role=ImageReferenceRole.CONTENT_CONTINUITY,
+    )
+    builder = ImagePromptBuilder()
+    prompts = (
+        builder.build(
+            _plan(),
+            _plan().visual_beats[0],
+            VisualOperation.REFERENCE_GENERATION,
+            references=(reference,),
+        ),
+        builder.build_edit(
+            _plan(),
+            _plan().visual_beats[0],
+            references=(reference,),
+        ),
+    )
+
+    for prompt in prompts:
+        for forbidden in (
+            "VISUAL REFERENCE",
+            "REFERENCE INSTRUCTIONS",
+            "IMAGE REFERENCE",
+            "CONTENT_CONTINUITY",
+        ):
+            assert forbidden not in prompt
+
+
 def test_prompt_builder_rejects_semantic_instruction_overload() -> None:
     with pytest.raises(ImagePromptBuildError, match="too long"):
         ImagePromptBuilder(max_semantic_characters=50).build(
@@ -931,6 +1088,69 @@ def test_prompt_builder_rejects_semantic_instruction_overload() -> None:
             _plan().visual_beats[0],
             VisualOperation.NEW_IMAGE,
         )
+
+
+def test_prompt_builder_compacts_verbose_visual_plan_without_failing() -> None:
+    plan = _plan()
+    beat = plan.visual_beats[0].model_copy(
+        update={
+            "physical_state": (
+                "opening-state-anchor "
+                + "verbose spatial detail " * 400
+                + "closing-state-anchor"
+            ),
+            "information_added_beyond_narration": "causal detail " * 300,
+        }
+    )
+
+    prompt = ImagePromptBuilder(max_semantic_characters=900).build(
+        plan,
+        beat,
+        VisualOperation.NEW_IMAGE,
+    )
+    semantic_prompt = prompt.split("\n\nSTYLE CONTRACT [", 1)[0]
+
+    assert len(semantic_prompt) <= 900
+    assert "CURRENT PHYSICAL STATE:" in semantic_prompt
+    assert "VISUAL FOCUS:" in semantic_prompt
+    assert "opening-state-anchor" in semantic_prompt
+    assert "closing-state-anchor" in semantic_prompt
+    assert "STYLE CONTRACT [rough_explainer_v1]" in prompt
+
+
+def test_prompt_builder_validates_full_style_intent_before_compaction() -> None:
+    project_style = "neutral direction " * 400 + "photorealistic"
+
+    with pytest.raises(style_contracts.StyleContractError, match="photorealism"):
+        ImagePromptBuilder(max_semantic_characters=900).build(
+            _plan(),
+            _plan().visual_beats[0],
+            VisualOperation.NEW_IMAGE,
+            project_style_prompt=project_style,
+        )
+
+
+def test_prompt_builder_does_not_rescan_compacted_negative_style_section() -> None:
+    project_style = (
+        "Simple handmade drawing. " * 250
+        + "\n\nAVOID:\n"
+        + "- photorealism\n"
+        + "- realistic materials\n"
+        + "- realistic anatomy\n"
+        + "- cinematic lighting\n"
+        + "- polished vector art\n"
+        + "- 3d render"
+    )
+
+    prompt = ImagePromptBuilder(max_semantic_characters=900).build(
+        _plan(),
+        _plan().visual_beats[0],
+        VisualOperation.NEW_IMAGE,
+        project_style_prompt=project_style,
+    )
+
+    assert "PROJECT STYLE DIRECTION:" in prompt
+    assert "STYLE CONTRACT [rough_explainer_v1]" in prompt
 
 
 def test_structured_continuity_request_does_not_need_manual_beat_prompt(

@@ -1,8 +1,11 @@
 """Image generation API client."""
 
+import asyncio
 import base64
+import json
 import mimetypes
 import os
+import time
 from pathlib import Path
 from typing import ClassVar, Protocol
 
@@ -630,6 +633,371 @@ class QwenImageApiClient:
         return image_url.strip()
 
 
+class KieZImageApiClient:
+    """Asynchronous task client for Z-Image hosted by Kie.ai."""
+
+    CREATE_URL: ClassVar[str] = "https://api.kie.ai/api/v1/jobs/createTask"
+    STATUS_URL: ClassVar[str] = "https://api.kie.ai/api/v1/jobs/recordInfo"
+    MODEL_ID: ClassVar[str] = "z-image"
+    REQUEST_TIMEOUT_SECONDS: ClassVar[float] = 30.0
+    GENERATION_TIMEOUT_SECONDS: ClassVar[float] = 600.0
+    PROMPT_MAX_CHARACTERS: ClassVar[int] = 800
+    POLL_INTERVAL_SECONDS: ClassVar[float] = 2.0
+    capabilities: ClassVar[ImageProviderCapabilities] = ImageProviderCapabilities()
+
+    def __init__(
+        self,
+        api_key: str | None = None,
+        model: str = MODEL_ID,
+        aspect_ratio: str = "9:16",
+        poll_interval: float = POLL_INTERVAL_SECONDS,
+        generation_timeout: float | None = None,
+    ) -> None:
+        self.api_key = api_key
+        self.model = model
+        self.aspect_ratio = aspect_ratio
+        self.poll_interval = poll_interval
+        configured_timeout = (
+            generation_timeout
+            if generation_timeout is not None
+            else _environment_float(
+                "KIE_ZIMAGE_GENERATION_TIMEOUT_SECONDS",
+                self.GENERATION_TIMEOUT_SECONDS,
+            )
+        )
+        self.generation_timeout = configured_timeout
+        if aspect_ratio not in {"1:1", "4:3", "3:4", "16:9", "9:16"}:
+            raise ValueError("Unsupported Kie.ai Z-Image aspect ratio")
+        if poll_interval < 0:
+            raise ValueError("Kie.ai polling interval must not be negative")
+        if configured_timeout <= 0:
+            raise ValueError("Kie.ai generation timeout must be positive")
+
+    async def generate(self, prompt: str) -> str:
+        """Create, poll, and return one generated Kie.ai image URL."""
+        from app.generators.image import validate_image_prompt
+
+        try:
+            validated_prompt = validate_image_prompt(prompt)
+        except ValueError as exc:
+            raise _diagnostic_error(
+                "Invalid image prompt",
+                provider="zimage",
+                model=self.model,
+                operation="generate",
+                error_type="provider_validation",
+                request_stage="request_validation",
+                provider_error=str(exc),
+            ) from exc
+
+        api_key = (
+            self.api_key
+            if self.api_key is not None
+            else os.getenv("KIE_API_KEY", "").strip()
+        )
+        if not api_key:
+            raise _diagnostic_error(
+                "KIE_API_KEY environment variable is not set",
+                provider="zimage",
+                model=self.model,
+                operation="generate",
+                error_type="provider_validation",
+                request_stage="request_validation",
+                provider_error="Provider credential is not configured",
+            )
+
+        payload = {
+            "model": self.model,
+            "input": {
+                "prompt": _fit_kie_zimage_prompt(validated_prompt),
+                "aspect_ratio": self.aspect_ratio,
+                "nsfw_checker": True,
+            },
+        }
+        headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+        }
+        try:
+            async with httpx.AsyncClient(
+                timeout=self.REQUEST_TIMEOUT_SECONDS
+            ) as client:
+                response = await client.post(
+                    self.CREATE_URL,
+                    headers=headers,
+                    json=payload,
+                )
+                response.raise_for_status()
+                task_id = _kie_task_id(response)
+                return await self._poll_result(client, headers, task_id)
+        except httpx.TimeoutException as exc:
+            raise _diagnostic_error(
+                "Kie.ai Z-Image request timed out",
+                provider="zimage",
+                model=self.model,
+                operation="generate",
+                error_type="timeout",
+                request_stage="provider_request",
+                provider_error=str(exc),
+            ) from exc
+        except httpx.HTTPStatusError as exc:
+            raise _diagnostic_error(
+                f"Kie.ai Z-Image returned HTTP {exc.response.status_code}",
+                provider="zimage",
+                model=self.model,
+                operation="generate",
+                error_type="http",
+                request_stage="provider_response",
+                http_status=exc.response.status_code,
+                provider_error=safe_provider_response(exc.response),
+            ) from exc
+        except httpx.RequestError as exc:
+            raise _diagnostic_error(
+                "Kie.ai Z-Image request failed",
+                provider="zimage",
+                model=self.model,
+                operation="generate",
+                error_type="network",
+                request_stage="provider_request",
+                provider_error=str(exc),
+            ) from exc
+
+        except ImageGenerationError:
+            raise
+
+    async def _poll_result(
+        self,
+        client: httpx.AsyncClient,
+        headers: dict[str, str],
+        task_id: str,
+    ) -> str:
+        deadline = time.monotonic() + self.generation_timeout
+        last_poll_error: str | None = None
+        while time.monotonic() < deadline:
+            try:
+                response = await client.get(
+                    self.STATUS_URL,
+                    headers=headers,
+                    params={"taskId": task_id},
+                )
+                response.raise_for_status()
+            except httpx.HTTPStatusError as exc:
+                if exc.response.status_code != 429 and exc.response.status_code < 500:
+                    raise
+                last_poll_error = f"HTTP {exc.response.status_code}"
+                await asyncio.sleep(self.poll_interval)
+                continue
+            except httpx.RequestError as exc:
+                last_poll_error = type(exc).__name__
+                await asyncio.sleep(self.poll_interval)
+                continue
+            state, image_url, failure = _kie_task_result(response)
+            if state == "success" and image_url is not None:
+                return image_url
+            if state == "fail":
+                raise _diagnostic_error(
+                    "Kie.ai Z-Image generation failed",
+                    provider="zimage",
+                    model=self.model,
+                    operation="generate",
+                    error_type="provider_validation",
+                    request_stage="provider_response",
+                    provider_error=failure or "Generation task failed",
+                )
+            await asyncio.sleep(self.poll_interval)
+        raise _diagnostic_error(
+            "Kie.ai Z-Image generation timed out",
+            provider="zimage",
+            model=self.model,
+            operation="generate",
+            error_type="timeout",
+            request_stage="provider_response",
+            provider_error=(
+                f"Generation task {task_id} did not finish within "
+                f"{self.generation_timeout:g} seconds"
+                + (f"; last polling error: {last_poll_error}" if last_poll_error else "")
+            ),
+        )
+
+
+def _environment_float(name: str, default: float) -> float:
+    raw = os.getenv(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a number") from exc
+
+
+def _kie_task_id(response: httpx.Response) -> str:
+    try:
+        body = response.json()
+        if body.get("code") != 200:
+            raise ValueError("task creation was rejected")
+        task_id = body["data"]["taskId"]
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise _diagnostic_error(
+            "Kie.ai Z-Image returned an invalid task response",
+            provider="zimage",
+            model=KieZImageApiClient.MODEL_ID,
+            operation="generate",
+            error_type="provider_validation",
+            request_stage="provider_response_validation",
+            provider_error="Task ID is missing or invalid",
+        ) from exc
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise _diagnostic_error(
+            "Kie.ai Z-Image returned an invalid task response",
+            provider="zimage",
+            model=KieZImageApiClient.MODEL_ID,
+            operation="generate",
+            error_type="provider_validation",
+            request_stage="provider_response_validation",
+            provider_error="Task ID is missing or invalid",
+        )
+    return task_id.strip()
+
+
+def _kie_task_result(response: httpx.Response) -> tuple[str, str | None, str | None]:
+    try:
+        body = response.json()
+        if body.get("code") != 200:
+            raise ValueError("task query was rejected")
+        data = body["data"]
+        state = data["state"]
+    except (ValueError, KeyError, TypeError, AttributeError) as exc:
+        raise _diagnostic_error(
+            "Kie.ai Z-Image returned invalid task status",
+            provider="zimage",
+            model=KieZImageApiClient.MODEL_ID,
+            operation="generate",
+            error_type="provider_validation",
+            request_stage="provider_response_validation",
+            provider_error="Task status is missing or invalid",
+        ) from exc
+    if state != "success":
+        return str(state), None, sanitize_provider_message(data.get("failMsg"))
+    try:
+        result = json.loads(data["resultJson"])
+        image_url = result["resultUrls"][0]
+    except (json.JSONDecodeError, KeyError, IndexError, TypeError) as exc:
+        raise _diagnostic_error(
+            "Kie.ai Z-Image response does not contain an image URL",
+            provider="zimage",
+            model=KieZImageApiClient.MODEL_ID,
+            operation="generate",
+            error_type="provider_validation",
+            request_stage="provider_response_validation",
+            provider_error="Result URL is missing or invalid",
+        ) from exc
+    if not isinstance(image_url, str) or not image_url.strip():
+        raise _diagnostic_error(
+            "Kie.ai Z-Image response does not contain an image URL",
+            provider="zimage",
+            model=KieZImageApiClient.MODEL_ID,
+            operation="generate",
+            error_type="provider_validation",
+            request_stage="provider_response_validation",
+            provider_error="Result URL is missing or invalid",
+        )
+    return "success", image_url.strip(), None
+
+
+def _fit_kie_zimage_prompt(prompt: str) -> str:
+    """Fit semantic beat essentials and the style contract into Kie's limit."""
+    maximum = KieZImageApiClient.PROMPT_MAX_CHARACTERS
+    compact = " ".join(prompt.split())
+    if len(compact) <= maximum:
+        return compact
+    marker = "STYLE CONTRACT ["
+    if marker not in compact:
+        separator = "..."
+        head = (maximum - len(separator)) * 2 // 3
+        tail = maximum - len(separator) - head
+        return f"{compact[:head].rstrip()}{separator}{compact[-tail:].lstrip()}"
+    dynamic = compact.split(marker, 1)[0].strip()
+    style = (
+        "STYLE: rough amateur hand-drawn 2D explainer; thick uneven black outlines; "
+        "crude geometry; simple cartoon people with dot eyes; flat muted colors; "
+        "minimal shading; sparse background; imperfect perspective. NO photorealism, "
+        "realistic materials/anatomy, cinematic light, polished art, 3D, depth of "
+        "field, or gradients. Simplicity over detail."
+    )
+    available = maximum - len(style) - 1
+    semantic_sections = _extract_kie_semantic_sections(dynamic)
+    if semantic_sections:
+        labels_and_limits = (
+            ("Focus", "VISUAL FOCUS", 115),
+            ("State", "CURRENT PHYSICAL STATE", 85),
+            ("Change", "WHAT CHANGED", 90),
+            ("Camera", "CURRENT CAMERA / COMPOSITION", 65),
+            ("Location", "LOCATION CONTINUITY", 65),
+            ("Avoid", "DO NOT SHOW", 45),
+        )
+        parts = ["No visible text, labels, titles, watermarks, or UI."]
+        parts.extend(
+            f"{label}: {_kie_semantic_excerpt(heading, section, limit)}"
+            for label, heading, limit in labels_and_limits
+            if (section := semantic_sections.get(heading))
+        )
+        dynamic = " ".join(parts)
+    if len(dynamic) > available:
+        dynamic = _truncate_at_word(dynamic, available)
+    fitted = f"{dynamic} {style}"
+    return _truncate_at_word(fitted, maximum)
+
+
+_KIE_SEMANTIC_HEADINGS = (
+    "LOCATION CONTINUITY",
+    "PROJECT STYLE DIRECTION",
+    "CHARACTER CONTINUITY",
+    "OBJECT CONTINUITY",
+    "CURRENT CAMERA / COMPOSITION",
+    "CURRENT PHYSICAL STATE",
+    "WHAT CHANGED",
+    "VISUAL FOCUS",
+    "DO NOT SHOW",
+    "SIMPLIFICATION RULE",
+)
+
+
+def _extract_kie_semantic_sections(dynamic_prompt: str) -> dict[str, str]:
+    positions: list[tuple[int, str, int]] = []
+    for heading in _KIE_SEMANTIC_HEADINGS:
+        marker = f"{heading}:"
+        position = dynamic_prompt.find(marker)
+        if position >= 0:
+            positions.append((position, heading, position + len(marker)))
+    positions.sort()
+    sections: dict[str, str] = {}
+    for index, (_, heading, content_start) in enumerate(positions):
+        content_end = (
+            positions[index + 1][0]
+            if index + 1 < len(positions)
+            else len(dynamic_prompt)
+        )
+        content = dynamic_prompt[content_start:content_end].strip()
+        if content:
+            sections[heading] = content
+    return sections
+
+
+def _kie_semantic_excerpt(heading: str, value: str, maximum: int) -> str:
+    if heading == "VISUAL FOCUS" and "First notice:" in value:
+        before, first_notice = value.split("First notice:", 1)
+        value = f"First notice: {first_notice.strip()} {before.strip()}"
+    return _truncate_at_word(value, maximum)
+
+
+def _truncate_at_word(value: str, maximum: int) -> str:
+    if len(value) <= maximum:
+        return value
+    shortened = value[: max(1, maximum - 3)].rsplit(" ", 1)[0].rstrip(" ,.;:")
+    return f"{shortened or value[: maximum - 3]}..."
+
+
 SeedreamImageProvider = BytePlusImageApiClient
 QwenImageProvider = QwenImageApiClient
+ZImageProvider = KieZImageApiClient
 ImageApiClient = SeedreamImageProvider

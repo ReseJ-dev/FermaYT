@@ -17,6 +17,29 @@ def test_first_beats_selects_ordered_prefix_without_mutating_plan() -> None:
     assert plan.model_dump(mode="json") == original
 
 
+def test_style_preview_has_fixed_three_beat_limit() -> None:
+    payload = _plan_payload()
+    payload["visual_beats"].append(
+        {**payload["visual_beats"][-1], "id": "beat_extra"}
+    )
+    plan = VisualPlan.model_validate(payload)
+
+    scope = GenerationScope(GenerationScopeType.STYLE_PREVIEW)
+
+    assert scope.is_image_only is True
+    assert scope.select_beat_ids(plan) == ("beat_1", "beat_2", "beat_3")
+    assert scope.snapshot() == {
+        "type": "STYLE_PREVIEW",
+        "value": None,
+        "version": "generation_scope_v1",
+    }
+
+
+def test_style_preview_rejects_client_supplied_limit() -> None:
+    with pytest.raises(ValueError):
+        GenerationScope(GenerationScopeType.STYLE_PREVIEW, 4)
+
+
 def test_first_seconds_ends_at_first_complete_estimated_beat_boundary() -> None:
     plan = VisualPlan.model_validate(_plan_payload())
 

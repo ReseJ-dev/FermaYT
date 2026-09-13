@@ -68,6 +68,64 @@ class ImageProviderDiagnostic:
         )
 
 
+@dataclass(frozen=True, slots=True)
+class StructuredAIProviderDiagnostic:
+    """Safe durable context for planning/structured-provider failures."""
+
+    provider: str
+    model: str | None
+    operation: str
+    category: str
+    attempt: int
+    max_attempts: int
+    http_status: int | None = None
+    provider_error: str | None = None
+    request_id: str | None = None
+    timeout_seconds: float | None = None
+    response_length: int | None = None
+    response_preview: str | None = None
+    finish_reason: str | None = None
+    retry_exhausted: bool | None = None
+    repair_attempt: int | None = None
+    validation_category: str | None = None
+
+    def with_context(
+        self,
+        *,
+        repair_attempt: int | None = None,
+        validation_category: str | None = None,
+    ) -> StructuredAIProviderDiagnostic:
+        return replace(
+            self,
+            repair_attempt=(
+                repair_attempt
+                if repair_attempt is not None
+                else self.repair_attempt
+            ),
+            validation_category=(
+                validation_category or self.validation_category
+            ),
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            key: value
+            for key, value in asdict(self).items()
+            if value is not None
+        }
+
+    def format(self, summary: str) -> str:
+        return "\n".join(
+            (
+                summary,
+                *(
+                    f"{key}={json.dumps(value, ensure_ascii=False)}"
+                    for key, value in self.as_dict().items()
+                ),
+            )
+        )
+
+
 def sanitize_provider_message(value: object) -> str | None:
     if value is None:
         return None
@@ -147,18 +205,39 @@ def find_image_provider_diagnostic(
     return None
 
 
+def find_structured_ai_provider_diagnostic(
+    error: BaseException,
+) -> StructuredAIProviderDiagnostic | None:
+    current: BaseException | None = error
+    visited: set[int] = set()
+    while current is not None and id(current) not in visited:
+        visited.add(id(current))
+        diagnostic = getattr(current, "safe_diagnostic", None)
+        if isinstance(diagnostic, StructuredAIProviderDiagnostic):
+            return diagnostic
+        current = current.__cause__ or current.__context__
+    return None
+
+
 def _extract_error_fields(payload: Any) -> object:
     if not isinstance(payload, dict):
         return "Provider returned a non-object error response"
     selected: dict[str, object] = {}
-    for key in ("code", "message", "error", "type", "request_id"):
+    for key in ("code", "message", "error", "detail", "type", "request_id"):
         if key in payload:
             selected[key] = payload[key]
     error = payload.get("error")
     if isinstance(error, dict):
         selected["error"] = {
             key: error[key]
-            for key in ("code", "message", "type")
+            for key in ("code", "message", "type", "status")
             if key in error
+        }
+    detail = payload.get("detail")
+    if isinstance(detail, dict):
+        selected["detail"] = {
+            key: detail[key]
+            for key in ("code", "message", "type", "status")
+            if key in detail
         }
     return selected or "Provider returned an HTTP error without diagnostic fields"

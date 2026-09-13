@@ -309,6 +309,8 @@ def test_qa_prompt_does_not_judge_as_standalone_artwork(tmp_path: Path) -> None:
 
     assert "not standalone artwork" in prompt
     assert "within a few seconds" in prompt
+    assert "CHECK UNWANTED TEXT" in prompt
+    assert "technical label" in prompt
 
 
 def test_correction_is_inserted_before_permanent_style_contract() -> None:

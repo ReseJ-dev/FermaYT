@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Protocol, runtime_checkable
 
-from app.clients.image_api import QwenImageProvider, SeedreamImageProvider
+from app.clients.image_api import QwenImageProvider, SeedreamImageProvider, ZImageProvider
 from app.clients.tts_api import ElevenLabsTTSApiClient, QwenTTSApiClient
 from app.provider_capabilities import ImageProviderCapabilities
 from app.tts_capabilities import TTSProviderCapabilities
@@ -96,6 +96,8 @@ def get_image_provider(
         return SeedreamImageProvider(**options)
     if provider_name == "qwen":
         return QwenImageProvider(**options)
+    if provider_name == "zimage":
+        return ZImageProvider(**options)
     raise ValueError(f"Unknown image provider: {name}")
 
 

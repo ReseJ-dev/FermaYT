@@ -270,23 +270,24 @@ class VisualBeatAssetExecutor:
             project_id,
             self.style_id,
         )
-        await generate_required_master_scenes(
-            self.session,
-            project,
-            state.plan,
-            provider,
-            projects_root=self.projects_root,
-            style_id=self.style_id,
-            style_reference=style_reference,
-            capabilities=capabilities,
-            downloader=self.downloader,
-            job_id=self.job_id,
-            budget_guard=self.budget_guard,
-            required_beat_ids=self.required_beat_ids,
-        )
+        if capabilities.reference_generation:
+            await generate_required_master_scenes(
+                self.session,
+                project,
+                state.plan,
+                provider,
+                projects_root=self.projects_root,
+                style_id=self.style_id,
+                style_reference=style_reference,
+                capabilities=capabilities,
+                downloader=self.downloader,
+                job_id=self.job_id,
+                budget_guard=self.budget_guard,
+                required_beat_ids=self.required_beat_ids,
+            )
 
         # Master availability is a Stage 2 resolution input. Re-resolve once after
-        # masters exist instead of silently using decisions made without them.
+        # usable reference masters exist instead of silently using stale decisions.
         if execution_plan.production_profile == ProductionProfile.FINAL.value:
             current_execution_plan = resolve_project_visual_operations(
                 self.session,
@@ -358,6 +359,10 @@ class VisualBeatAssetExecutor:
             if beat.master_scene_id is not None
             else None
         )
+        if master_asset is not None and not context.capabilities.reference_generation:
+            # The provider cannot consume the pixels. ImagePromptBuilder still
+            # injects the matching immutable master definition as semantic geometry.
+            master_asset = None
         selected_references = select_visual_references(
             beat,
             operation,

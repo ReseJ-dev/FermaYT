@@ -27,15 +27,30 @@ class VisualDirectorError(RuntimeError):
         validation_category: str | None = None,
         diagnostic: dict[str, object] | None = None,
         provider_requests: int = 0,
+        safe_diagnostic: object | None = None,
+        user_summary: str | None = None,
     ) -> None:
         super().__init__(message)
         self.validation_category = validation_category
         self.diagnostic = diagnostic
         self.provider_requests = provider_requests
+        self.safe_diagnostic = safe_diagnostic
+        self.user_summary = user_summary or message
 
 
 class StructuredAIProviderError(RuntimeError):
     """Raised when a structured planning or vision provider call fails safely."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic: object | None = None,
+        user_summary: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.safe_diagnostic = diagnostic
+        self.user_summary = user_summary or message
 
 
 class ProjectVisualPlanError(RuntimeError):
