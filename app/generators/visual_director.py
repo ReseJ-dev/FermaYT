@@ -1,24 +1,47 @@
 """Whole-story semantic visual planning before asset generation."""
 
 import json
+import math
+import re
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
 from pydantic import ValidationError
 
-from app.errors import StructuredAIProviderError, VisualDirectorError
-from app.provider_diagnostics import (
-    StructuredAIProviderDiagnostic,
-    find_structured_ai_provider_diagnostic,
+from app.budgets import GenerationBudgetError
+from app.errors import (
+    PlanningBillingUncertainError,
+    PlanningTooLargeError,
+    StructuredAIProviderError,
+    VisualDirectorError,
 )
 from app.models.visual_plan import (
     VisualPlan,
     VisualPlanDuplicateIdError,
+    VisualPlanMasterSceneAssignmentError,
     VisualPlanReferenceError,
+)
+from app.provider_diagnostics import (
+    StructuredAIProviderDiagnostic,
+    find_structured_ai_provider_diagnostic,
 )
 
 MAX_VISUAL_PLAN_REPAIR_ATTEMPTS = 2
+
+
+class VisualPlanPacingError(ValueError):
+    """The plan has too few meaningful visible states for its narration."""
+
+    category = "INSUFFICIENT_VISUAL_PACING"
+
+    def __init__(self, actual: int, minimum: int) -> None:
+        self.actual = actual
+        self.minimum = minimum
+        super().__init__(
+            f"visual plan has {actual} beats; narration requires at least {minimum} "
+            "meaningful visible states"
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,6 +65,22 @@ class VisualPlanningClient(Protocol):
     async def generate(self, prompt: str) -> str: ...
 
 
+class PlanningAttemptExecutor(Protocol):
+    @property
+    def can_dispatch(self) -> bool: ...
+
+    async def execute(self, prompt: str, kind: str) -> str: ...
+
+    def mark_validation_started(self) -> None: ...
+
+    def mark_validation(
+        self,
+        status: str,
+        safe_error: str | None = None,
+        validation_category: str | None = None,
+    ) -> None: ...
+
+
 class VisualDirector:
     """Turn complete narration into a validated semantic visual plan."""
 
@@ -52,6 +91,7 @@ class VisualDirector:
         max_repair_attempts: int = MAX_VISUAL_PLAN_REPAIR_ATTEMPTS,
         on_repair_event: Callable[[VisualPlanRepairEvent], None] | None = None,
         before_provider_call: Callable[[int, bool], None] | None = None,
+        attempt_controller: PlanningAttemptExecutor | None = None,
     ) -> None:
         if max_repair_attempts < 0:
             raise ValueError("max_repair_attempts must not be negative")
@@ -59,24 +99,60 @@ class VisualDirector:
         self.max_repair_attempts = max_repair_attempts
         self._on_repair_event = on_repair_event
         self._before_provider_call = before_provider_call
+        self._attempt_controller = attempt_controller
         self.provider_requests = 0
 
-    async def create_plan(self, narration: str) -> VisualPlan:
+    async def create_plan(
+        self,
+        narration: str,
+        *,
+        planning_scope_metadata: dict[str, object] | None = None,
+        project_title: str | None = None,
+    ) -> VisualPlan:
         normalized_narration = narration.strip()
         if not normalized_narration:
             raise ValueError("Narration must not be empty")
 
         raw_plan = await self._generate(
-            build_visual_director_request(normalized_narration),
+            build_visual_director_request(
+                normalized_narration,
+                planning_scope_metadata=planning_scope_metadata,
+                project_title=project_title,
+            ),
             is_repair=False,
         )
         last_diagnostic: VisualPlanValidationDiagnostic | None = None
         for repair_attempt in range(self.max_repair_attempts + 1):
+            if self._attempt_controller is not None:
+                self._attempt_controller.mark_validation_started()
             try:
                 payload = json.loads(raw_plan)
+                if isinstance(payload, dict) and planning_scope_metadata is not None:
+                    payload = dict(payload)
+                    payload["planning_scope"] = planning_scope_metadata
+                payload = hydrate_resolvable_master_scene_ids(payload)
                 plan = VisualPlan.model_validate(payload)
-            except (json.JSONDecodeError, TypeError, ValidationError) as exc:
+                _validate_visual_plan_pacing(plan, normalized_narration)
+            except (
+                json.JSONDecodeError,
+                TypeError,
+                ValidationError,
+                VisualPlanPacingError,
+            ) as exc:
                 last_diagnostic = _validation_diagnostic(exc)
+                can_repair = (
+                    repair_attempt < self.max_repair_attempts
+                    and (
+                        self._attempt_controller is None
+                        or self._attempt_controller.can_dispatch
+                    )
+                )
+                if self._attempt_controller is not None:
+                    self._attempt_controller.mark_validation(
+                        "REPAIR_REQUIRED" if can_repair else "SCHEMA_INVALID",
+                        last_diagnostic.summary,
+                        last_diagnostic.category,
+                    )
                 self._emit_repair_event(
                     VisualPlanRepairEvent(
                         repair_attempt=repair_attempt,
@@ -85,7 +161,7 @@ class VisualDirector:
                         issue=last_diagnostic.issue,
                     )
                 )
-                if repair_attempt >= self.max_repair_attempts:
+                if not can_repair:
                     stable_category = _stable_validation_category(
                         last_diagnostic.category
                     )
@@ -114,6 +190,7 @@ class VisualDirector:
                     raw_plan,
                     exc,
                     last_diagnostic,
+                    planning_scope_metadata=planning_scope_metadata,
                 )
                 raw_plan = await self._generate(repair_prompt, is_repair=True)
                 continue
@@ -127,6 +204,8 @@ class VisualDirector:
                         issue=last_diagnostic.issue,
                     )
                 )
+            if self._attempt_controller is not None:
+                self._attempt_controller.mark_validation("SUCCEEDED")
             return plan
 
         raise AssertionError("visual plan validation loop did not terminate")
@@ -137,7 +216,18 @@ class VisualDirector:
             self._before_provider_call(next_request, is_repair)
         self.provider_requests = next_request
         try:
+            if self._attempt_controller is not None:
+                return await self._attempt_controller.execute(
+                    prompt,
+                    "REPAIR" if is_repair else "INITIAL",
+                )
             return await self._client.generate(prompt)
+        except (
+            GenerationBudgetError,
+            PlanningBillingUncertainError,
+            PlanningTooLargeError,
+        ):
+            raise
         except StructuredAIProviderError as exc:
             message = (
                 f"Visual plan repair provider failed on request {next_request}"
@@ -194,6 +284,16 @@ def _validation_summary(error: Exception) -> str:
 
 def _validation_diagnostic(error: Exception) -> VisualPlanValidationDiagnostic:
     """Classify a parse/schema/reference error using the canonical validator context."""
+    if isinstance(error, VisualPlanPacingError):
+        return VisualPlanValidationDiagnostic(
+            category=error.category,
+            summary=str(error),
+            issue={
+                "category": error.category,
+                "actual_visible_states": error.actual,
+                "minimum_visible_states": error.minimum,
+            },
+        )
     if isinstance(error, ValidationError):
         details: list[str] = []
         errors = error.errors(
@@ -210,6 +310,12 @@ def _validation_diagnostic(error: Exception) -> VisualPlanValidationDiagnostic:
         for item in errors:
             context_error = item.get("ctx", {}).get("error")
             if isinstance(context_error, VisualPlanReferenceError):
+                return VisualPlanValidationDiagnostic(
+                    category=context_error.category,
+                    summary="; ".join(details),
+                    issue=context_error.as_dict(),
+                )
+            if isinstance(context_error, VisualPlanMasterSceneAssignmentError):
                 return VisualPlanValidationDiagnostic(
                     category=context_error.category,
                     summary="; ".join(details),
@@ -240,11 +346,57 @@ def _validation_diagnostic(error: Exception) -> VisualPlanValidationDiagnostic:
     )
 
 
+def _validate_visual_plan_pacing(plan: VisualPlan, narration: str) -> None:
+    word_count = len(re.findall(r"\b[\w'-]+\b", narration, flags=re.UNICODE))
+    # At a typical explanatory narration pace this targets roughly one visible
+    # state per 10-11 seconds, yielding about 45-70 states for an eight-minute video.
+    minimum_states = max(1, math.ceil(word_count / 21))
+    if len(plan.visual_beats) < minimum_states:
+        raise VisualPlanPacingError(len(plan.visual_beats), minimum_states)
+
+
+def hydrate_resolvable_master_scene_ids(payload: object) -> object:
+    """Fill beat master references only when the location has one clear master."""
+    if not isinstance(payload, dict):
+        return payload
+    environments = payload.get("recurring_environments")
+    masters = payload.get("possible_master_scenes")
+    beats = payload.get("visual_beats")
+    if not all(isinstance(items, list) for items in (environments, masters, beats)):
+        return payload
+
+    recurring_locations = {
+        item.get("location_id")
+        for item in environments
+        if isinstance(item, dict)
+        and isinstance(item.get("id"), str)
+        and isinstance(item.get("location_id"), str)
+    }
+    masters_by_location: dict[str, list[str]] = {}
+    for item in masters:
+        if not isinstance(item, dict):
+            continue
+        master_id = item.get("id")
+        location_id = item.get("location_id")
+        if isinstance(master_id, str) and master_id and isinstance(location_id, str):
+            masters_by_location.setdefault(location_id, []).append(master_id)
+
+    for beat in beats:
+        if not isinstance(beat, dict):
+            continue
+        location_id = beat.get("location_id")
+        candidates = masters_by_location.get(location_id, [])
+        if location_id in recurring_locations and len(candidates) == 1:
+            beat["master_scene_id"] = candidates[0]
+    return payload
+
+
 def _stable_validation_category(category: str) -> str:
     if category in {
         "UNKNOWN_REFERENCE",
         "FORWARD_REFERENCE",
         "REFERENCE_TYPE_MISMATCH",
+        VisualPlanMasterSceneAssignmentError.category,
         "DUPLICATE_ID",
     }:
         return "PLANNING_REFERENCE_ERROR"
@@ -257,11 +409,24 @@ def build_visual_plan_repair_request(
     raw_plan: str,
     error: Exception,
     diagnostic: VisualPlanValidationDiagnostic,
+    *,
+    planning_scope_metadata: dict[str, object] | None = None,
 ) -> str:
     """Build a targeted request that preserves content and repairs structure only."""
     validation_errors = _repair_error_payload(error, diagnostic)
+    master_scene_context = _master_scene_repair_context(diagnostic)
     schema = json.dumps(VisualPlan.model_json_schema(), ensure_ascii=False)
+    scope_context = ""
+    if planning_scope_metadata and planning_scope_metadata.get("is_partial"):
+        scope_context = f"""PARTIAL PLANNING SCOPE:
+Repair only the plan for source characters
+{planning_scope_metadata.get("source_start_char")} through
+{planning_scope_metadata.get("source_end_char")}.
+Do not add beats for narration outside that excerpt.
+"""
     return f"""The previous VisualPlan is structurally invalid.
+
+{scope_context}
 
 Repair ONLY the structural consistency of the same JSON. Do not rewrite the story.
 Preserve story meaning, beat count and order, narration mapping, locations,
@@ -271,6 +436,8 @@ specific validation error requires a minimal change.
 VALIDATION CATEGORY: {diagnostic.category}
 VALIDATION ERRORS:
 {json.dumps(validation_errors, ensure_ascii=False)}
+
+{master_scene_context}
 
 ID REFERENCE RULES:
 - Every referenced ID must exactly match an item defined in the same VisualPlan.
@@ -299,6 +466,31 @@ INVALID JSON TO REPAIR:
 """
 
 
+def _master_scene_repair_context(
+    diagnostic: VisualPlanValidationDiagnostic,
+) -> str:
+    issue = diagnostic.issue
+    if (
+        diagnostic.category != VisualPlanMasterSceneAssignmentError.category
+        or not isinstance(issue, dict)
+    ):
+        return ""
+    environments = issue.get("recurring_environment_ids", [])
+    allowed = issue.get("allowed_master_scene_ids", [])
+    environment_lines = "\n".join(f"- {value}" for value in environments)
+    allowed_lines = "\n".join(f"- {value}" for value in allowed)
+    provided = json.dumps(issue.get("provided_master_scene_id"), ensure_ascii=False)
+    return f"""MASTER SCENE REFERENCE VIOLATION:
+Affected beat id: {issue.get('beat_id')}
+Recurring environment id(s):
+{environment_lines}
+Currently supplied master_scene_id: {provided}
+Allowed master_scene_id values:
+{allowed_lines}
+Exact invariant: {issue.get('invariant')}
+The beat must reference one of the allowed master scenes above."""
+
+
 def _repair_error_payload(
     error: Exception,
     diagnostic: VisualPlanValidationDiagnostic,
@@ -325,10 +517,57 @@ def _repair_error_payload(
     return result
 
 
-def build_visual_director_request(narration: str) -> str:
-    """Build a provider-neutral request containing the complete narration."""
+def build_visual_director_request(
+    narration: str,
+    *,
+    planning_scope_metadata: dict[str, object] | None = None,
+    project_title: str | None = None,
+) -> str:
+    """Build a provider-neutral request for a full or bounded source range."""
     schema = json.dumps(VisualPlan.model_json_schema(), ensure_ascii=False)
+    is_partial = bool(
+        planning_scope_metadata and planning_scope_metadata.get("is_partial")
+    )
+    if is_partial:
+        scope_directive = f"""PLANNING SCOPE.
+You are planning ONLY this narration excerpt.
+Do not invent beats for narration outside this excerpt.
+Return a VisualPlan only for the supplied source range.
+This is a partial plan and must not imply that it covers the complete story.
+Source range: characters {planning_scope_metadata.get("source_start_char")}
+through {planning_scope_metadata.get("source_end_char")}.
+Requested scope: {planning_scope_metadata.get("scope_type")}.
+Expected beat count is approximately
+{planning_scope_metadata.get("expected_beat_count")}; use story-driven pacing.
+The end of the excerpt contains a small deterministic lookahead for continuity.
+Project title: {project_title or "Untitled project"}.
+"""
+        reading_instruction = (
+            "Read ONLY the supplied narration excerpt before planning any beat."
+        )
+        pacing_instruction = (
+            "12. PACING GUARD. Plan only this bounded excerpt. No completely "
+            "unchanged static frame may last more than 12 seconds. Do not use "
+            "whole-story or eight-minute beat targets."
+        )
+        narration_label = "SCOPED NARRATION EXCERPT"
+    else:
+        scope_directive = ""
+        reading_instruction = (
+            "Read the COMPLETE narration before planning any individual beat."
+        )
+        pacing_instruction = (
+            "12. PACING GUARD. No completely unchanged static frame may last more "
+            "than 12 seconds. For narration around eight minutes, create roughly "
+            "45-70 meaningful visible states, while keeping paid NEW_IMAGE, "
+            "REFERENCE_GENERATION, and EDIT_EXISTING operations near 25-40. Use "
+            "REUSE with a new crop, zoom, pan, focus, or deterministic OVERLAY for "
+            "the remaining states; do not buy one image per sentence."
+        )
+        narration_label = "COMPLETE NARRATION"
     return f"""You are the Visual Director for a coherent narrated video.
+
+{scope_directive}
 
 VISUAL PRODUCT PRINCIPLE. This is an automated visual storytelling system, not an
 AI image generator with video export. Optimize for the experience of watching the
@@ -345,20 +584,24 @@ A simple image that clearly advances the story is better than a beautiful image
 that only decorates the narration. Do not optimize only for fewer API calls or only
 for visual variety.
 
-Read the COMPLETE narration before planning any individual beat. Narration and
+{reading_instruction} Narration and
 visuals have different jobs: do not paraphrase narration and do not write image
 generation prompts. First identify all characters, locations, important objects,
 recurring environments, and possible master scenes. Then create meaningful visual
 beats that make spatial layout, movement, distance, routes, obstructions, danger,
 breakage, and progressive physical changes easy to understand.
 
-MASTER SCENES. Select only a small number of important recurring environments. For
-each master, define stable environment geometry, recurring object positions, overall
-color palette, and basic composition. Treat masters as immutable continuity anchors,
-not frames that later beats can silently replace. Every beat occurring in a recurring
-environment must explicitly set master_scene_id. Descendants may change story state
-such as water, damage, people, objects or lighting while preserving the recognizable
-environment.
+MASTER SCENES. Select only a small number of important recurring environments. Define
+all possible_master_scenes first, with stable unique IDs, before creating visual_beats.
+For each master, define stable environment geometry, recurring object positions,
+overall color palette, and basic composition. Treat masters as immutable continuity
+anchors, not frames that later beats can silently replace. Whenever a VisualBeat
+occurs inside a recurring environment that has a master scene, the beat MUST include
+the corresponding master_scene_id. If the same environment is reused across multiple
+beats, preserve the correct master_scene_id unless the plan explicitly transitions to
+another mastered scene. A recurring environment without a master scene does not force
+a master_scene_id. Descendants may change story state such as water, damage, people,
+objects or lighting while preserving the recognizable environment.
 
 DIRECTING RULES:
 1. SHOT PROGRESSION. Use WIDE, MEDIUM, CLOSE, DETAIL and CUTAWAY_DIAGRAM in a
@@ -385,6 +628,10 @@ a strong WIDE may hold 5-7 seconds with subtle movement. Do not use one identica
 duration for every beat.
 10. ADD INFORMATION. Each visual must add spatial, causal, scale, route or state
 information beyond the narration instead of merely illustrating its wording.
+11. BEAT GRANULARITY. Start a new semantic visual beat when narration introduces a
+new object, location, physical state, obstacle, route, important resource, causal
+mechanism, comparison, or decision. Do not create beats for filler wording.
+{pacing_instruction}
 
 Prefer an established scene that evolves over unrelated replacement images. Target
 approximately one meaningful visual change every 3-5 seconds, but do not create a new
@@ -428,7 +675,7 @@ code fences, commentary, or image prompts.
 JSON Schema:
 {schema}
 
-COMPLETE NARRATION:
+{narration_label}:
 <narration>
 {narration}
 </narration>

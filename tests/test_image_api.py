@@ -193,7 +193,7 @@ def test_zimage_compacts_assembled_prompt_to_kie_limit(
 
     assert 1 <= len(observed_prompt) <= 800
     assert "Scene semantics" in observed_prompt
-    assert "NO photorealism" in observed_prompt
+    assert "Do not depict photorealism" in observed_prompt
 
 
 def test_zimage_compaction_preserves_beat_semantics_over_verbose_project_style() -> None:
@@ -234,7 +234,7 @@ Permanent style details.
     assert "Dust and small rocks fall" in compact
     assert "begins shedding debris" in compact
     assert "canonical master style direction" not in compact
-    assert "NO photorealism" in compact
+    assert "Do not depict photorealism" in compact
     assert compact != calm
 
 
@@ -257,7 +257,7 @@ STYLE CONTRACT [rough_explainer_v1]
     compact = _fit_kie_zimage_prompt(prompt)
 
     assert len(compact) <= 800
-    assert "First notice: Falling rock above the tunnel exit" in compact
+    assert "Falling rock above the tunnel exit" in compact
 
 
 def configure_qwen(

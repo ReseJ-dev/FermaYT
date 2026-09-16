@@ -226,7 +226,8 @@ def test_bound_provider_always_prepends_approved_style_reference(
     ]
     assert "first attached image controls line thickness" in prompt
     assert "IMAGE REFERENCE" not in prompt
-    assert prompt.count("STYLE CONTRACT [rough_explainer_v1]") == 1
+    assert prompt.count("Use this permanent drawing style") == 1
+    assert "STYLE CONTRACT" not in prompt
 
 
 def test_bound_provider_keeps_style_first_when_content_reference_is_added(

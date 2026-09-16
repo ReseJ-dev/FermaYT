@@ -22,14 +22,22 @@ from app.costs import (
 )
 from app.errors import MasterSceneError
 from app.generators.image import generate_image, validate_image_prompt
-from app.generators.image_prompt import ImagePromptBuilder
+from app.generators.image_prompt import (
+    ImagePromptBuilder,
+    sanitize_provider_visual_text,
+)
 from app.generators.style_reference import (
     build_reference_role_instruction,
     to_style_image_reference,
     verify_style_reference_asset,
 )
 from app.models.visual_plan import MasterScene, VisualBeat, VisualOperation, VisualPlan
-from app.persistence import MasterSceneAsset, Project, StyleReferenceAsset
+from app.persistence import (
+    MasterSceneAsset,
+    MasterSceneGenerationAttempt,
+    Project,
+    StyleReferenceAsset,
+)
 from app.pipeline.visual_operation_engine import VisualProviderCapabilities
 from app.pipeline.visual_qa import (
     VisualQAContext,
@@ -45,7 +53,19 @@ from app.providers import (
     ImageReferenceRole,
     ReferenceImageProvider,
 )
-from app.repositories import create_master_scene_asset, get_master_scene_asset
+from app.repositories import (
+    create_master_scene_asset,
+    create_master_scene_generation_attempt,
+    get_master_scene_asset,
+    get_project_visual_plan_record,
+    update_master_scene_generation_attempt,
+)
+from app.services.prompt_assembly import (
+    PromptAssembly,
+    PromptTargetType,
+    build_auto_master_scene_prompt,
+    compile_prompt_assembly,
+)
 from app.storage import ProjectMediaPaths
 from app.style_contracts import (
     DEFAULT_IMAGE_STYLE_ID,
@@ -115,21 +135,47 @@ async def generate_required_master_scenes(
         master_id: get_master_scene_asset(session, project.id, master_id)
         for master_id in required_ids
     }
+    plan_record = get_project_visual_plan_record(session, project.id)
 
     for master_scene_id in required_ids:
         definition = definitions[master_scene_id]
-        base_prompt = build_master_scene_generation_prompt(
+        prompt = build_auto_master_scene_prompt(
             definition,
             project.global_image_style_prompt,
+            style_references,
+            style_id=style_id,
         )
-        if style_references:
-            base_prompt = (
-                f"{base_prompt}\n\n{build_reference_role_instruction(style_references)}"
+        operation = (
+            VisualOperation.REFERENCE_GENERATION
+            if style_references
+            else VisualOperation.NEW_IMAGE
+        )
+
+        def assemble_master_prompt(
+            correction_instruction: str | None,
+            *,
+            current_master_scene_id: str = master_scene_id,
+            current_operation: VisualOperation = operation,
+            current_prompt: str = prompt,
+        ) -> PromptAssembly:
+            return compile_prompt_assembly(
+                session,
+                project=project,
+                plan_record=plan_record,
+                plan=plan,
+                target_type=PromptTargetType.MASTER_SCENE,
+                target_id=current_master_scene_id,
+                operation=current_operation,
+                auto_scene_prompt=current_prompt,
+                references=style_references,
+                style_id=style_id,
+                provider=project.image_provider,
+                model=getattr(client, "model", project.image_model),
+                qa_correction=correction_instruction,
             )
-        prompt = apply_image_style_contract(
-            base_prompt,
-            style_id,
-        )
+
+        base_assembly = assemble_master_prompt(None)
+        prompt = base_assembly.assembled_prompt_before_provider_transform or prompt
         existing = existing_required[master_scene_id]
         if existing is not None:
             if existing.style_version != style_version:
@@ -174,14 +220,98 @@ async def generate_required_master_scenes(
             )
         try:
             prompts_by_candidate: dict[str, str] = {}
+            assemblies_by_candidate: dict[str, PromptAssembly] = {}
+            attempts_by_candidate: dict[str, MasterSceneGenerationAttempt] = {}
+
+            def record_prompt_attempt(
+                candidate_path: str,
+                assembly: PromptAssembly,
+                *,
+                current_master_scene_id: str = master_scene_id,
+                current_attempts: dict[
+                    str, MasterSceneGenerationAttempt
+                ] = attempts_by_candidate,
+            ) -> None:
+                current_attempts[candidate_path] = (
+                    create_master_scene_generation_attempt(
+                        session,
+                        project_id=project.id,
+                        visual_plan_id=assembly.visual_plan_id,
+                        visual_plan_revision=assembly.visual_plan_revision,
+                        master_scene_id=current_master_scene_id,
+                        prompt_assembly_snapshot=assembly.as_dict(),
+                        provider=assembly.provider,
+                        model=assembly.model,
+                        output_path=candidate_path,
+                    )
+                )
+
+            def record_prompt_outcome(
+                retry: bool,
+                candidate_path: str,
+                status: UsageStatus,
+                *,
+                current_master_scene_id: str = master_scene_id,
+                current_attempts: dict[
+                    str, MasterSceneGenerationAttempt
+                ] = attempts_by_candidate,
+            ) -> None:
+                attempt_record = current_attempts.get(candidate_path)
+                if attempt_record is not None:
+                    update_master_scene_generation_attempt(
+                        session,
+                        attempt_record,
+                        generation_status=status.value,
+                    )
+                if job_id is not None:
+                    record_provider_usage(
+                        session,
+                        project_id=project.id,
+                        job_id=job_id,
+                        pipeline_stage="MASTER_SCENES",
+                        provider=project.image_provider,
+                        model=getattr(client, "model", project.image_model),
+                        operation=(
+                            "REFERENCE_GENERATION"
+                            if style_references
+                            else "NEW_IMAGE"
+                        ),
+                        request_revision=usage_revision(
+                            current_master_scene_id, style_version, candidate_path
+                        ),
+                        unit_type=PricingUnit.PER_IMAGE,
+                        input_units=1,
+                        status=status,
+                        master_scene_id=current_master_scene_id,
+                        is_qa_retry=retry,
+                    )
+
+            def record_qa_decision(
+                candidate_path: str,
+                decision: object,
+                *,
+                current_attempts: dict[
+                    str, MasterSceneGenerationAttempt
+                ] = attempts_by_candidate,
+            ) -> None:
+                attempt_record = current_attempts.get(candidate_path)
+                if attempt_record is not None and hasattr(decision, "model_dump"):
+                    update_master_scene_generation_attempt(
+                        session,
+                        attempt_record,
+                        qa_result=decision.model_dump(mode="json"),
+                    )
+
             generate_master_candidate = _build_master_candidate_generator(
-                prompt,
+                assemble_master_prompt,
                 style_id,
                 style_references,
                 client,
                 prompts_by_candidate,
+                assemblies_by_candidate,
                 downloader or download_file,
                 use_direct_download=downloader is not None,
+                on_assembly=record_prompt_attempt,
                 before_request=(
                     lambda retry, master_scene_id=master_scene_id: (
                         budget_guard.check_paid_call(
@@ -202,33 +332,7 @@ async def generate_required_master_scenes(
                         else None
                     )
                 ),
-                on_request=(
-                    lambda retry, candidate_path, status, master_scene_id=master_scene_id: (
-                        record_provider_usage(
-                            session,
-                            project_id=project.id,
-                            job_id=job_id,
-                            pipeline_stage="MASTER_SCENES",
-                            provider=project.image_provider,
-                            model=getattr(client, "model", project.image_model),
-                            operation=(
-                                "REFERENCE_GENERATION"
-                                if style_references
-                                else "NEW_IMAGE"
-                            ),
-                            request_revision=usage_revision(
-                                master_scene_id, style_version, candidate_path
-                            ),
-                            unit_type=PricingUnit.PER_IMAGE,
-                            input_units=1,
-                            status=status,
-                            master_scene_id=master_scene_id,
-                            is_qa_retry=retry,
-                        )
-                        if job_id is not None
-                        else None
-                    )
-                ),
+                on_request=record_prompt_outcome,
             )
 
             if qa_service is not None:
@@ -295,6 +399,7 @@ async def generate_required_master_scenes(
                             else None
                         )
                     ),
+                    on_qa_decision=record_qa_decision,
                 )
                 generated_path = qa_outcome.image_path
                 selected_candidate = qa_outcome.selected_candidate_path
@@ -303,9 +408,17 @@ async def generate_required_master_scenes(
                     if selected_candidate is not None
                     else prompt
                 )
+                selected_assembly = (
+                    assemblies_by_candidate.get(selected_candidate, base_assembly)
+                    if selected_candidate is not None
+                    else base_assembly
+                )
             else:
                 generated_path = await generate_master_candidate(None, output_path)
                 generation_prompt = prompt
+                selected_assembly = assemblies_by_candidate.get(
+                    output_path, base_assembly
+                )
             file_sha256 = await asyncio.to_thread(_sha256_file, generated_path)
             asset = create_master_scene_asset(
                 session,
@@ -315,6 +428,7 @@ async def generate_required_master_scenes(
                 file_sha256=file_sha256,
                 style_version=style_version,
                 generation_prompt=generation_prompt,
+                prompt_assembly_snapshot=selected_assembly.as_dict(),
                 provider=project.image_provider,
                 model=project.image_model,
                 seed=None,
@@ -393,20 +507,19 @@ def build_master_scene_generation_prompt(
 ) -> str:
     """Build and retain the exact prompt used for an immutable master."""
     parts = [
-        f"MASTER SCENE ID: {master.id}",
-        f"Environment: {master.description}",
-        f"Stable geometry: {master.environment_geometry}",
-        f"Recurring object positions: {master.recurring_object_positions}",
-        f"Overall color palette: {master.color_palette}",
-        f"Basic composition: {master.basic_composition}",
+        f"Draw this recurring environment. {master.description}",
+        f"Preserve this stable geometry. {master.environment_geometry}",
+        f"Place recurring objects this way. {master.recurring_object_positions}",
+        f"Use these colors. {master.color_palette}",
+        f"Use this composition. {master.basic_composition}",
         (
             "Create a clear reusable environment reference. Prioritize readable "
             "spatial layout over incidental detail."
         ),
     ]
     if global_style_prompt is not None and global_style_prompt.strip():
-        parts.append(f"Project visual style: {global_style_prompt.strip()}")
-    return "\n".join(parts)
+        parts.append(f"Follow this project drawing direction. {global_style_prompt.strip()}")
+    return sanitize_provider_visual_text(" ".join(parts))
 
 
 def build_continuity_generation_request(
@@ -552,11 +665,16 @@ async def generate_continuity_image(
     client: MasterSceneImageClient,
     *,
     downloader: Callable[[str, str], Awaitable[str]] | None = None,
+    prompt_is_final: bool = False,
 ) -> str:
     """Execute a prepared request without silently ignoring reference images."""
-    contracted_prompt = prepare_image_prompt_for_provider(
-        request.prompt,
-        request.style_version or DEFAULT_IMAGE_STYLE_ID,
+    contracted_prompt = (
+        request.prompt
+        if prompt_is_final
+        else prepare_image_prompt_for_provider(
+            request.prompt,
+            request.style_version or DEFAULT_IMAGE_STYLE_ID,
+        )
     )
     if request.operation is VisualOperation.EDIT_EXISTING:
         if not request.references or not isinstance(client, ImageEditingProvider):
@@ -652,21 +770,20 @@ def _required_master_scene_ids(
 
 
 def _structured_master_description(master: MasterScene, style_version: str) -> str:
-    return "\n".join(
+    del style_version
+    return sanitize_provider_visual_text(" ".join(
         (
-            "IMMUTABLE MASTER SCENE CONTINUITY:",
-            f"master_scene_id: {master.id}",
-            f"style_version: {style_version}",
-            f"environment_geometry: {master.environment_geometry}",
-            f"recurring_object_positions: {master.recurring_object_positions}",
-            f"color_palette: {master.color_palette}",
-            f"basic_composition: {master.basic_composition}",
+            "Preserve the recognizable recurring environment.",
+            f"Keep this geometry. {master.environment_geometry}",
+            f"Keep recurring objects here. {master.recurring_object_positions}",
+            f"Keep these colors. {master.color_palette}",
+            f"Keep this composition. {master.basic_composition}",
             (
                 "Preserve this recognizable environment. Change only people, objects, "
                 "water, damage, or lighting explicitly required by this beat."
             ),
         )
-    )
+    ))
 
 
 def _usable_style_references(
@@ -694,14 +811,16 @@ def _prompt_with_reference_roles(
 
 
 def _build_master_candidate_generator(
-    base_prompt: str,
+    assemble_prompt: Callable[[str | None], PromptAssembly],
     style_id: str,
     style_references: tuple[ImageReference, ...],
     client: MasterSceneImageClient,
     prompts_by_candidate: dict[str, str],
+    assemblies_by_candidate: dict[str, PromptAssembly],
     downloader: Callable[[str, str], Awaitable[str]],
     *,
     use_direct_download: bool,
+    on_assembly: Callable[[str, PromptAssembly], object] | None = None,
     before_request: Callable[[bool], object] | None = None,
     on_request: Callable[[bool, str, UsageStatus], object] | None = None,
 ) -> Callable[[str | None, str], Awaitable[str]]:
@@ -709,35 +828,34 @@ def _build_master_candidate_generator(
         correction_instruction: str | None,
         candidate_path: str,
     ) -> str:
-        candidate_prompt = apply_visual_qa_correction(
-            base_prompt,
-            correction_instruction,
-            style_id,
-        )
+        assembly = assemble_prompt(correction_instruction)
+        candidate_prompt = assembly.assembled_prompt_before_provider_transform or ""
         prompts_by_candidate[candidate_path] = candidate_prompt
+        assemblies_by_candidate[candidate_path] = assembly
         if before_request is not None:
             before_request(correction_instruction is not None)
+        if on_assembly is not None:
+            on_assembly(candidate_path, assembly)
         try:
             if style_references:
                 result = await generate_continuity_image(
                     ContinuityGenerationRequest(
                         operation=VisualOperation.REFERENCE_GENERATION,
-                        prompt=candidate_prompt,
+                        prompt=assembly.final_provider_prompt or "",
                         style_version=style_id,
                         references=style_references,
                     ),
                     candidate_path,
                     client,
                     downloader=downloader,
+                    prompt_is_final=True,
                 )
             elif use_direct_download:
-                image_url = await client.generate(
-                    prepare_image_prompt_for_provider(candidate_prompt, style_id)
-                )
+                image_url = await client.generate(assembly.final_provider_prompt or "")
                 result = await downloader(image_url, candidate_path)
             else:
                 result = await generate_image(
-                    candidate_prompt,
+                    assembly.final_provider_prompt or "",
                     candidate_path,
                     client,  # type: ignore[arg-type]
                     style_id=style_id,
@@ -786,11 +904,11 @@ def _master_prompt_matches(
 ) -> bool:
     if stored_prompt == base_prompt:
         return True
-    contract = get_image_style_contract(style_id).render()
+    contract = get_image_style_contract(style_id).render_for_image_provider()
     if not stored_prompt.endswith(contract) or not base_prompt.endswith(contract):
         return False
     stored_content = stored_prompt[: -len(contract)].rstrip()
     base_content = base_prompt[: -len(contract)].rstrip()
     return stored_content.startswith(
-        f"{base_content}\n\nVISUAL QA CORRECTION FOR REGENERATION:"
+        f"{base_content}\n\nRegenerate the illustration so that"
     )

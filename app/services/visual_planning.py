@@ -2,18 +2,22 @@
 
 import hashlib
 import logging
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
+from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
 from app.budgets import ProjectBudgetGuard
 from app.costs import PricingUnit, UsageStatus, record_provider_usage, usage_revision
 from app.errors import (
+    PlanningTooLargeError,
     ProjectVisualPlanError,
     StaleProjectVisualPlanError,
     VisualDirectorError,
 )
+from app.generation_scope import GenerationScope, PlanningScope
 from app.generators.visual_director import (
     MAX_VISUAL_PLAN_REPAIR_ATTEMPTS,
     VisualDirector,
@@ -26,10 +30,12 @@ from app.repositories import (
     get_project,
     get_project_visual_plan_record,
     save_project_visual_plan_record,
+    set_active_project_visual_plan,
 )
+from app.services.planning_attempts import PlanningAttemptController
 
 VISUAL_PLAN_SCHEMA_VERSION = "visual_plan_v1"
-VISUAL_DIRECTOR_VERSION = "visual_director_v1"
+VISUAL_DIRECTOR_VERSION = "visual_director_v2"
 
 logger = logging.getLogger(__name__)
 
@@ -65,6 +71,10 @@ async def create_project_visual_plan(
     job_id: str | None = None,
     budget_guard: ProjectBudgetGuard | None = None,
     max_repair_attempts: int = MAX_VISUAL_PLAN_REPAIR_ATTEMPTS,
+    planning_run_id: str | None = None,
+    allow_after_uncertain: bool = False,
+    cancellation_requested: Callable[[], bool] | None = None,
+    planning_scope: PlanningScope | None = None,
 ) -> VisualPlan:
     """Generate, validate, and atomically persist a Project's current plan."""
     project = get_project(session, project_id)
@@ -81,18 +91,6 @@ async def create_project_visual_plan(
         project_id=project_id,
         event="planning_start",
     )
-
-    def before_provider_call(request_number: int, is_repair: bool) -> None:
-        del request_number, is_repair
-        if budget_guard is not None:
-            budget_guard.check_paid_call(
-                pipeline_stage="PLANNING",
-                provider=project.planning_provider,
-                model=project.planning_model,
-                operation="PLANNING",
-                unit_type=PricingUnit.PER_REQUEST,
-                input_units=1,
-            )
 
     def log_repair_event(repair: VisualPlanRepairEvent) -> None:
         _log(
@@ -112,25 +110,129 @@ async def create_project_visual_plan(
             validation_issue=repair.issue,
         )
 
+    effective_scope = planning_scope or PlanningScope.derive(
+        story_text, GenerationScope.full()
+    )
+    configured_max_output = int(
+        getattr(
+            planning_client,
+            "configured_max_output_tokens",
+            getattr(planning_client, "max_output_tokens", 32_768),
+        )
+        or 32_768
+    )
+    hard_output_ceiling = min(
+        configured_max_output, int(project.planning_max_output_tokens)
+    )
+    required_output = effective_scope.required_output_tokens()
+    if required_output > hard_output_ceiling:
+        raise PlanningTooLargeError(
+            f"expected {effective_scope.expected_beat_count} beats require about "
+            f"{required_output} output tokens, hard ceiling is {hard_output_ceiling}"
+        )
+    scoped_max_output = effective_scope.max_output_tokens(hard_output_ceiling)
+    # Every planning adapter receives an explicit bounded output request.
+    planning_client.max_output_tokens = scoped_max_output  # type: ignore[attr-defined]
+    effective_job_id = job_id or f"direct-{uuid4()}"
+    attempt_controller = PlanningAttemptController(
+        session,
+        project_id=project_id,
+        job_id=effective_job_id,
+        planning_run_id=planning_run_id or effective_job_id,
+        client=planning_client,
+        budget_guard=budget_guard,
+        allow_after_uncertain=allow_after_uncertain,
+        cancelled=cancellation_requested,
+        provider=project.planning_provider,
+        model=project.planning_model,
+        expected_beat_count=effective_scope.expected_beat_count,
+        planning_budget_amount=(
+            float(project.planning_budget_amount)
+            if project.planning_budget_amount is not None
+            else None
+        ),
+        max_paid_requests=project.planning_max_paid_requests,
+        max_input_tokens=project.planning_max_input_tokens,
+        max_output_tokens=project.planning_max_output_tokens,
+        max_total_estimated_tokens=project.planning_max_total_estimated_tokens,
+    )
     director = VisualDirector(
         planning_client,
         max_repair_attempts=max_repair_attempts,
         on_repair_event=log_repair_event,
-        before_provider_call=before_provider_call,
+        attempt_controller=attempt_controller,
     )
-    try:
-        plan = await director.create_plan(story_text)
-    except VisualDirectorError as exc:
-        if job_id is not None:
-            record_provider_usage(
-                session, project_id=project_id, job_id=job_id,
-                pipeline_stage="PLANNING", provider=project.planning_provider,
-                model=project.planning_model, operation="PLANNING",
-                request_revision=usage_revision(hash_story_text(story_text), "planning"),
+    preflight = getattr(planning_client, "preflight", None)
+    if callable(preflight):
+        preflight_is_paid = getattr(planning_client, "provider", None) != "kimi"
+        if budget_guard is not None and preflight_is_paid:
+            budget_guard.check_paid_call(
+                pipeline_stage="PLANNING",
+                provider=project.planning_provider,
+                model=project.planning_model,
+                operation="PLANNING",
                 unit_type=PricingUnit.PER_REQUEST,
-                input_units=max(exc.provider_requests, 1),
-                status=UsageStatus.FAILED,
+                input_units=1,
             )
+        try:
+            await preflight()
+        except Exception:
+            if job_id is not None and preflight_is_paid:
+                record_provider_usage(
+                    session,
+                    project_id=project_id,
+                    job_id=job_id,
+                    pipeline_stage="PLANNING",
+                    provider=project.planning_provider,
+                    model=project.planning_model,
+                    operation="PLANNING",
+                    request_revision=usage_revision(
+                        hash_story_text(story_text),
+                        project.planning_model,
+                        "planning_preflight",
+                    ),
+                    unit_type=PricingUnit.PER_REQUEST,
+                    input_units=1,
+                    status=UsageStatus.FAILED,
+                )
+            _log(
+                logging.WARNING,
+                "Visual planning preflight failed",
+                project_id=project_id,
+                event="planning_preflight_failure",
+            )
+            raise
+        if job_id is not None and preflight_is_paid:
+            record_provider_usage(
+                session,
+                project_id=project_id,
+                job_id=job_id,
+                pipeline_stage="PLANNING",
+                provider=project.planning_provider,
+                model=project.planning_model,
+                operation="PLANNING",
+                request_revision=usage_revision(
+                    hash_story_text(story_text),
+                    project.planning_model,
+                    "planning_preflight",
+                ),
+                unit_type=PricingUnit.PER_REQUEST,
+                input_units=1,
+                status=UsageStatus.SUCCEEDED,
+            )
+        _log(
+            logging.INFO,
+            "Visual planning preflight succeeded",
+            project_id=project_id,
+            event="planning_preflight_success",
+        )
+    try:
+        plan = await director.create_plan(
+            effective_scope.narration_excerpt,
+            planning_scope_metadata=effective_scope.metadata(),
+            project_title=project.name,
+        )
+    except VisualDirectorError as exc:
         failure_type = (
             "provider_failure"
             if "provider failed" in str(exc)
@@ -154,16 +256,6 @@ async def create_project_visual_plan(
             )
         raise
 
-    if job_id is not None:
-        record_provider_usage(
-            session, project_id=project_id, job_id=job_id,
-            pipeline_stage="PLANNING", provider=project.planning_provider,
-            model=project.planning_model, operation="PLANNING",
-            request_revision=usage_revision(hash_story_text(story_text), "planning"),
-            unit_type=PricingUnit.PER_REQUEST, input_units=director.provider_requests,
-            status=UsageStatus.SUCCEEDED,
-        )
-
     _log(
         logging.INFO,
         "Visual planning succeeded",
@@ -178,6 +270,19 @@ async def create_project_visual_plan(
             schema_version=VISUAL_PLAN_SCHEMA_VERSION,
             visual_director_version=VISUAL_DIRECTOR_VERSION,
             story_text_hash=hash_story_text(story_text),
+            scope_key=effective_scope.scope_key,
+            scope_type=effective_scope.type.value,
+            requested_seconds=effective_scope.requested_seconds,
+            requested_beats=effective_scope.requested_beats,
+            source_start_char=effective_scope.source_start_char,
+            source_end_char=effective_scope.source_end_char,
+            source_hash=effective_scope.source_hash,
+            is_partial=effective_scope.is_partial,
+            continuation_boundary_char=(
+                effective_scope.continuation_boundary_char
+            ),
+            expected_beat_count=effective_scope.expected_beat_count,
+            planning_max_output_tokens=scoped_max_output,
             plan_json=plan.model_dump(mode="json"),
         )
     except Exception:
@@ -196,15 +301,20 @@ async def create_project_visual_plan(
         event="persistence_success",
         plan_id=record.id,
     )
+    set_active_project_visual_plan(session, project_id, record.id)
     return VisualPlan.model_validate(record.plan_json)
 
 
 def load_project_visual_plan(
     session: Session,
     project_id: str,
+    *,
+    scope_key: str | None = None,
 ) -> VisualPlan | None:
     """Reload and revalidate a Project's current plan from durable storage."""
-    record = get_project_visual_plan_record(session, project_id)
+    record = get_project_visual_plan_record(
+        session, project_id, scope_key=scope_key
+    )
     if record is None:
         return None
     try:
@@ -225,15 +335,19 @@ def load_project_visual_plan(
 def load_project_visual_plan_state(
     session: Session,
     project_id: str,
+    *,
+    scope_key: str | None = None,
 ) -> ProjectVisualPlanState | None:
     """Load a plan for inspection and explicitly report CURRENT or STALE."""
     project = get_project(session, project_id)
     if project is None:
         raise ValueError(f"Project not found: {project_id}")
-    record = get_project_visual_plan_record(session, project_id)
+    record = get_project_visual_plan_record(
+        session, project_id, scope_key=scope_key
+    )
     if record is None:
         return None
-    plan = load_project_visual_plan(session, project_id)
+    plan = load_project_visual_plan(session, project_id, scope_key=scope_key)
     assert plan is not None
     status = (
         VisualPlanStatus.CURRENT
@@ -250,9 +364,13 @@ def load_project_visual_plan_state(
 def require_current_project_visual_plan(
     session: Session,
     project_id: str,
+    *,
+    scope_key: str | None = None,
 ) -> ProjectVisualPlanState:
     """Reject missing or stale plans at an execution boundary."""
-    state = load_project_visual_plan_state(session, project_id)
+    state = load_project_visual_plan_state(
+        session, project_id, scope_key=scope_key
+    )
     if state is None:
         raise ProjectVisualPlanError("Project does not have a visual plan")
     if not state.is_current:

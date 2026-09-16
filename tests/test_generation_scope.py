@@ -3,7 +3,7 @@
 import pytest
 from test_visual_asset_execution import _plan_payload
 
-from app.generation_scope import GenerationScope, GenerationScopeType
+from app.generation_scope import GenerationScope, GenerationScopeType, PlanningScope
 from app.models.visual_plan import VisualPlan
 
 
@@ -80,3 +80,30 @@ def test_invalid_partial_scope_is_rejected(
 ) -> None:
     with pytest.raises(ValueError):
         GenerationScope(scope_type, value)
+
+
+def _long_story(word_count: int = 1441) -> str:
+    return " ".join(
+        f"word{index}{'.' if (index + 1) % 20 == 0 else ''}"
+        for index in range(word_count)
+    )
+
+
+def test_first_seconds_planning_scope_is_bounded_before_provider_call() -> None:
+    story = _long_story()
+    thirty = PlanningScope.derive(
+        story, GenerationScope(GenerationScopeType.FIRST_SECONDS, 30)
+    )
+    sixty = PlanningScope.derive(
+        story, GenerationScope(GenerationScopeType.FIRST_SECONDS, 60)
+    )
+    full = PlanningScope.derive(story, GenerationScope.full())
+
+    assert len(thirty.narration_excerpt.split()) in range(100, 122)
+    assert len(thirty.narration_excerpt.split()) < 1441 // 10
+    assert len(thirty.narration_excerpt) < len(sixty.narration_excerpt) < len(story)
+    assert thirty.is_partial is sixty.is_partial is True
+    assert full.narration_excerpt == story
+    assert full.is_partial is False
+    assert thirty.max_output_tokens(32768) < sixty.max_output_tokens(32768)
+    assert sixty.max_output_tokens(32768) < full.max_output_tokens(32768)

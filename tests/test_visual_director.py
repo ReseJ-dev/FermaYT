@@ -7,12 +7,17 @@ from copy import deepcopy
 import pytest
 
 from app.errors import StructuredAIProviderError, VisualDirectorError
+from app.generators.visual_director import (
+    VisualDirector,
+    VisualPlanPacingError,
+    _validate_visual_plan_pacing,
+    build_visual_director_request,
+)
+from app.models.visual_plan import VisualOperation, VisualPlan
 from app.provider_diagnostics import (
     StructuredAIProviderDiagnostic,
     find_structured_ai_provider_diagnostic,
 )
-from app.generators.visual_director import VisualDirector
-from app.models.visual_plan import VisualOperation
 
 
 def valid_plan_payload() -> dict[str, object]:
@@ -130,6 +135,23 @@ def valid_plan_payload() -> dict[str, object]:
             },
         ],
     }
+
+
+def test_visual_director_requires_semantic_granularity_and_cost_aware_states() -> None:
+    request = build_visual_director_request("A long narration about a mine route.")
+
+    assert "new object, location, physical state, obstacle, route" in request
+    assert "45-70 meaningful visible states" in request
+    assert "25-40" in request
+    assert "REUSE with a new crop, zoom, pan, focus" in request
+
+
+def test_long_narration_with_too_few_beats_fails_pacing_validation() -> None:
+    plan = VisualPlan.model_validate(valid_plan_payload())
+    narration = " ".join(f"word{index}" for index in range(240))
+
+    with pytest.raises(VisualPlanPacingError, match="at least 12"):
+        _validate_visual_plan_pacing(plan, narration)
 
 
 class FakePlanningClient:
@@ -262,16 +284,140 @@ def test_director_rejects_close_view_without_established_geography() -> None:
         asyncio.run(VisualDirector(client).create_plan("Complete narration"))
 
 
-def test_director_requires_master_id_in_recurring_environment() -> None:
+def test_director_hydrates_missing_master_id_without_repair() -> None:
     payload = valid_plan_payload()
     beats = payload["visual_beats"]
     assert isinstance(beats, list)
     assert isinstance(beats[0], dict)
     beats[0]["master_scene_id"] = None
-    client = FakePlanningClient(json.dumps(payload))
+    client = SequencedPlanningClient([json.dumps(payload)])
 
-    with pytest.raises(VisualDirectorError, match="invalid structured visual plan"):
-        asyncio.run(VisualDirector(client).create_plan("Complete narration"))
+    plan = asyncio.run(VisualDirector(client).create_plan("Complete narration"))
+
+    assert plan.visual_beats[0].master_scene_id == "shaft_master"
+    assert len(client.prompts) == 1
+
+
+def test_canonical_model_still_rejects_missing_master_id() -> None:
+    payload = valid_plan_payload()
+    payload["visual_beats"][0]["master_scene_id"] = None  # type: ignore[index]
+
+    with pytest.raises(ValueError, match="must reference one of these master scenes"):
+        VisualPlan.model_validate(payload)
+
+
+def test_correct_master_id_is_preserved() -> None:
+    client = SequencedPlanningClient([json.dumps(valid_plan_payload())])
+
+    plan = asyncio.run(VisualDirector(client).create_plan("Complete narration"))
+
+    assert {beat.master_scene_id for beat in plan.visual_beats} == {"shaft_master"}
+    assert len(client.prompts) == 1
+
+
+def test_non_mastered_recurring_environment_does_not_require_master_id() -> None:
+    payload = valid_plan_payload()
+    payload["possible_master_scenes"] = []
+    for beat in payload["visual_beats"]:  # type: ignore[union-attr]
+        beat["master_scene_id"] = None
+    client = SequencedPlanningClient([json.dumps(payload)])
+
+    plan = asyncio.run(VisualDirector(client).create_plan("Complete narration"))
+
+    assert all(beat.master_scene_id is None for beat in plan.visual_beats)
+    assert len(client.prompts) == 1
+
+
+def test_wrong_master_id_is_corrected_when_location_is_unambiguous() -> None:
+    payload = valid_plan_payload()
+    payload["locations"].append(  # type: ignore[union-attr]
+        {
+            "id": "surface",
+            "name": "Surface",
+            "description": "Open ground above the shaft",
+            "spatial_layout": "A flat clearing around the shaft entrance",
+        }
+    )
+    wrong_master = deepcopy(payload["possible_master_scenes"][0])  # type: ignore[index]
+    wrong_master.update(id="surface_master", location_id="surface")
+    payload["possible_master_scenes"].append(wrong_master)  # type: ignore[union-attr]
+    payload["visual_beats"][0]["master_scene_id"] = "surface_master"  # type: ignore[index]
+    client = SequencedPlanningClient([json.dumps(payload)])
+
+    plan = asyncio.run(VisualDirector(client).create_plan("Complete narration"))
+
+    assert plan.visual_beats[0].master_scene_id == "shaft_master"
+    assert len(client.prompts) == 1
+
+
+def test_ambiguous_master_id_requires_targeted_repair() -> None:
+    invalid = valid_plan_payload()
+    alternative = deepcopy(invalid["possible_master_scenes"][0])  # type: ignore[index]
+    alternative["id"] = "shaft_master_alternative"
+    invalid["possible_master_scenes"].append(alternative)  # type: ignore[union-attr]
+    invalid["visual_beats"][0]["master_scene_id"] = None  # type: ignore[index]
+    repaired = deepcopy(invalid)
+    repaired["visual_beats"][0]["master_scene_id"] = "shaft_master"  # type: ignore[index]
+    client = SequencedPlanningClient([json.dumps(invalid), json.dumps(repaired)])
+    events = []
+
+    plan = asyncio.run(
+        VisualDirector(client, on_repair_event=events.append).create_plan(
+            "Complete narration"
+        )
+    )
+
+    assert plan.visual_beats[0].master_scene_id == "shaft_master"
+    assert len(client.prompts) == 2
+    repair_prompt = client.prompts[1]
+    assert "Affected beat id: beat_1" in repair_prompt
+    assert "Recurring environment id(s):\n- shaft_environment" in repair_prompt
+    assert "Currently supplied master_scene_id: null" in repair_prompt
+    assert "- shaft_master\n- shaft_master_alternative" in repair_prompt
+    assert "A beat in a mastered recurring environment" in repair_prompt
+    assert events[0].issue == {
+        "category": "MASTER_SCENE_ASSIGNMENT_REQUIRED",
+        "beat_id": "beat_1",
+        "recurring_environment_ids": ["shaft_environment"],
+        "recurring_environment_id": "shaft_environment",
+        "provided_master_scene_id": None,
+        "allowed_master_scene_ids": [
+            "shaft_master",
+            "shaft_master_alternative",
+        ],
+        "invariant": (
+            "A beat in a mastered recurring environment must reference a master "
+            "scene belonging to that environment."
+        ),
+    }
+
+
+def test_all_beats_in_one_mastered_environment_are_hydrated() -> None:
+    payload = valid_plan_payload()
+    for beat in payload["visual_beats"]:  # type: ignore[union-attr]
+        beat["master_scene_id"] = None
+    client = SequencedPlanningClient([json.dumps(payload)])
+
+    plan = asyncio.run(VisualDirector(client).create_plan("Complete narration"))
+
+    assert [beat.master_scene_id for beat in plan.visual_beats] == [
+        "shaft_master",
+        "shaft_master",
+    ]
+    assert len(client.prompts) == 1
+
+
+def test_master_hydration_consumes_zero_repair_attempts() -> None:
+    payload = valid_plan_payload()
+    payload["visual_beats"][0]["master_scene_id"] = None  # type: ignore[index]
+    events = []
+    client = SequencedPlanningClient([json.dumps(payload)])
+    director = VisualDirector(client, on_repair_event=events.append)
+
+    asyncio.run(director.create_plan("Complete narration"))
+
+    assert director.provider_requests == 1
+    assert events == []
 
 
 def test_director_hides_provider_error_details() -> None:
@@ -384,7 +530,6 @@ def test_repair_can_add_a_genuine_missing_master_geography_definition() -> None:
         ("location_id", "unknown_location", "shaft"),
         ("characters_visible", ["unknown_character"], ["miners"]),
         ("important_objects", ["unknown_object"], ["ladder"]),
-        ("master_scene_id", "unknown_master", "shaft_master"),
     ],
 )
 def test_other_unknown_registry_references_use_same_repair_flow(

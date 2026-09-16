@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -27,6 +29,16 @@ _REQUEST_ID_HEADERS = (
 _PREVIEW_LIMIT = 500
 
 
+@dataclass(frozen=True, slots=True)
+class StructuredCompletionMetadata:
+    """Non-secret provider accounting data returned with one completion."""
+
+    provider_request_id: str | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    total_tokens: int | None = None
+
+
 async def complete_json_chat(
     *,
     provider: str,
@@ -42,6 +54,8 @@ async def complete_json_chat(
     output_token_parameter: str = "max_tokens",
     temperature: float | None = None,
     reasoning_effort: str | None = None,
+    thinking: dict[str, str] | None = None,
+    on_metadata: Callable[[StructuredCompletionMetadata], None] | None = None,
 ) -> str:
     """Return strictly parsed JSON content or a diagnostic-rich safe error."""
     payload: dict[str, object] = {
@@ -54,6 +68,8 @@ async def complete_json_chat(
         payload["temperature"] = temperature
     if reasoning_effort is not None:
         payload["reasoning_effort"] = reasoning_effort
+    if thinking is not None:
+        payload["thinking"] = thinking
 
     for attempt in range(1, max_attempts + 1):
         diagnostic: StructuredAIProviderDiagnostic | None = None
@@ -117,7 +133,7 @@ async def complete_json_chat(
                 continue
             raise _provider_error(diagnostic, "Structured provider request failed") from exc
 
-        return _parse_response(
+        content, metadata = _parse_response(
             response,
             provider=provider,
             model=model,
@@ -125,6 +141,9 @@ async def complete_json_chat(
             attempt=attempt,
             max_attempts=max_attempts,
         )
+        if on_metadata is not None:
+            on_metadata(metadata)
+        return content
 
     raise AssertionError("structured completion retry loop did not terminate")
 
@@ -151,7 +170,7 @@ def _parse_response(
     operation: str,
     attempt: int,
     max_attempts: int,
-) -> str:
+) -> tuple[str, StructuredCompletionMetadata]:
     request_id = _request_id(response)
     try:
         body = response.json()
@@ -209,7 +228,26 @@ def _parse_response(
             else "Structured provider returned invalid JSON content"
         )
         raise _provider_error(diagnostic, summary) from exc
-    return normalized
+    usage = body.get("usage") if isinstance(body, dict) else None
+    usage = usage if isinstance(usage, dict) else {}
+    return normalized, StructuredCompletionMetadata(
+        provider_request_id=request_id or _string_value(body.get("id")),
+        input_tokens=_integer_value(
+            usage.get("prompt_tokens", usage.get("input_tokens"))
+        ),
+        output_tokens=_integer_value(
+            usage.get("completion_tokens", usage.get("output_tokens"))
+        ),
+        total_tokens=_integer_value(usage.get("total_tokens")),
+    )
+
+
+def _integer_value(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _string_value(value: object) -> str | None:
+    return value if isinstance(value, str) and value.strip() else None
 
 
 async def _retry_if_transient(
@@ -237,6 +275,8 @@ def _http_category(status: int) -> str:
         return "PLANNING_BAD_REQUEST"
     if status == 404:
         return "PLANNING_NOT_FOUND"
+    if status == 402:
+        return "PLANNING_PAYMENT_REQUIRED"
     if status == 429:
         return "PLANNING_RATE_LIMIT"
     if 500 <= status <= 599:

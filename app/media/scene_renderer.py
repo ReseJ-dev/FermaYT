@@ -6,7 +6,6 @@ from typing import Literal
 
 from app.errors import VideoRenderError
 
-
 ImageFit = Literal["cover", "contain"]
 
 
@@ -52,10 +51,18 @@ def render_scene(
         str(fps),
         "-c:v",
         "libx264",
+        "-crf",
+        "20",
+        "-preset",
+        "medium",
         "-pix_fmt",
         "yuv420p",
         "-c:a",
         "aac",
+        "-af",
+        "loudnorm=I=-15:TP=-1:LRA=11",
+        "-b:a",
+        "192k",
         "-shortest",
         "-movflags",
         "+faststart",

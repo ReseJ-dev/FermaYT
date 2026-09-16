@@ -57,6 +57,47 @@ class VisualPlanDuplicateIdError(ValueError):
         super().__init__(f"duplicate {label} id: {duplicate_id}")
 
 
+class VisualPlanMasterSceneAssignmentError(ValueError):
+    """A beat cannot be assigned to a mastered environment unambiguously."""
+
+    category = "MASTER_SCENE_ASSIGNMENT_REQUIRED"
+
+    def __init__(
+        self,
+        *,
+        beat_id: str,
+        recurring_environment_ids: set[str],
+        provided_master_scene_id: str | None,
+        allowed_master_scene_ids: set[str],
+    ) -> None:
+        self.beat_id = beat_id
+        self.recurring_environment_ids = tuple(sorted(recurring_environment_ids))
+        self.provided_master_scene_id = provided_master_scene_id
+        self.allowed_master_scene_ids = tuple(sorted(allowed_master_scene_ids))
+        environments = ", ".join(self.recurring_environment_ids)
+        allowed = ", ".join(self.allowed_master_scene_ids)
+        super().__init__(
+            f"beat {beat_id} in recurring environment {environments} must reference "
+            f"one of these master scenes: {allowed}"
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        result: dict[str, object] = {
+            "category": self.category,
+            "beat_id": self.beat_id,
+            "recurring_environment_ids": list(self.recurring_environment_ids),
+            "provided_master_scene_id": self.provided_master_scene_id,
+            "allowed_master_scene_ids": list(self.allowed_master_scene_ids),
+            "invariant": (
+                "A beat in a mastered recurring environment must reference a master "
+                "scene belonging to that environment."
+            ),
+        }
+        if len(self.recurring_environment_ids) == 1:
+            result["recurring_environment_id"] = self.recurring_environment_ids[0]
+        return result
+
+
 class VisualOperation(str, Enum):
     """The visual operation preferred by the director for a beat."""
 
@@ -225,7 +266,7 @@ class VisualBeat(_VisualModel):
         default=None,
         description="A restrained route, arrow or highlight; never a full slide.",
     )
-    estimated_duration_seconds: float = Field(gt=0)
+    estimated_duration_seconds: float = Field(gt=0, le=12)
 
     @model_validator(mode="before")
     @classmethod
@@ -270,17 +311,52 @@ class VisualBeat(_VisualModel):
         return self
 
 
+class VisualPlanPlanningScope(_VisualModel):
+    scope_type: str = Field(
+        pattern=r"^(FULL|FIRST_SECONDS|FIRST_BEATS|STYLE_PREVIEW)$"
+    )
+    requested_seconds: float | None = Field(default=None, gt=0)
+    requested_beats: int | None = Field(default=None, gt=0)
+    source_start_char: int = Field(ge=0)
+    source_end_char: int = Field(gt=0)
+    continuation_boundary_char: int | None = Field(default=None, ge=0)
+    source_hash: str = Field(min_length=64, max_length=64)
+    is_partial: bool
+    expected_beat_count: int = Field(gt=0)
+    version: str = Field(min_length=1)
+
+    @model_validator(mode="after")
+    def validate_source_range(self) -> "VisualPlanPlanningScope":
+        if self.source_end_char <= self.source_start_char:
+            raise ValueError("planning source range must be positive")
+        if self.is_partial and self.continuation_boundary_char is None:
+            raise ValueError("partial planning scope requires a continuation boundary")
+        if (
+            self.continuation_boundary_char is not None
+            and not self.source_start_char
+            <= self.continuation_boundary_char
+            <= self.source_end_char
+        ):
+            raise ValueError("continuation boundary must be inside the source range")
+        return self
+
+
 class VisualPlan(_VisualModel):
     """Whole-story semantic visual plan; it intentionally contains no prompts."""
 
     story_summary: str = Field(min_length=1)
     visual_strategy: str = Field(min_length=1)
+    planning_scope: VisualPlanPlanningScope | None = None
     characters: list[CharacterDefinition]
     locations: list[LocationDefinition]
     important_objects: list[ImportantObjectDefinition]
     recurring_environments: list[RecurringEnvironment]
     possible_master_scenes: list[MasterScene]
     visual_beats: list[VisualBeat] = Field(min_length=1)
+
+    @property
+    def is_partial(self) -> bool:
+        return bool(self.planning_scope and self.planning_scope.is_partial)
 
     @model_validator(mode="after")
     def validate_references(self) -> "VisualPlan":
@@ -293,12 +369,16 @@ class VisualPlan(_VisualModel):
         )
         master_scene_ids = _unique_ids(self.possible_master_scenes, "master scene")
         beat_ids = _unique_ids(self.visual_beats, "visual beat")
-        recurring_location_ids = {
-            environment.location_id for environment in self.recurring_environments
-        }
-        mastered_location_ids = {
-            master.location_id for master in self.possible_master_scenes
-        }
+        recurring_environments_by_location: dict[str, set[str]] = {}
+        for environment in self.recurring_environments:
+            recurring_environments_by_location.setdefault(
+                environment.location_id, set()
+            ).add(environment.id)
+        master_scenes_by_location: dict[str, set[str]] = {}
+        for master in self.possible_master_scenes:
+            master_scenes_by_location.setdefault(master.location_id, set()).add(
+                master.id
+            )
 
         for environment in self.recurring_environments:
             _require_known(
@@ -366,12 +446,22 @@ class VisualPlan(_VisualModel):
                 owner_id=beat.id,
                 field="important_objects",
             )
+            recurring_environment_ids = recurring_environments_by_location.get(
+                beat.location_id, set()
+            )
+            allowed_master_scene_ids = master_scenes_by_location.get(
+                beat.location_id, set()
+            )
             if (
-                beat.location_id in recurring_location_ids & mastered_location_ids
-                and beat.master_scene_id is None
+                recurring_environment_ids
+                and allowed_master_scene_ids
+                and beat.master_scene_id not in allowed_master_scene_ids
             ):
-                raise ValueError(
-                    "beats in a mastered recurring environment require master_scene_id"
+                raise VisualPlanMasterSceneAssignmentError(
+                    beat_id=beat.id,
+                    recurring_environment_ids=recurring_environment_ids,
+                    provided_master_scene_id=beat.master_scene_id,
+                    allowed_master_scene_ids=allowed_master_scene_ids,
                 )
             if beat.source_visual_id is not None:
                 valid_sources = master_scene_ids | previous_beat_ids

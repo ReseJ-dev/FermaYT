@@ -194,9 +194,9 @@ def test_generates_only_referenced_masters_and_persists_metadata(
     assert asset.model == "qwen-image-3.0"
     assert asset.seed is None
     assert asset.reference_hashes == []
-    assert "Stable geometry:" in asset.generation_prompt
-    assert "Overall color palette:" in asset.generation_prompt
-    assert "STYLE CONTRACT [rough_explainer_v1]" in asset.generation_prompt
+    assert "Preserve this stable geometry" in asset.generation_prompt
+    assert "Use these colors" in asset.generation_prompt
+    assert "Use this permanent drawing style" in asset.generation_prompt
     assert len(calls) == 1
     assert [item.master_scene_id for item in list_master_scene_assets(session, project.id)] == [
         "shaft_master"
@@ -346,7 +346,7 @@ def test_master_generation_accepts_negative_project_style_and_calls_provider(
 
     assert len(assets) == 1
     assert len(client.prompts) == 1
-    assert client.prompts[0].count("STYLE CONTRACT [rough_explainer_v1]") == 1
+    assert client.prompts[0].count("Use this permanent drawing style") == 1
 
 
 @pytest.mark.parametrize(
@@ -630,8 +630,8 @@ def test_text_only_provider_receives_structured_master_description(
     )
 
     assert request.reference_image_paths == ()
-    assert "IMMUTABLE MASTER SCENE CONTINUITY" in request.prompt
-    assert "environment_geometry:" in request.prompt
+    assert "Preserve the recognizable recurring environment" in request.prompt
+    assert "Keep this geometry" in request.prompt
     assert "Miners look toward the damaged ladder" in request.prompt
 
 
@@ -666,7 +666,7 @@ def test_reference_provider_receives_verified_master_image(
     assert request.reference_hashes == (asset.file_sha256,)
     assert request.master_scene_id == "shaft_master"
     assert "IMMUTABLE MASTER SCENE CONTINUITY" not in request.prompt
-    assert "STYLE CONTRACT [rough_explainer_v1]" in request.prompt
+    assert "Use this permanent drawing style" in request.prompt
 
 
 def test_continuity_executor_passes_references_to_capable_client(
@@ -715,7 +715,7 @@ def test_continuity_executor_passes_references_to_capable_client(
     assert client.received[0].startswith(
         "Create one illustration containing absolutely no visible text"
     )
-    assert "STYLE CONTRACT [rough_explainer_v1]" in client.received[0]
+    assert "Use this permanent drawing style" in client.received[0]
     assert tuple(reference.file_path for reference in client.received[1]) == (
         "master.png",
     )
@@ -903,10 +903,11 @@ def test_continuity_generation_feeds_qa_correction_into_retry(
 
     assert outcome.attempts == 2
     assert len(client.prompts) == 2
-    assert "VISUAL QA CORRECTION FOR REGENERATION" in client.prompts[1]
+    assert "Regenerate the illustration so that" in client.prompts[1]
+    assert "VISUAL QA CORRECTION" not in client.prompts[1]
     assert "Crop closer to the broken ladder" in client.prompts[1]
     assert "avoid photorealism" in client.prompts[1]
-    assert client.prompts[1].count("STYLE CONTRACT [rough_explainer_v1]") == 1
+    assert client.prompts[1].count("Use this permanent drawing style") == 1
 
 
 def test_master_generation_is_qa_checked_and_keeps_correction_provenance(
@@ -957,7 +958,7 @@ def test_master_generation_is_qa_checked_and_keeps_correction_provenance(
 
     assert qa.calls == 2
     assert len(generation_calls) == 2
-    assert "VISUAL QA CORRECTION FOR REGENERATION" in asset.generation_prompt
+    assert "Regenerate the illustration so that" in asset.generation_prompt
     assert "Remove rock texture and simplify the walls" in asset.generation_prompt
 
     unused_qa = QA()
@@ -997,15 +998,34 @@ def test_image_prompt_builder_uses_semantics_and_never_narration() -> None:
     assert "UNIQUE NARRATION MUST NEVER REACH IMAGE API" not in prompt
     assert "Use the same recurring environment" in prompt
     assert "Vertical shaft, surface above, side tunnel below" in prompt
-    assert "Ladder: Main escape ladder" in prompt
-    assert "VISUAL FOCUS:" in prompt
-    assert "First notice: The blocked vertical escape route" in prompt
-    assert "DO NOT SHOW:\ninjured people; a different mine layout" in prompt
+    assert "Ladder appears as Main escape ladder" in prompt
+    assert "Guide attention to the story-critical action." in prompt
+    assert "Make The blocked vertical escape route the first noticeable element" in prompt
+    assert "Exclude these story mistakes. injured people; a different mine layout" in prompt
     assert "clearly advances the story" in prompt
     assert "only decorates the narration" in prompt
     assert prompt.rstrip().endswith(
-        "This contract overrides any conflicting style instruction elsewhere in the request."
+        "These permanent drawing rules override any conflicting style request."
     )
+
+
+def test_provider_prompt_contains_no_raw_planner_or_debug_labels() -> None:
+    prompt = ImagePromptBuilder().build(
+        _plan(),
+        _plan().visual_beats[0],
+        VisualOperation.NEW_IMAGE,
+    )
+
+    for forbidden in (
+        "Purpose:",
+        "State:",
+        "Change:",
+        "Visual Operation:",
+        "Reference:",
+        "STYLE CONTRACT",
+        "VISUAL QA CORRECTION",
+    ):
+        assert forbidden.casefold() not in prompt.casefold()
 
 
 def test_image_prompt_sections_have_concise_semantic_order() -> None:
@@ -1015,14 +1035,14 @@ def test_image_prompt_sections_have_concise_semantic_order() -> None:
         VisualOperation.NEW_IMAGE,
     )
     headings = [
-        "LOCATION CONTINUITY:",
-        "CHARACTER CONTINUITY:",
-        "OBJECT CONTINUITY:",
-        "CURRENT CAMERA / COMPOSITION:",
-        "CURRENT PHYSICAL STATE:",
-        "WHAT CHANGED:",
-        "SIMPLIFICATION RULE:",
-        "STYLE CONTRACT [rough_explainer_v1]",
+        "Draw the recurring setting with this stable layout.",
+        "Show these people with their established roles and appearance.",
+        "Include these story objects in their established positions.",
+        "Frame the scene this way.",
+        "Depict this physical situation.",
+        "Make this new physical change clearly visible.",
+        "Keep the image visually simple and immediately readable.",
+        "Use this permanent drawing style",
     ]
 
     positions = [prompt.index(heading) for heading in headings]
@@ -1108,14 +1128,13 @@ def test_prompt_builder_compacts_verbose_visual_plan_without_failing() -> None:
         beat,
         VisualOperation.NEW_IMAGE,
     )
-    semantic_prompt = prompt.split("\n\nSTYLE CONTRACT [", 1)[0]
+    semantic_prompt = prompt.split("\n\nUse this permanent drawing style", 1)[0]
 
     assert len(semantic_prompt) <= 900
-    assert "CURRENT PHYSICAL STATE:" in semantic_prompt
-    assert "VISUAL FOCUS:" in semantic_prompt
+    assert "Depict this physical situation." in semantic_prompt
+    assert "Guide attention to the story-critical action." in semantic_prompt
     assert "opening-state-anchor" in semantic_prompt
-    assert "closing-state-anchor" in semantic_prompt
-    assert "STYLE CONTRACT [rough_explainer_v1]" in prompt
+    assert "Use this permanent drawing style" in prompt
 
 
 def test_prompt_builder_validates_full_style_intent_before_compaction() -> None:
@@ -1149,8 +1168,8 @@ def test_prompt_builder_does_not_rescan_compacted_negative_style_section() -> No
         project_style_prompt=project_style,
     )
 
-    assert "PROJECT STYLE DIRECTION:" in prompt
-    assert "STYLE CONTRACT [rough_explainer_v1]" in prompt
+    assert "Follow this project drawing direction." in prompt
+    assert "Use this permanent drawing style" in prompt
 
 
 def test_structured_continuity_request_does_not_need_manual_beat_prompt(
@@ -1180,6 +1199,6 @@ def test_structured_continuity_request_does_not_need_manual_beat_prompt(
     )
 
     assert plan.visual_beats[0].narration_segment not in request.prompt
-    assert "LOCATION CONTINUITY:" in request.prompt
-    assert "CURRENT PHYSICAL STATE:" in request.prompt
-    assert request.prompt.count("STYLE CONTRACT [rough_explainer_v1]") == 1
+    assert "Draw the recurring setting with this stable layout." in request.prompt
+    assert "Depict this physical situation." in request.prompt
+    assert request.prompt.count("Use this permanent drawing style") == 1

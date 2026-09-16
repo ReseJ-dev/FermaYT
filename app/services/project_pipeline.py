@@ -24,7 +24,7 @@ from app.costs import (
     summarize_project_cost,
     usage_revision,
 )
-from app.generation_scope import GenerationScope, GenerationScopeType
+from app.generation_scope import GenerationScope, GenerationScopeType, PlanningScope
 from app.generators.master_scene import generate_required_master_scenes
 from app.models.render import ProjectRenderConfig
 from app.persistence import ProviderUsageRecord
@@ -37,10 +37,12 @@ from app.providers import (
 )
 from app.repositories import (
     get_project,
+    get_project_visual_plan_record,
     get_style_reference_asset,
     list_beat_visual_results,
     list_master_scene_assets,
     list_project_video_renders,
+    set_active_project_visual_plan,
 )
 from app.services.narration import generate_project_narration
 from app.services.narration_alignment import align_project_visual_beats
@@ -52,6 +54,7 @@ from app.services.visual_asset_execution import (
 )
 from app.services.visual_operations import resolve_project_visual_operations
 from app.services.visual_planning import (
+    VISUAL_DIRECTOR_VERSION,
     create_project_visual_plan,
     hash_story_text,
     load_project_visual_plan_state,
@@ -178,12 +181,36 @@ async def run_project_video_pipeline(
     budget_override: bool = False,
     production_profile: ProductionProfile | str = ProductionProfile.FINAL,
     generation_scope: GenerationScope | None = None,
+    planning_run_id: str | None = None,
+    allow_planning_retry_after_uncertain: bool = False,
+    cancellation_requested: Callable[[], bool] | None = None,
 ) -> ProjectPipelineReport | ProjectStylePreviewReport:
     """Run every required current stage, reusing valid persisted revisions."""
     cost_run_id = job_id or f"direct-{uuid4()}"
     profile = ProductionProfile(production_profile)
     scope = generation_scope or GenerationScope.full()
-    emit = progress or _ignore_progress
+    progress_callback = progress or _ignore_progress
+
+    async def emit(
+        stage: ProjectPipelineStage,
+        overall: int,
+        stage_progress: int,
+        message: str,
+        current_beat: int | None,
+        total_beats: int | None,
+        failed_beat: str | None,
+    ) -> None:
+        if cancellation_requested is not None and cancellation_requested():
+            raise asyncio.CancelledError
+        await progress_callback(
+            stage,
+            overall,
+            stage_progress,
+            message,
+            current_beat,
+            total_beats,
+            failed_beat,
+        )
     await emit(
         ProjectPipelineStage.VALIDATING, 2, 0, "Проверка проекта", None, None, None
     )
@@ -210,8 +237,19 @@ async def run_project_video_pipeline(
         ProjectPipelineStage.VALIDATING, 5, 100, "Проект готов", None, None, None
     )
 
-    existing_plan = load_project_visual_plan_state(session, project_id)
-    plan_reused = existing_plan is not None and existing_plan.is_current
+    planning_scope = PlanningScope.derive(project.story_text, scope)
+    existing_plan = load_project_visual_plan_state(
+        session, project_id, scope_key=planning_scope.scope_key
+    )
+    plan_record = get_project_visual_plan_record(
+        session, project_id, scope_key=planning_scope.scope_key
+    )
+    plan_reused = (
+        existing_plan is not None
+        and existing_plan.is_current
+        and plan_record is not None
+        and plan_record.visual_director_version == VISUAL_DIRECTOR_VERSION
+    )
     await emit(
         ProjectPipelineStage.PLANNING,
         8,
@@ -223,6 +261,8 @@ async def run_project_video_pipeline(
     )
     if plan_reused:
         plan = existing_plan.plan
+        assert plan_record is not None
+        set_active_project_visual_plan(session, project_id, plan_record.id)
         record_provider_usage(
             session,
             project_id=project_id,
@@ -245,6 +285,10 @@ async def run_project_video_pipeline(
             dependencies.planning_client,
             job_id=cost_run_id,
             budget_guard=budget_guard,
+            planning_run_id=planning_run_id,
+            allow_after_uncertain=allow_planning_retry_after_uncertain,
+            cancellation_requested=cancellation_requested,
+            planning_scope=planning_scope,
         )
     semantic_total_beats = len(plan.visual_beats)
     selected_beat_ids = scope.select_beat_ids(plan)
@@ -546,9 +590,9 @@ async def run_project_video_pipeline(
 
     render_config = ProjectRenderConfig(
         version=(
-            "draft_render_config_v1"
+            "draft_render_config_v2"
             if profile is ProductionProfile.DRAFT
-            else "project_render_config_v1"
+            else "project_render_config_v2"
         ),
         width=(
             project.draft_width if profile is ProductionProfile.DRAFT else project.width

@@ -17,7 +17,12 @@ from app.database import (
     create_sqlite_engine,
     init_database,
 )
-from app.errors import StaleProjectVisualPlanError, VisualDirectorError
+from app.errors import (
+    StaleProjectVisualPlanError,
+    StructuredAIProviderError,
+    VisualDirectorError,
+)
+from app.generation_scope import GenerationScope, GenerationScopeType, PlanningScope
 from app.pipeline.visual_operation_engine import VisualDecisionEvidence
 from app.provider_capabilities import ImageProviderCapabilities
 from app.repositories import (
@@ -90,6 +95,23 @@ class SequencedPlanningClient:
         self.calls += 1
         self.prompts.append(prompt)
         return self.responses[self.calls - 1]
+
+
+class PreflightPlanningClient(FakePlanningClient):
+    def __init__(
+        self,
+        response: str,
+        *,
+        preflight_failure: Exception | None = None,
+    ) -> None:
+        super().__init__(response)
+        self.preflight_calls = 0
+        self.preflight_failure = preflight_failure
+
+    async def preflight(self) -> None:
+        self.preflight_calls += 1
+        if self.preflight_failure is not None:
+            raise self.preflight_failure
 
 
 def _valid_plan_payload() -> dict[str, Any]:
@@ -237,6 +259,122 @@ def test_project_story_creates_and_persists_validated_visual_plan(
     assert all(item.project_id == project.id for item in caplog.records)
 
 
+def test_long_story_partial_plan_sends_bounded_excerpt_and_is_stored_separately(
+    session: Session,
+) -> None:
+    story = " ".join(
+        f"word{index}{'.' if (index + 1) % 20 == 0 else ''}"
+        for index in range(1441)
+    )
+    project = _create_project(session)
+    project = update_project(session, project.id, story_text=story)
+    assert project is not None
+    payload = _valid_plan_payload()
+    base = payload["visual_beats"][0]
+    payload["visual_beats"] = [
+        {
+            **deepcopy(base),
+            "id": f"beat_{index}",
+            "narration_segment": f"word{(index - 1) * 20} through word{index * 20 - 1}",
+        }
+        for index in range(1, 7)
+    ]
+
+    class ScopedClient(FakePlanningClient):
+        provider = "kimi"
+        model = "kimi-k2.6"
+        max_output_tokens = 32768
+        configured_max_output_tokens = 32768
+
+    client = ScopedClient(json.dumps(payload))
+    scope = PlanningScope.derive(
+        story,
+        GenerationScope(GenerationScopeType.FIRST_SECONDS, 30),
+    )
+    plan = asyncio.run(
+        create_project_visual_plan(
+            session,
+            project.id,
+            client,
+            planning_scope=scope,
+        )
+    )
+
+    assert len(client.prompts) == 1
+    assert "SCOPED NARRATION EXCERPT" in client.prompts[0]
+    assert "word1440" not in client.prompts[0]
+    assert len(scope.narration_excerpt.split()) == 120
+    assert plan.planning_scope is not None
+    assert plan.planning_scope.is_partial is True
+    assert plan.planning_scope.source_end_char == scope.source_end_char
+    partial_record = get_project_visual_plan_record(
+        session, project.id, scope_key=scope.scope_key
+    )
+    assert partial_record is not None
+    assert partial_record.is_partial is True
+    assert partial_record.planning_max_output_tokens == 9000
+    assert get_project_visual_plan_record(
+        session, project.id, scope_key="FULL"
+    ) is None
+
+
+def test_successful_preflight_runs_before_full_visual_planning(
+    session: Session,
+) -> None:
+    project = _create_project(session)
+    client = PreflightPlanningClient(json.dumps(_valid_plan_payload()))
+
+    plan = asyncio.run(
+        create_project_visual_plan(
+            session,
+            project.id,
+            client,
+            job_id="preflight-success-job",
+        )
+    )
+
+    assert client.preflight_calls == 1
+    assert client.calls == 1
+    assert len(plan.visual_beats) == 1
+    records = session.execute(
+        text(
+            "SELECT status FROM provider_usage_records "
+            "WHERE job_id = 'preflight-success-job' ORDER BY created_at"
+        )
+    ).scalars().all()
+    assert records == ["SUCCEEDED", "SUCCEEDED"]
+
+
+def test_failed_preflight_blocks_full_visual_planning(
+    session: Session,
+) -> None:
+    project = _create_project(session)
+    client = PreflightPlanningClient(
+        json.dumps(_valid_plan_payload()),
+        preflight_failure=StructuredAIProviderError("no balance"),
+    )
+
+    with pytest.raises(StructuredAIProviderError, match="no balance"):
+        asyncio.run(
+            create_project_visual_plan(
+                session,
+                project.id,
+                client,
+                job_id="preflight-failure-job",
+            )
+        )
+
+    assert client.preflight_calls == 1
+    assert client.calls == 0
+    status = session.execute(
+        text(
+            "SELECT status FROM provider_usage_records "
+            "WHERE job_id = 'preflight-failure-job'"
+        )
+    ).scalar_one()
+    assert status == "FAILED"
+
+
 def test_production_unknown_geography_reference_is_repaired_and_persisted(
     session: Session,
     caplog: pytest.LogCaptureFixture,
@@ -275,7 +413,7 @@ def test_production_unknown_geography_reference_is_repaired_and_persisted(
     ] == "main_tunnel_wide"
     usage_units = session.execute(
         text(
-            "SELECT input_units FROM provider_usage_records "
+            "SELECT SUM(input_units) FROM provider_usage_records "
             "WHERE job_id = 'geography-repair-job'"
         )
     ).scalar_one()
@@ -325,7 +463,7 @@ def test_failed_reference_repairs_keep_last_valid_persisted_plan(
         [invalid_response, invalid_response, invalid_response]
     )
 
-    with pytest.raises(VisualDirectorError, match="after 2 repair attempt"):
+    with pytest.raises(VisualDirectorError, match="after 1 repair attempt"):
         asyncio.run(create_project_visual_plan(session, project.id, client))
 
     session.expire_all()
@@ -333,7 +471,7 @@ def test_failed_reference_repairs_keep_last_valid_persisted_plan(
     assert after is not None
     assert after.id == original_id
     assert after.plan_json == original_json
-    assert client.calls == 3
+    assert client.calls == 2
 
 
 def test_story_change_marks_plan_stale_without_deleting_it(

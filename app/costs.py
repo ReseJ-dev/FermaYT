@@ -31,6 +31,10 @@ class PricingUnit(str, Enum):
     PER_IMAGE = "PER_IMAGE"
     PER_CHARACTER = "PER_CHARACTER"
     PER_REQUEST = "PER_REQUEST"
+    PER_TOKEN = "PER_TOKEN"
+    PER_INPUT_TOKEN = "PER_INPUT_TOKEN"
+    PER_OUTPUT_TOKEN = "PER_OUTPUT_TOKEN"
+    PER_REASONING_TOKEN = "PER_REASONING_TOKEN"
 
 
 class UsageStatus(str, Enum):
@@ -206,6 +210,7 @@ def record_provider_usage(
     beat_id: str | None = None,
     master_scene_id: str | None = None,
     actual_cost: float | None = None,
+    cost_certainty: CostCertainty | str | None = None,
     is_qa_retry: bool = False,
 ) -> ProviderUsageRecord:
     """Append one idempotent ledger entry and snapshot the effective price version."""
@@ -237,7 +242,9 @@ def record_provider_usage(
         if is_free
         else (round(float(pricing.price) * units, 8) if pricing is not None else None)
     )
-    if is_free:
+    if cost_certainty is not None:
+        certainty = CostCertainty(cost_certainty)
+    elif is_free:
         actual_cost = 0.0
         certainty = CostCertainty.ACTUAL
     elif normalized_status is UsageStatus.FAILED or pricing is None:
@@ -416,7 +423,10 @@ def estimate_project_generation_cost(
     execution = session.scalar(
         execution_query.order_by(ProjectVisualExecutionPlan.created_at.desc()).limit(1)
     )
-    if execution is None or project.visual_plan is None:
+    from app.repositories import get_project_visual_plan_record
+
+    visual_plan = get_project_visual_plan_record(session, project_id)
+    if execution is None or visual_plan is None:
         return CostEstimate(
             minimum=None,
             maximum=None,
@@ -455,7 +465,7 @@ def estimate_project_generation_cost(
             )
         )
     )
-    beats = project.visual_plan.plan_json.get("visual_beats", [])
+    beats = visual_plan.plan_json.get("visual_beats", [])
     required_masters = {
         beat.get("master_scene_id")
         for beat in beats

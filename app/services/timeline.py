@@ -12,6 +12,7 @@ from typing import Any
 
 from sqlalchemy.orm import Session
 
+from app.asset_roles import RENDERABLE_VISUAL_ASSET_ROLES
 from app.errors import ProjectVisualPlanError
 from app.generation_scope import GenerationScope
 from app.models.timeline import NormalizedOverlay, NormalizedTransform
@@ -34,7 +35,8 @@ from app.services.visual_planning import (
     require_current_project_visual_plan,
 )
 
-TIMELINE_RHYTHM_VERSION = "timeline_rhythm_v1"
+TIMELINE_RHYTHM_VERSION = "timeline_rhythm_v2"
+MAX_STATIC_VISUAL_SECONDS = 12.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -109,6 +111,7 @@ def build_project_timeline(
         )
     for beat in selected_beats:
         result = accepted[beat.id]
+        _require_renderable_result(result, beat.id)
         if result.output_path is None or result.file_sha256 is None:
             raise ValueError(f"Accepted visual metadata is incomplete for beat {beat.id}")
         if not _file_matches_sha256(result.output_path, result.file_sha256):
@@ -155,6 +158,18 @@ def build_project_timeline(
         raw_intervals,
         timeline_duration,
     )
+    long_static = [
+        beat.id
+        for beat, interval in zip(selected_beats, intervals, strict=True)
+        if interval[1] - interval[0] > MAX_STATIC_VISUAL_SECONDS
+        and accepted[beat.id].transform_metadata is None
+        and accepted[beat.id].overlay_metadata is None
+    ]
+    if long_static:
+        raise ValueError(
+            "Visual pacing guard: unchanged static visual exceeds 12 seconds for "
+            + ", ".join(long_static)
+        )
     entries: list[dict[str, Any]] = []
     for position, (beat, interval) in enumerate(
         zip(selected_beats, intervals, strict=True)
@@ -346,6 +361,26 @@ def timeline_is_current(session: Session, timeline: ProjectTimeline) -> bool:
         )
         for entry in timeline.entries
     )
+
+
+def _require_renderable_result(result: BeatVisualResult, beat_id: str) -> None:
+    if result.asset_role not in RENDERABLE_VISUAL_ASSET_ROLES:
+        raise ValueError(
+            f"Timeline beat {beat_id} uses non-renderable asset role "
+            f"{result.asset_role}"
+        )
+    if result.generation_status != "SUCCEEDED" or not result.is_accepted:
+        raise ValueError(f"Timeline beat {beat_id} has no accepted successful visual")
+    if (
+        result.resolved_operation
+        in {"NEW_IMAGE", "REFERENCE_GENERATION", "EDIT_EXISTING"}
+        and result.production_profile != "DRAFT"
+        and (
+            result.qa_status not in {"PASS", "PASS_WITH_WARNING"}
+            or result.qa_warning is not None
+        )
+    ):
+        raise ValueError(f"Timeline beat {beat_id} generated visual did not pass QA")
 
 
 def format_timeline_debug(timeline: ProjectTimeline) -> str:

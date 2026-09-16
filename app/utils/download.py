@@ -5,7 +5,6 @@ from pathlib import Path
 
 import httpx
 
-
 DOWNLOAD_TIMEOUT_SECONDS = 30.0
 
 

@@ -12,6 +12,9 @@ class VisualQAResult(str, Enum):
 
 
 class VisualQAProblemCategory(str, Enum):
+    MISSING_REQUIRED_ENTITY = "MISSING_REQUIRED_ENTITY"
+    WRONG_ENTITY_IDENTITY = "WRONG_ENTITY_IDENTITY"
+    WRONG_ENVIRONMENT = "WRONG_ENVIRONMENT"
     MISSING_REQUIRED_OBJECT = "MISSING_REQUIRED_OBJECT"
     WRONG_PHYSICAL_STATE = "WRONG_PHYSICAL_STATE"
     WRONG_CHARACTER = "WRONG_CHARACTER"
@@ -26,6 +29,7 @@ class VisualQAProblemCategory(str, Enum):
     IMPORTANT_ACTION_TOO_SMALL = "IMPORTANT_ACTION_TOO_SMALL"
     EXCESSIVE_CLUTTER = "EXCESSIVE_CLUTTER"
     UNWANTED_TEXT = "UNWANTED_TEXT"
+    UNINTENDED_TEXT = "UNINTENDED_TEXT"
     WRONG_CAMERA = "WRONG_CAMERA"
     REFERENCE_NOT_RESPECTED = "REFERENCE_NOT_RESPECTED"
     OTHER = "OTHER"
@@ -97,6 +101,9 @@ class VisualQADecision(BaseModel):
             if self.severity is VisualQASeverity.CRITICAL:
                 raise ValueError("critical problems cannot PASS_WITH_WARNING")
             hard_categories = {
+                VisualQAProblemCategory.MISSING_REQUIRED_ENTITY,
+                VisualQAProblemCategory.WRONG_ENTITY_IDENTITY,
+                VisualQAProblemCategory.WRONG_ENVIRONMENT,
                 VisualQAProblemCategory.MISSING_REQUIRED_OBJECT,
                 VisualQAProblemCategory.WRONG_PHYSICAL_STATE,
                 VisualQAProblemCategory.WRONG_CHARACTER,
@@ -104,9 +111,12 @@ class VisualQADecision(BaseModel):
                 VisualQAProblemCategory.STORY_ACCURACY,
                 VisualQAProblemCategory.CONTINUITY,
                 VisualQAProblemCategory.STYLE_DRIFT_REALISM,
+                VisualQAProblemCategory.STYLE_DRIFT,
                 VisualQAProblemCategory.EDIT_CHANGED_TOO_MUCH,
                 VisualQAProblemCategory.COMPOSITION_UNCLEAR,
                 VisualQAProblemCategory.VIDEO_READABILITY,
+                VisualQAProblemCategory.UNWANTED_TEXT,
+                VisualQAProblemCategory.UNINTENDED_TEXT,
             }
             if set(self.problem_categories) & hard_categories:
                 raise ValueError("hard failures cannot PASS_WITH_WARNING")

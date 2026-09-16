@@ -114,6 +114,7 @@ def test_structured_provider_fails_safely(
     [
         (400, "PLANNING_BAD_REQUEST"),
         (401, "PLANNING_AUTH_ERROR"),
+        (402, "PLANNING_PAYMENT_REQUIRED"),
         (403, "PLANNING_AUTH_ERROR"),
         (404, "PLANNING_NOT_FOUND"),
         (429, "PLANNING_RATE_LIMIT"),
@@ -185,7 +186,7 @@ def test_planning_timeout_records_duration(monkeypatch: pytest.MonkeyPatch) -> N
     assert diagnostic.retry_exhausted is True
 
 
-def test_planning_retries_transient_http_failure(
+def test_planning_does_not_retry_transient_http_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     async_client = httpx.AsyncClient
@@ -194,33 +195,20 @@ def test_planning_retries_transient_http_failure(
     async def handler(request: httpx.Request) -> httpx.Response:
         nonlocal calls
         calls += 1
-        if calls < 3:
-            return httpx.Response(429, request=request, json={"message": "busy"})
-        return httpx.Response(
-            200,
-            request=request,
-            json={
-                "choices": [
-                    {
-                        "finish_reason": "stop",
-                        "message": {"content": '{"visual_beats":[]}'},
-                    }
-                ]
-            },
-        )
+        return httpx.Response(429, request=request, json={"message": "busy"})
 
     monkeypatch.setattr(
         httpx,
         "AsyncClient",
         lambda **kwargs: async_client(transport=httpx.MockTransport(handler), **kwargs),
     )
-    result = asyncio.run(
-        DashScopeVisualPlanningClient(
-            api_key="key", max_attempts=3, retry_base_delay=0
-        ).generate("story")
-    )
-    assert result == '{"visual_beats":[]}'
-    assert calls == 3
+    with pytest.raises(StructuredAIProviderError):
+        asyncio.run(
+            DashScopeVisualPlanningClient(
+                api_key="key", max_attempts=3, retry_base_delay=0
+            ).generate("story")
+        )
+    assert calls == 1
 
 
 def test_planning_does_not_retry_auth_failure(

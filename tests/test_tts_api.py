@@ -10,7 +10,6 @@ import pytest
 from app.clients.tts_api import QwenTTSApiClient, TTSApiClient
 from app.errors import TTSGenerationError
 
-
 ResponseHandler = Callable[[httpx.Request], httpx.Response]
 
 

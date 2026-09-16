@@ -18,7 +18,7 @@ class RenderTransition(str, Enum):
 class ProjectRenderConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    version: str = "project_render_config_v1"
+    version: str = "project_render_config_v2"
     width: int = Field(default=1920, gt=0)
     height: int = Field(default=1080, gt=0)
     fps: int = Field(default=30, gt=0, le=120)
@@ -30,6 +30,12 @@ class ProjectRenderConfig(BaseModel):
     default_transition: RenderTransition = RenderTransition.CUT
     output_container: str = "mp4"
     max_motion_scale: float = Field(default=1.15, ge=1.0, le=1.5)
+    video_crf: int = Field(default=20, ge=0, le=51)
+    video_preset: str = Field(default="medium", min_length=1)
+    audio_loudness_lufs: float = Field(default=-15.0, ge=-24.0, le=-10.0)
+    audio_true_peak_db: float = Field(default=-1.0, ge=-3.0, le=-0.1)
+    audio_loudness_range: float = Field(default=11.0, ge=1.0, le=20.0)
+    audio_bitrate: str = Field(default="192k", min_length=1)
 
     @field_validator("width", "height")
     @classmethod

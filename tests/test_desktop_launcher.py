@@ -2,8 +2,8 @@
 
 import os
 import subprocess
+import sys
 from pathlib import Path
-
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -66,6 +66,37 @@ def test_python_entrypoint_owns_and_cleans_up_pid_file(
     run.main()
 
     assert observed_pid == str(os.getpid())
+    assert not pid_file.exists()
+
+
+def test_cli_exit_does_not_wait_for_abandoned_worker_thread(tmp_path: Path) -> None:
+    pid_file = tmp_path / "fermayt.pid"
+    source = f"""
+import threading
+import time
+import run
+
+run.DATA_DIR = run.Path({str(tmp_path)!r})
+run.PID_FILE = run.Path({str(pid_file)!r})
+
+def fake_uvicorn_run(*args, **kwargs):
+    del args, kwargs
+    threading.Thread(target=time.sleep, args=(30,)).start()
+
+run.uvicorn.run = fake_uvicorn_run
+run.cli_main()
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", source],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
     assert not pid_file.exists()
 
 

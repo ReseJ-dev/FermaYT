@@ -14,6 +14,7 @@ import pytest
 from sqlalchemy.orm import Session
 
 import app.services.project_render as render_service
+from app.asset_roles import VisualAssetRole
 from app.database import create_session_factory, create_sqlite_engine, init_database
 from app.errors import ProjectTimelineRenderError, StaleProjectVisualPlanError
 from app.media.probe import probe_media
@@ -26,6 +27,7 @@ from app.models.timeline import (
     TimestampSource,
 )
 from app.models.visual_plan import VisualPlan
+from app.persistence import BeatVisualResult
 from app.repositories import (
     create_beat_visual_result,
     create_project,
@@ -625,6 +627,77 @@ def test_complete_eight_beat_timeline_is_gap_free_and_executable(
     assert report.operation_counts["EDIT_EXISTING"] == 3
 
 
+@pytest.mark.parametrize(
+    "asset_role",
+    [
+        VisualAssetRole.DEBUG.value,
+        VisualAssetRole.OPERATION_REFERENCE.value,
+        VisualAssetRole.STYLE_REFERENCE.value,
+        VisualAssetRole.MASTER_ONLY.value,
+    ],
+)
+def test_non_renderable_asset_role_cannot_enter_project_timeline(
+    session: Session,
+    tmp_path: Path,
+    asset_role: str,
+) -> None:
+    project, execution, results = _setup_graph(session, tmp_path)
+    results[-1].asset_role = asset_role
+    session.commit()
+    narration = asyncio.run(
+        generate_project_narration(
+            session,
+            project.id,
+            provider_resolver=_resolver_with_calls([]),
+            duration_probe=lambda path: 32.0,
+            projects_root=tmp_path / "projects",
+        )
+    )
+
+    with pytest.raises(ValueError, match=f"non-renderable asset role {asset_role}"):
+        build_project_timeline(session, project.id, execution.id, narration.id)
+
+
+def test_timeline_fails_when_final_narration_has_no_valid_visual(
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    project, execution, results = _setup_graph(session, tmp_path)
+    results[-1].is_accepted = False
+    session.commit()
+    narration = asyncio.run(
+        generate_project_narration(
+            session,
+            project.id,
+            provider_resolver=_resolver_with_calls([]),
+            duration_probe=lambda path: 32.0,
+            projects_root=tmp_path / "projects",
+        )
+    )
+
+    with pytest.raises(ValueError, match="accepted visual assets.*beat_8"):
+        build_project_timeline(session, project.id, execution.id, narration.id)
+
+
+def test_long_unchanged_static_visual_triggers_pacing_guard(
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    project, execution, _ = _setup_graph(session, tmp_path)
+    narration = asyncio.run(
+        generate_project_narration(
+            session,
+            project.id,
+            provider_resolver=_resolver_with_calls([]),
+            duration_probe=lambda path: 120.0,
+            projects_root=tmp_path / "projects",
+        )
+    )
+
+    with pytest.raises(ValueError, match="unchanged static visual exceeds 12 seconds"):
+        build_project_timeline(session, project.id, execution.id, narration.id)
+
+
 def test_new_accepted_visual_and_tts_change_make_timeline_stale(
     session: Session,
     tmp_path: Path,
@@ -861,6 +934,26 @@ def test_render_failure_is_persisted_and_preserves_previous_success(
     assert records[-1].attempt == 2
     assert Path(successful.output_path or "").is_file()
     assert project.final_video_path == successful.output_path
+
+
+def test_render_hard_fails_before_ffmpeg_for_operation_reference_asset(
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    project, timeline = _make_real_render_graph(session, tmp_path)
+    result = session.get(BeatVisualResult, timeline.entries[0].beat_visual_result_id)
+    assert result is not None
+    result.asset_role = VisualAssetRole.OPERATION_REFERENCE.value
+    session.commit()
+
+    with pytest.raises(ProjectTimelineRenderError, match="OPERATION_REFERENCE"):
+        render_project_video(
+            session,
+            project.id,
+            timeline.id,
+            config=ProjectRenderConfig(width=320, height=180, fps=10),
+            projects_root=tmp_path / "render-projects",
+        )
 
 
 def test_failed_attempt_resumes_from_valid_intermediate_clips(

@@ -13,6 +13,7 @@ from uuid import uuid4
 
 from sqlalchemy.orm import Session
 
+from app.asset_roles import RENDERABLE_VISUAL_ASSET_ROLES
 from app.errors import MediaProbeError, ProjectTimelineRenderError
 from app.media.concat import concat_scene_videos
 from app.media.probe import MediaProbeResult, probe_media
@@ -35,7 +36,7 @@ from app.repositories import (
 from app.services.timeline import timeline_is_current
 from app.storage import ProjectMediaPaths
 
-RENDERER_VERSION = "project_timeline_renderer_v1"
+RENDERER_VERSION = "project_timeline_renderer_v2"
 
 
 def render_project_video(
@@ -256,6 +257,22 @@ def _validate_render_inputs(session: Session, timeline: ProjectTimeline, config:
         result = session.get(BeatVisualResult, entry.beat_visual_result_id)
         if result is None or result.generation_status != "SUCCEEDED" or not result.is_accepted:
             raise ValueError(f"Beat {entry.beat_id} has no accepted successful visual result")
+        if result.asset_role not in RENDERABLE_VISUAL_ASSET_ROLES:
+            raise ValueError(
+                f"Beat {entry.beat_id} uses non-renderable asset role "
+                f"{result.asset_role}"
+            )
+        if result.beat_id != entry.beat_id:
+            raise ValueError(f"Timeline result does not belong to beat {entry.beat_id}")
+        if result.output_path != entry.asset_path:
+            raise ValueError(f"Timeline asset path does not match beat {entry.beat_id}")
+        if result.resolved_operation in {
+            "NEW_IMAGE", "REFERENCE_GENERATION", "EDIT_EXISTING"
+        } and result.production_profile != ProductionProfile.DRAFT.value and (
+            result.qa_status not in {"PASS", "PASS_WITH_WARNING"}
+            or result.qa_warning is not None
+        ):
+            raise ValueError(f"Beat {entry.beat_id} generated visual did not pass QA")
         _parse_transform(entry)
         _parse_overlay(entry)
         if entry.transition_metadata not in (None, {}, {"type": "CUT"}):

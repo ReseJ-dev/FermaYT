@@ -16,6 +16,7 @@ from app.pipeline.visual_qa import (
     apply_visual_qa_correction,
     build_visual_qa_request,
     generate_with_visual_qa,
+    is_hard_qa_failure,
 )
 
 
@@ -233,9 +234,9 @@ def test_retry_limit_keeps_best_candidate_and_records_warning(
             "Crop closer",
         ),
         _regenerate(
-            ["STYLE_DRIFT"],
-            "Too polished",
-            "Use rougher lines",
+            ["EXCESSIVE_CLUTTER"],
+            "Minor background clutter",
+            "Remove the unrelated background marks",
         ),
     ]
 
@@ -271,8 +272,7 @@ def test_retry_limit_keeps_best_candidate_and_records_warning(
     assert outcome.attempts == 3
     assert outcome.warning is not None
     assert "kept the best candidate" in outcome.warning
-    # A slightly rougher frame is preferable to one where the story object is too
-    # small to read. Clarity and readability outrank style polish.
+    # Minor clutter is preferable to a frame with wrong story geometry.
     assert outcome.decision == decisions[2]
     assert output.read_bytes() == b"candidate-3"
 
@@ -309,7 +309,7 @@ def test_qa_prompt_does_not_judge_as_standalone_artwork(tmp_path: Path) -> None:
 
     assert "not standalone artwork" in prompt
     assert "within a few seconds" in prompt
-    assert "CHECK UNWANTED TEXT" in prompt
+    assert "CHECK UNINTENDED TEXT" in prompt
     assert "technical label" in prompt
 
 
@@ -322,6 +322,56 @@ def test_correction_is_inserted_before_permanent_style_contract() -> None:
         "Remove realistic rock texture and crop closer to the blockage",
     )
 
-    assert "VISUAL QA CORRECTION FOR REGENERATION" in corrected
-    assert corrected.index("VISUAL QA CORRECTION") < corrected.index("STYLE CONTRACT [")
-    assert corrected.count("STYLE CONTRACT [rough_explainer_v1]") == 1
+    assert "Regenerate the illustration so that" in corrected
+    assert "VISUAL QA CORRECTION" not in corrected
+    assert corrected.index("Regenerate the illustration") < corrected.index(
+        "Use this permanent drawing style"
+    )
+    assert corrected.count("Use this permanent drawing style") == 1
+
+
+@pytest.mark.parametrize(
+    "category",
+    [
+        "UNINTENDED_TEXT",
+        "MISSING_REQUIRED_ENTITY",
+        "WRONG_ENTITY_IDENTITY",
+        "WRONG_ENVIRONMENT",
+        "WRONG_PHYSICAL_STATE",
+        "STYLE_DRIFT",
+    ],
+)
+def test_story_critical_qa_failures_are_never_accepted(category: str) -> None:
+    decision = _regenerate(
+        [category],
+        "Candidate contradicts a required story fact",
+        "Restore the required story fact",
+    )
+
+    assert is_hard_qa_failure(decision) is True
+    with pytest.raises(ValidationError, match="hard failures"):
+        VisualQADecision(
+            result="PASS_WITH_WARNING",
+            problem_categories=[category],
+            reasons=["Candidate contradicts a required story fact"],
+            severity="minor",
+        )
+
+
+def test_qa_request_requires_miner_identity_and_rejects_unintended_text(
+    tmp_path: Path,
+) -> None:
+    context = replace(
+        _context(tmp_path),
+        required_entities=("miners",),
+        required_attributes=("mining helmets", "work clothing"),
+        required_environment="underground mine tunnel",
+        required_state="rising water",
+        forbidden_major_mismatches=("generic civilians", "unclothed people"),
+    )
+
+    prompt = build_visual_qa_request(context)
+
+    assert "mining helmets" in prompt and "work clothing" in prompt
+    assert "generic civilians" in prompt and "unclothed people" in prompt
+    assert "UNINTENDED_TEXT" in prompt

@@ -137,12 +137,15 @@ document.addEventListener("DOMContentLoaded", () => {
   const generationActions = document.getElementById("generation-actions");
   const profileButtons = Array.from(document.querySelectorAll(".generate-profile"));
   const continueOverBudget = document.getElementById("continue-over-budget");
+  const retryPlanningAnyway = document.getElementById("retry-planning-anyway");
+  const cancelGeneration = document.getElementById("cancel-generation");
   const projectForm = document.getElementById("project-settings-form");
   const progressBox = document.getElementById("pipeline-progress");
   const progressBar = document.getElementById("pipeline-progress-bar");
   const progressStage = document.getElementById("pipeline-stage");
   const progressPercent = document.getElementById("pipeline-percent");
   const progressMessage = document.getElementById("pipeline-message");
+  const planningAttempts = document.getElementById("planning-attempts");
   const progressError = document.getElementById("pipeline-error");
   const costRun = document.getElementById("cost-run");
   const costEstimate = document.getElementById("cost-estimate");
@@ -156,11 +159,67 @@ document.addEventListener("DOMContentLoaded", () => {
   let pollingTimer = null;
 
   const renderJob = (job) => {
+    const planning = job.planning_progress;
+    const isPlanning = Boolean(planning?.state) && (
+      job.current_stage === "PLANNING"
+      || ["PAUSED_AFTER_TIMEOUT", "PAUSED_BUDGET", "FAILED"].includes(planning.state)
+    );
     if (progressBox) progressBox.hidden = false;
-    if (progressBar instanceof HTMLProgressElement) progressBar.value = job.progress || 0;
-    if (progressStage) progressStage.textContent = job.current_stage || job.status;
-    if (progressPercent) progressPercent.textContent = `${job.progress || 0}%`;
-    if (progressMessage) progressMessage.textContent = job.message || "";
+    if (progressBar instanceof HTMLProgressElement) {
+      progressBar.hidden = isPlanning;
+      progressBar.value = job.progress || 0;
+    }
+    if (progressPercent) {
+      progressPercent.hidden = isPlanning;
+      progressPercent.textContent = `${job.progress || 0}%`;
+    }
+    if (progressStage) progressStage.textContent = isPlanning ? "PLANNING" : (job.current_stage || job.status);
+    if (progressMessage) progressMessage.textContent = isPlanning ? "" : (job.message || "");
+    if (planningAttempts) {
+      const stateLabels = {
+        PREPARING_SCOPE: "Preparing scope",
+        ESTIMATING_COST: "Estimating cost",
+        WAITING_FOR_PROVIDER: "Waiting for provider",
+        VALIDATING_RESPONSE: "Validating response",
+        REPAIRING_PLAN: "Repairing plan",
+        PAUSED_AFTER_TIMEOUT: "Planning paused",
+        PAUSED_BUDGET: "Paused by planning budget",
+        COMPLETED: "Completed",
+        FAILED: "Failed",
+      };
+      const currency = planning?.cost?.currency || "";
+      const money = (value) => value === null || value === undefined
+        ? "—"
+        : `${Number(value).toFixed(4)}${currency ? ` ${currency}` : ""}`;
+      const duration = (seconds) => {
+        if (seconds === null || seconds === undefined) return "—";
+        const rounded = Math.max(0, Math.floor(Number(seconds)));
+        return `${String(Math.floor(rounded / 60)).padStart(2, "0")}:${String(rounded % 60).padStart(2, "0")}`;
+      };
+      const lines = [];
+      if (planning?.state) lines.push(`Status: ${stateLabels[planning.state] || planning.state}`);
+      if (planning?.scope?.label) lines.push(`Scope: ${planning.scope.label}`);
+      if (planning?.provider?.name || planning?.provider?.model) {
+        lines.push(`Provider: ${[planning.provider.name, planning.provider.model].filter(Boolean).join(" · ")}`);
+      }
+      if (planning?.request?.number) {
+        lines.push(`Paid request: ${planning.request.number} of maximum ${planning.request.maximum} · Type: ${planning.request.type}`);
+        if (planning.request.type === "REPAIR") lines.push(`Repair attempt: ${planning.request.number} / ${planning.request.maximum}`);
+        lines.push(`Elapsed: ${duration(planning.request.elapsed_seconds)}`);
+      }
+      if (planning?.tokens?.input_estimate !== null && planning?.tokens?.input_estimate !== undefined) {
+        lines.push(`Input: ~${Number(planning.tokens.input_estimate).toLocaleString()} tokens · Max output: ${Number(planning.tokens.max_output).toLocaleString()} tokens`);
+      }
+      if (planning?.cost) lines.push(`Estimated max cost: ${money(planning.cost.estimated_max)} · ${planning.cost.certainty || "UNKNOWN"}`);
+      if (planning?.repair?.reason) lines.push(`Repair reason: ${planning.repair.reason}`);
+      const budget = planning?.cost?.budget;
+      if (budget?.enabled) lines.push(`Planning budget: spent ${money(budget.spent)} · reserved unknown ${money(budget.reserved_unknown)} · remaining ${money(budget.remaining)} / ${money(budget.amount)}`);
+      if (planning?.timeout?.paused) {
+        lines.push(planning.timeout.message);
+        lines.push(`Estimated/unknown exposure: ${money(budget?.reserved_unknown ?? planning.cost.estimated_max)}`);
+      }
+      planningAttempts.textContent = lines.join("\n");
+    }
     if (progressError) {
       let failureMessage = job.budget_pause?.message || job.error || "";
       if (job.diagnostic && !job.budget_pause) {
@@ -206,6 +265,11 @@ document.addEventListener("DOMContentLoaded", () => {
       if (button instanceof HTMLButtonElement) button.disabled = ["queued", "running"].includes(job.status);
     });
     if (continueOverBudget instanceof HTMLButtonElement) continueOverBudget.hidden = job.status !== "paused_budget";
+    if (retryPlanningAnyway instanceof HTMLButtonElement) retryPlanningAnyway.hidden = job.status !== "paused_planning";
+    if (cancelGeneration instanceof HTMLButtonElement) {
+      cancelGeneration.hidden = !["queued", "running", "paused_planning"].includes(job.status);
+      cancelGeneration.textContent = job.status === "paused_planning" ? "Stop" : "Остановить локально";
+    }
   };
 
   const pollJob = async (jobId) => {
@@ -215,7 +279,7 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!response.ok) return;
       const job = await response.json();
       renderJob(job);
-      if (["completed", "failed", "paused_budget"].includes(job.status)) {
+      if (["completed", "failed", "paused_budget", "paused_planning", "cancelled"].includes(job.status)) {
         window.clearInterval(pollingTimer);
         pollingTimer = null;
         if (job.status === "completed") {
@@ -238,7 +302,7 @@ document.addEventListener("DOMContentLoaded", () => {
       pollingTimer = window.setInterval(() => pollJob(existingJob), 1500);
       pollJob(existingJob);
     }
-    const startPipeline = async (profile, scope = "FULL", scopeValue = "", overrideBudget = false) => {
+    const startPipeline = async (profile, scope = "FULL", scopeValue = "", overrideBudget = false, retryPlanning = false) => {
       profileButtons.forEach((button) => { if (button instanceof HTMLButtonElement) button.disabled = true; });
       if (progressError) progressError.textContent = "";
       const body = new URLSearchParams(new FormData(projectForm));
@@ -246,6 +310,7 @@ document.addEventListener("DOMContentLoaded", () => {
       body.set("generation_scope_type", scope);
       if (scopeValue !== "") body.set("generation_scope_value", String(scopeValue));
       if (overrideBudget) body.set("budget_override", "1");
+      if (retryPlanning) body.set("planning_retry_anyway", "1");
       const response = await fetch(`/api/projects/${generationActions.dataset.projectId}/generate-video`, {
         method: "POST",
         headers: {"Content-Type": "application/x-www-form-urlencoded"},
@@ -284,6 +349,27 @@ document.addEventListener("DOMContentLoaded", () => {
         generationActions.dataset.jobScopeValue || "",
         true,
       ));
+    }
+    if (retryPlanningAnyway instanceof HTMLButtonElement) {
+      retryPlanningAnyway.addEventListener("click", () => startPipeline(
+        generationActions.dataset.jobProfile || "FINAL",
+        generationActions.dataset.jobScope || "FULL",
+        generationActions.dataset.jobScopeValue || "",
+        false,
+        true,
+      ));
+    }
+    if (cancelGeneration instanceof HTMLButtonElement) {
+      cancelGeneration.addEventListener("click", async () => {
+        if (generationActions.dataset.jobStatus === "paused_planning") {
+          cancelGeneration.hidden = true;
+          return;
+        }
+        const jobId = generationActions.dataset.jobId;
+        if (!jobId) return;
+        const response = await fetch(`/api/jobs/${encodeURIComponent(jobId)}/cancel`, {method: "POST"});
+        if (response.ok) renderJob(await response.json());
+      });
     }
   }
 
@@ -351,6 +437,205 @@ document.addEventListener("DOMContentLoaded", () => {
           element.disabled = false;
         }
       });
+    });
+  }
+
+  const promptSheet = document.querySelector("[data-prompt-sheet]");
+  const promptDialog = document.getElementById("prompt-detail-dialog");
+  if (promptSheet instanceof HTMLElement && promptDialog instanceof HTMLDialogElement) {
+    const projectId = promptSheet.dataset.projectId || "";
+    const search = promptSheet.querySelector("[data-prompt-search]");
+    const filter = promptSheet.querySelector("[data-prompt-filter]");
+    const count = promptSheet.querySelector("[data-prompt-count]");
+    const providerSelect = promptDialog.querySelector("[data-preview-provider]");
+    const modelInput = promptDialog.querySelector("[data-preview-model]");
+    const overrideInput = promptDialog.querySelector("[data-override-input]");
+    const feedback = promptDialog.querySelector("[data-prompt-feedback]");
+    let activeTarget = null;
+    let activeDetail = null;
+
+    const setText = (selector, value) => {
+      const element = promptDialog.querySelector(selector);
+      if (element) element.textContent = value ?? "—";
+    };
+    const makeListItem = (text) => {
+      const item = document.createElement("li");
+      item.textContent = text;
+      return item;
+    };
+    const renderKeyValues = (element, values) => {
+      if (!(element instanceof HTMLElement)) return;
+      element.replaceChildren();
+      Object.entries(values || {}).forEach(([key, value]) => {
+        const term = document.createElement("dt");
+        term.textContent = key.replaceAll("_", " ");
+        const description = document.createElement("dd");
+        description.textContent = Array.isArray(value) ? (value.join(", ") || "—") : String(value ?? "—");
+        element.append(term, description);
+      });
+    };
+    const formatTransformation = (item) => {
+      const before = item.before_length;
+      const after = item.after_length;
+      const lengths = before !== undefined && after !== undefined ? ` · ${before} → ${after} chars` : "";
+      return `${item.type || "TRANSFORMATION"}${lengths}`;
+    };
+    const renderHistory = (attempts) => {
+      const container = promptDialog.querySelector("[data-detail-history]");
+      if (!(container instanceof HTMLElement)) return;
+      container.replaceChildren();
+      if (!attempts?.length) {
+        const empty = document.createElement("p");
+        empty.className = "helper-text";
+        empty.textContent = "No generation attempts yet.";
+        container.append(empty);
+        return;
+      }
+      attempts.forEach((attempt) => {
+        const snapshot = attempt.prompt_assembly || {};
+        const details = document.createElement("details");
+        details.className = "prompt-attempt";
+        const summary = document.createElement("summary");
+        summary.textContent = `Attempt ${attempt.generation_attempt} · ${snapshot.provider || "—"} / ${snapshot.model || "—"} · ${attempt.qa_status || attempt.qa_result?.result || attempt.generation_status || "—"}`;
+        const body = document.createElement("div");
+        const correction = document.createElement("p");
+        correction.textContent = `QA correction: ${snapshot.qa_correction || "—"}`;
+        const finalLabel = document.createElement("strong");
+        finalLabel.textContent = "Immutable final provider prompt";
+        const finalPrompt = document.createElement("pre");
+        finalPrompt.textContent = snapshot.final_provider_prompt || "NO PROVIDER PROMPT";
+        const asset = document.createElement("p");
+        asset.textContent = `Asset: ${attempt.generated_asset || "—"}${attempt.accepted ? " · ACCEPTED" : ""}`;
+        body.append(correction, finalLabel, finalPrompt, asset);
+        details.append(summary, body);
+        container.append(details);
+      });
+    };
+    const renderAssembly = (detail, {full = true} = {}) => {
+      activeDetail = {...(activeDetail || {}), ...detail};
+      const noProvider = !detail.final_provider_prompt;
+      setText("[data-detail-auto]", detail.auto_scene_prompt || "—");
+      setText("[data-detail-effective]", detail.effective_scene_prompt || "—");
+      setText("[data-detail-operation]", detail.operation || "—");
+      setText("[data-detail-operation-instructions]", detail.operation_instructions || "—");
+      setText("[data-detail-style]", detail.style_contract_version || "—");
+      setText("[data-detail-qa-correction]", detail.qa_correction || "—");
+      setText("[data-detail-final]", detail.final_provider_prompt || "NO IMAGE PROVIDER CALL");
+      const transformations = promptDialog.querySelector("[data-detail-transformations]");
+      if (transformations) {
+        transformations.replaceChildren();
+        (detail.provider_transformations || []).forEach((item) => transformations.append(makeListItem(formatTransformation(item))));
+        if (!(detail.provider_transformations || []).length) transformations.append(makeListItem("None"));
+      }
+      const references = promptDialog.querySelector("[data-detail-references]");
+      if (references) {
+        references.replaceChildren();
+        (detail.references_used || []).forEach((item) => references.append(makeListItem(`${item.role} · ${item.reference_id}`)));
+        if (!(detail.references_used || []).length) references.append(makeListItem("None"));
+      }
+      promptDialog.querySelectorAll("[data-provider-prompt-fields]").forEach((element) => { element.hidden = noProvider; });
+      const noProviderPanel = promptDialog.querySelector("[data-no-provider]");
+      if (noProviderPanel) noProviderPanel.hidden = !noProvider;
+      if (overrideInput instanceof HTMLTextAreaElement) overrideInput.disabled = noProvider;
+      promptDialog.querySelectorAll("[data-edit-override], [data-save-override], [data-clear-override]").forEach((button) => { button.disabled = noProvider; });
+      if (!full) return;
+      setText("[data-detail-type]", detail.target_type || activeTarget?.type || "TARGET");
+      setText("[data-detail-id]", detail.target_id || activeTarget?.id || "—");
+      setText("[data-detail-narration]", detail.target_metadata?.narration || "—");
+      setText("[data-detail-source]", detail.target_metadata?.source_asset || detail.target_metadata?.source_visual_id || "—");
+      setText("[data-detail-operation-detail]", detail.target_metadata?.operation_detail || "");
+      renderKeyValues(promptDialog.querySelector("[data-detail-semantics]"), detail.semantic_requirement);
+      renderHistory(detail.attempts || []);
+      const stored = detail.stored_override;
+      if (overrideInput instanceof HTMLTextAreaElement) overrideInput.value = stored?.scene_prompt_override || detail.manual_scene_override || "";
+      setText("[data-override-state]", stored?.state || detail.override_state || "AUTO");
+      const status = promptDialog.querySelector("[data-detail-status]");
+      if (status) {
+        status.textContent = ["STALE", "REVIEW_REQUIRED"].includes(stored?.state)
+          ? `${stored.state.replaceAll("_", " ")}: this override is not active. Save it again to attach it to the current semantic target, or discard it.`
+          : "";
+        status.hidden = !status.textContent;
+      }
+      if (providerSelect instanceof HTMLSelectElement) providerSelect.value = detail.provider || promptSheet.dataset.provider || "seedream";
+      if (modelInput instanceof HTMLInputElement) modelInput.value = detail.model || promptSheet.dataset.model || "";
+    };
+    const loadDetail = async () => {
+      if (!activeTarget) return;
+      if (feedback) feedback.textContent = "Loading…";
+      const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/prompts/${encodeURIComponent(activeTarget.type)}/${encodeURIComponent(activeTarget.id)}`);
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.detail || "Unable to load prompt detail");
+      renderAssembly(payload);
+      if (feedback) feedback.textContent = "";
+    };
+    const updateRows = () => {
+      const needle = search instanceof HTMLInputElement ? search.value.trim().toLowerCase() : "";
+      const mode = filter instanceof HTMLSelectElement ? filter.value : "ALL";
+      let visible = 0;
+      promptSheet.querySelectorAll("[data-prompt-row]").forEach((row) => {
+        const matchesSearch = !needle || (row.dataset.search || "").toLowerCase().includes(needle);
+        const matchesMode = mode === "ALL" || row.dataset.mode === mode;
+        row.hidden = !(matchesSearch && matchesMode);
+        if (!row.hidden) visible += 1;
+      });
+      if (count) count.textContent = `${visible} targets`;
+    };
+    search?.addEventListener("input", updateRows);
+    filter?.addEventListener("change", updateRows);
+    promptSheet.querySelectorAll("[data-inspect-prompt]").forEach((button) => {
+      button.addEventListener("click", async () => {
+        const row = button.closest("[data-prompt-row]");
+        if (!(row instanceof HTMLElement)) return;
+        activeTarget = {type: row.dataset.targetType || "", id: row.dataset.targetId || "", row};
+        promptDialog.showModal();
+        try { await loadDetail(); } catch (error) { if (feedback) feedback.textContent = error.message; }
+      });
+    });
+    promptDialog.querySelector("[data-refresh-preview]")?.addEventListener("click", async () => {
+      if (!activeTarget) return;
+      const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/prompts/${encodeURIComponent(activeTarget.type)}/${encodeURIComponent(activeTarget.id)}/preview`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({provider: providerSelect?.value, model: modelInput?.value}),
+      });
+      const payload = await response.json();
+      if (!response.ok) { if (feedback) feedback.textContent = payload.detail || "Preview failed"; return; }
+      renderAssembly(payload, {full: false});
+      if (feedback) feedback.textContent = "Exact preview refreshed.";
+    });
+    promptDialog.querySelector("[data-edit-override]")?.addEventListener("click", () => {
+      if (overrideInput instanceof HTMLTextAreaElement) {
+        overrideInput.focus();
+        overrideInput.setSelectionRange(overrideInput.value.length, overrideInput.value.length);
+      }
+    });
+    promptDialog.querySelector("[data-save-override]")?.addEventListener("click", async () => {
+      if (!activeTarget || !(overrideInput instanceof HTMLTextAreaElement)) return;
+      const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/prompts/${encodeURIComponent(activeTarget.type)}/${encodeURIComponent(activeTarget.id)}/override`, {
+        method: "PUT",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({scene_prompt_override: overrideInput.value}),
+      });
+      const payload = await response.json();
+      if (!response.ok) { if (feedback) feedback.textContent = payload.detail || "Save failed"; return; }
+      renderAssembly(payload.prompt);
+      activeTarget.row.dataset.mode = "OVERRIDE";
+      const mode = activeTarget.row.querySelector("[data-row-mode]");
+      if (mode) { mode.textContent = "OVERRIDE"; mode.className = "prompt-mode prompt-mode-override"; }
+      if (feedback) feedback.textContent = "Override saved. Image generation was not started.";
+      updateRows();
+    });
+    promptDialog.querySelector("[data-clear-override]")?.addEventListener("click", async () => {
+      if (!activeTarget) return;
+      const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/prompts/${encodeURIComponent(activeTarget.type)}/${encodeURIComponent(activeTarget.id)}/override`, {method: "DELETE"});
+      const payload = await response.json();
+      if (!response.ok) { if (feedback) feedback.textContent = payload.detail || "Clear failed"; return; }
+      await loadDetail();
+      activeTarget.row.dataset.mode = "AUTO";
+      const mode = activeTarget.row.querySelector("[data-row-mode]");
+      if (mode) { mode.textContent = "AUTO"; mode.className = "prompt-mode prompt-mode-auto"; }
+      if (feedback) feedback.textContent = "Override cleared. AUTO prompt restored.";
+      updateRows();
     });
   }
 });

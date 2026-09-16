@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from app.errors import ImagePromptBuildError
@@ -82,9 +83,10 @@ class ImagePromptBuilder:
             (
                 "VISUAL FOCUS",
                 (
-                    f"Purpose: {beat.visual_purpose}. Viewer must understand: "
-                    f"{beat.what_viewer_should_understand}. First notice: "
-                    f"{beat.visual_focus or beat.what_viewer_should_understand}."
+                    f"Make {beat.visual_focus or beat.what_viewer_should_understand} "
+                    f"the first noticeable element. Clearly depict "
+                    f"{beat.what_viewer_should_understand}. The frame should "
+                    f"{beat.visual_purpose}."
                 ),
             ),
         ])
@@ -165,13 +167,12 @@ class ImagePromptBuilder:
                 "Attached image guidance",
                 build_reference_role_instruction(references),
             ),
-            ("KEEP UNCHANGED", "\n".join(f"- {item}" for item in keep)),
-            ("CHANGE ONLY", f"- {change}"),
+            ("KEEP UNCHANGED", "; ".join(keep)),
+            ("CHANGE ONLY", change),
             (
                 "REQUIRED RESULT",
                 (
-                    f"The viewer must quickly understand: "
-                    f"{beat.what_viewer_should_understand}. "
+                    f"Make {beat.what_viewer_should_understand} immediately clear. "
                     "Do not redesign the environment or add unrelated detail."
                 ),
             ),
@@ -219,9 +220,9 @@ class ImagePromptBuilder:
             )
         return (
             "Use the same recurring environment. "
-            f"Geometry: {master.environment_geometry}. "
-            f"Composition anchor: {master.basic_composition}. "
-            f"Keep palette: {master.color_palette}. "
+            f"Preserve this geometry. {master.environment_geometry}. "
+            f"Use this composition. {master.basic_composition}. "
+            f"Keep this palette. {master.color_palette}. "
             "Do not redesign the environment."
         )
 
@@ -231,7 +232,8 @@ class ImagePromptBuilder:
         if not beat.characters_visible:
             return "No recurring characters visible; do not introduce extra people."
         return "; ".join(
-            f"{by_id[character_id].name}: {by_id[character_id].description}"
+            f"{by_id[character_id].name} appears as "
+            f"{by_id[character_id].description}"
             for character_id in beat.characters_visible
         )
 
@@ -243,7 +245,7 @@ class ImagePromptBuilder:
     ) -> str:
         by_id = {item.id: item for item in plan.important_objects}
         objects = [
-            f"{by_id[object_id].name}: {by_id[object_id].description}"
+            f"{by_id[object_id].name} appears as {by_id[object_id].description}"
             for object_id in beat.important_objects
         ]
         if master is not None:
@@ -256,8 +258,8 @@ class ImagePromptBuilder:
     def _camera_content(beat: VisualBeat) -> str:
         return (
             f"{beat.camera_framing.value}. {beat.camera_view}. "
-            f"Movement: {beat.camera_movement.value}. Reason: {beat.framing_reason}. "
-            f"Make clear: {beat.information_added_beyond_narration}."
+            f"Use {beat.camera_movement.value} movement because {beat.framing_reason}. "
+            f"Clearly show {beat.information_added_beyond_narration}."
         )
 
     @staticmethod
@@ -266,11 +268,9 @@ class ImagePromptBuilder:
         if beat.safety_geography is not None:
             safety = beat.safety_geography
             parts.append(
-                "Safety geography — "
-                f"current: {safety.current_position}; "
-                f"exit: {safety.exit_or_safe_area}; "
-                f"distance/scale: {safety.distance_or_scale}; "
-                f"obstacle: {safety.obstacle_between}"
+                f"Place the subject at {safety.current_position}, the safe exit at "
+                f"{safety.exit_or_safe_area}, show {safety.distance_or_scale} between "
+                f"them, and place {safety.obstacle_between} in the way"
             )
         return ". ".join(parts)
 
@@ -280,11 +280,11 @@ class ImagePromptBuilder:
         if beat.progressive_change is not None:
             change = beat.progressive_change
             parts.append(
-                f"{change.subject_id}: {change.previous_state} → "
-                f"{change.current_state} ({change.progression})"
+                f"Show {change.subject_id} moving from {change.previous_state} to "
+                f"{change.current_state}, progressing as {change.progression}"
             )
         if beat.anticipated_consequence is not None:
-            parts.append(f"Visually prepare: {beat.anticipated_consequence}")
+            parts.append(f"Visually prepare {beat.anticipated_consequence}")
         return ". ".join(parts)
 
 
@@ -293,12 +293,13 @@ def _render_sections(
     sections: list[tuple[str, str]],
 ) -> str:
     entries = [
-        (heading, content.strip())
+        (heading, sanitize_provider_visual_text(content))
         for heading, content in sections
         if content.strip()
     ]
     return prefix + "".join(
-        f"\n\n{heading}:\n{content}" for heading, content in entries
+        f"\n\n{_PROVIDER_SECTION_LEADS[heading]} {content}"
+        for heading, content in entries
     )
 
 
@@ -309,7 +310,7 @@ def _fit_semantic_sections(
 ) -> str:
     """Compact verbose model output while retaining every semantic section."""
     entries = [
-        (heading, " ".join(content.split()))
+        (heading, sanitize_provider_visual_text(content))
         for heading, content in sections
         if content.strip()
     ]
@@ -318,7 +319,8 @@ def _fit_semantic_sections(
         return rendered
 
     fixed_length = len(prefix) + sum(
-        len(f"\n\n{heading}:\n") for heading, _ in entries
+        len(f"\n\n{_PROVIDER_SECTION_LEADS[heading]} ")
+        for heading, _ in entries
     )
     content_budget = maximum - fixed_length
     minimum_per_section = 24
@@ -356,6 +358,38 @@ def _fit_semantic_sections(
             "Semantic image prompt is too long for the configured prompt budget"
         )
     return result
+
+
+_PROVIDER_SECTION_LEADS = {
+    "Attached image guidance": "Use the attached images only as visual guidance.",
+    "LOCATION CONTINUITY": "Draw the recurring setting with this stable layout.",
+    "PROJECT STYLE DIRECTION": "Follow this project drawing direction.",
+    "CHARACTER CONTINUITY": "Show these people with their established roles and appearance.",
+    "OBJECT CONTINUITY": "Include these story objects in their established positions.",
+    "CURRENT CAMERA / COMPOSITION": "Frame the scene this way.",
+    "CURRENT PHYSICAL STATE": "Depict this physical situation.",
+    "WHAT CHANGED": "Make this new physical change clearly visible.",
+    "VISUAL FOCUS": "Guide attention to the story-critical action.",
+    "DO NOT SHOW": "Exclude these story mistakes.",
+    "SIMPLIFICATION RULE": "Keep the image visually simple and immediately readable.",
+    "KEEP UNCHANGED": "Preserve the following established elements.",
+    "CHANGE ONLY": "Change only this physical state.",
+    "REQUIRED RESULT": "The edited result must communicate this fact.",
+}
+
+_INTERNAL_LABEL = re.compile(
+    r"(?i)\b(?:purpose|state|change|visual\s+operation|visual\s+reference|"
+    r"reference\s+instructions?|image\s+reference|planner\s+notes?|qa\s+notes?|"
+    r"style\s+contract)\s*:"
+)
+
+
+def sanitize_provider_visual_text(value: str) -> str:
+    """Remove planner-style labels while preserving their concrete visual content."""
+    normalized = " ".join(value.split())
+    normalized = _INTERNAL_LABEL.sub("", normalized)
+    normalized = normalized.replace(":", ",")
+    return re.sub(r"\s+", " ", normalized).strip()
 
 
 def _ellipsize_middle(value: str, maximum: int) -> str:

@@ -5,6 +5,7 @@ import os
 import re
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlencode
 from uuid import uuid4
@@ -14,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.budgets import ProjectBudgetGuard
@@ -38,9 +40,14 @@ from app.generators.image import (
 from app.generators.master_scene import register_uploaded_master_scene
 from app.generators.style_reference import register_approved_style_reference
 from app.generators.voice import generate_voice
-from app.jobs import GenerationJob, GenerationJobManager, GenerationJobType
+from app.jobs import (
+    GenerationJob,
+    GenerationJobManager,
+    GenerationJobStatus,
+    GenerationJobType,
+)
 from app.media.probe import get_media_duration
-from app.persistence import Project, Scene
+from app.persistence import PlanningProviderAttempt, Project, Scene
 from app.production_profiles import ProductionProfile
 from app.providers import get_image_provider, get_tts_provider
 from app.repositories import (
@@ -73,7 +80,19 @@ from app.secret_store import (
     SecretStoreError,
 )
 from app.services.pipeline_production import build_production_pipeline_dependencies
+from app.services.planning_attempts import (
+    latest_uncertain_planning_attempt,
+    planning_budget_snapshot,
+)
 from app.services.project_pipeline import run_project_video_pipeline
+from app.services.prompt_assembly import (
+    PromptTargetType,
+    clear_prompt_override,
+    get_prompt_detail,
+    get_prompt_sheet,
+    preview_generation_request,
+    set_prompt_override,
+)
 from app.services.visual_planning import load_project_visual_plan_state
 from app.storage import ProjectMediaPaths
 
@@ -401,6 +420,50 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
         )
 
 
+@app.get("/projects/{project_id}/prompts", response_class=HTMLResponse)
+async def project_prompt_sheet_page(
+    request: Request,
+    project_id: str,
+) -> HTMLResponse:
+    """Render the compact project-wide VisualPlan prompt inspector."""
+    with SessionLocal() as session:
+        project = get_project(session, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        try:
+            rows = get_prompt_sheet(session, project_id)
+        except ValueError:
+            rows = []
+        masters = [
+            row
+            for row in rows
+            if row["target_type"] == "MASTER_SCENE"
+            and row.get("override_state") != "ORPHANED"
+        ]
+        beats = [
+            row
+            for row in rows
+            if row["target_type"] == "BEAT"
+            and row.get("override_state") != "ORPHANED"
+        ]
+        orphaned = [
+            row for row in rows if row.get("override_state") == "ORPHANED"
+        ]
+        return templates.TemplateResponse(
+            request=request,
+            name="prompt_sheet.html",
+            context={
+                "title": f"Prompts — {project.name} — FermaYT",
+                "project": project,
+                "master_rows": masters,
+                "beat_rows": beats,
+                "orphaned_rows": orphaned,
+                "notice": request.query_params.get("notice"),
+                "error": request.query_params.get("error"),
+            },
+        )
+
+
 @app.post("/projects/{project_id}")
 async def update_project_route(
     request: Request,
@@ -419,6 +482,117 @@ async def update_project_route(
     return _project_redirect(project_id, notice="Настройки проекта сохранены.")
 
 
+@app.get("/api/projects/{project_id}/prompt-sheet")
+async def project_prompt_sheet_route(project_id: str) -> dict[str, object]:
+    """Return stable beat/master prompt targets and their override state."""
+    try:
+        with SessionLocal() as session:
+            return {"targets": get_prompt_sheet(session, project_id)}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/projects/{project_id}/prompts/{target_type}/{target_id}")
+async def project_prompt_detail_route(
+    project_id: str,
+    target_type: str,
+    target_id: str,
+) -> dict[str, object]:
+    """Preview the structured request compiled by the production prompt path."""
+    try:
+        with SessionLocal() as session:
+            return get_prompt_detail(
+                session,
+                project_id,
+                target_type=PromptTargetType(target_type.upper()),
+                target_id=target_id,
+            )
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.put("/api/projects/{project_id}/prompts/{target_type}/{target_id}/override")
+async def set_project_prompt_override_route(
+    request: Request,
+    project_id: str,
+    target_type: str,
+    target_id: str,
+) -> dict[str, object]:
+    """Set only the desired scene description for one current plan target."""
+    try:
+        payload = await request.json()
+        scene_prompt = payload.get("scene_prompt_override")
+        if not isinstance(scene_prompt, str):
+            raise TypeError("scene_prompt_override must be a string")
+        with SessionLocal() as session:
+            override = set_prompt_override(
+                session,
+                project_id,
+                target_type=PromptTargetType(target_type.upper()),
+                target_id=target_id,
+                scene_prompt_override=scene_prompt,
+            )
+            return {
+                "override_id": override.id,
+                "revision": override.revision,
+                "enabled": override.enabled,
+                "prompt": get_prompt_detail(
+                    session,
+                    project_id,
+                    target_type=target_type.upper(),
+                    target_id=target_id,
+                ),
+            }
+    except (TypeError, ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/projects/{project_id}/prompts/{target_type}/{target_id}/override")
+async def clear_project_prompt_override_route(
+    project_id: str,
+    target_type: str,
+    target_id: str,
+) -> dict[str, object]:
+    """Disable the current revision's override and return to AUTO mode."""
+    try:
+        with SessionLocal() as session:
+            override = clear_prompt_override(
+                session,
+                project_id,
+                target_type=PromptTargetType(target_type.upper()),
+                target_id=target_id,
+            )
+            return {"cleared": override is not None}
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/prompts/{target_type}/{target_id}/preview")
+async def preview_project_prompt_route(
+    request: Request,
+    project_id: str,
+    target_type: str,
+    target_id: str,
+) -> dict[str, object]:
+    """Compile against an optional provider/model without dispatching a request."""
+    try:
+        payload = await request.json()
+        with SessionLocal() as session:
+            assembly = preview_generation_request(
+                session,
+                project_id,
+                target_type=PromptTargetType(target_type.upper()),
+                target_id=target_id,
+                provider=payload.get("provider"),
+                model=payload.get("model"),
+                qa_correction=payload.get("qa_correction"),
+                operation=payload.get("operation"),
+            )
+            return assembly.as_dict()
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
 @app.post("/api/projects/{project_id}/generate-video")
 async def generate_project_video_route(
     request: Request,
@@ -430,6 +604,38 @@ async def generate_project_video_route(
         return _job_payload(active)
     form = await _read_optional_form(request)
     budget_override = form.get("budget_override") == "1"
+    planning_retry_anyway = form.get("planning_retry_anyway") == "1"
+    latest_job = await job_manager.get_latest_project_job(project_id)
+    planning_run_id: str | None = None
+    if latest_job is not None and latest_job.status is GenerationJobStatus.PAUSED_PLANNING:
+        with SessionLocal() as session:
+            uncertain = latest_uncertain_planning_attempt(session, project_id)
+        if uncertain is not None:
+            if not planning_retry_anyway:
+                raise HTTPException(
+                    status_code=409,
+                    detail=(
+                        "Planning request timed out locally. Provider billing status "
+                        "is unknown. Retrying may create a second charge."
+                    ),
+                )
+            planning_run_id = uncertain.planning_run_id
+    elif (
+        latest_job is not None
+        and latest_job.status is GenerationJobStatus.PAUSED_BUDGET
+        and latest_job.failed_stage == "PLANNING"
+    ):
+        # A budget increase resumes the same planning ledger; unknown reservations
+        # must never disappear merely because the worker gets a new job id.
+        with SessionLocal() as session:
+            prior = session.scalar(
+                select(PlanningProviderAttempt)
+                .where(PlanningProviderAttempt.project_id == project_id)
+                .order_by(PlanningProviderAttempt.started_at.desc())
+                .limit(1)
+            )
+        if prior is not None:
+            planning_run_id = prior.planning_run_id
     try:
         production_profile = ProductionProfile(
             form.get("production_profile", ProductionProfile.FINAL.value).upper()
@@ -480,6 +686,8 @@ async def generate_project_video_route(
             budget_override,
             production_profile,
             generation_scope,
+            planning_run_id,
+            planning_retry_anyway,
         )
 
     job = await job_manager.enqueue(
@@ -500,6 +708,14 @@ async def generate_project_video_route(
 @app.get("/api/jobs/{job_id}")
 async def generation_job(job_id: str) -> dict[str, object]:
     job = await job_manager.get_job(job_id)
+    if job is None:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return _job_payload(job)
+
+
+@app.post("/api/jobs/{job_id}/cancel")
+async def cancel_generation_job(job_id: str) -> dict[str, object]:
+    job = await job_manager.cancel_job(job_id)
     if job is None:
         raise HTTPException(status_code=404, detail="Job not found")
     return _job_payload(job)
@@ -1248,6 +1464,18 @@ def _update_project_from_form(
         "generation_budget_warning_threshold",
         str(current.generation_budget_warning_threshold),
     )
+    form.setdefault(
+        "planning_budget_amount", str(current.planning_budget_amount or "")
+    )
+    form.setdefault(
+        "planning_max_paid_requests", str(current.planning_max_paid_requests)
+    )
+    form.setdefault("planning_max_input_tokens", str(current.planning_max_input_tokens))
+    form.setdefault("planning_max_output_tokens", str(current.planning_max_output_tokens))
+    form.setdefault(
+        "planning_max_total_estimated_tokens",
+        str(current.planning_max_total_estimated_tokens),
+    )
     form.setdefault("draft_paid_visual_ratio", str(current.draft_paid_visual_ratio))
     form.setdefault("draft_width", str(current.draft_width))
     form.setdefault("draft_height", str(current.draft_height))
@@ -1262,6 +1490,25 @@ def _update_project_from_form(
             form, "planning_provider", {"dashscope", "kimi"}, "Planning provider"
         ),
         planning_model=_required(form, "planning_model", "Planning model"),
+        planning_budget_amount=_optional_float(
+            form.get("planning_budget_amount"), "Planning budget"
+        ),
+        planning_max_paid_requests=int(
+            _required(form, "planning_max_paid_requests", "Planning paid requests")
+        ),
+        planning_max_input_tokens=int(
+            _required(form, "planning_max_input_tokens", "Planning input tokens")
+        ),
+        planning_max_output_tokens=int(
+            _required(form, "planning_max_output_tokens", "Planning output tokens")
+        ),
+        planning_max_total_estimated_tokens=int(
+            _required(
+                form,
+                "planning_max_total_estimated_tokens",
+                "Planning total tokens",
+            )
+        ),
         visual_qa_enabled=form.get("visual_qa_enabled", "0") == "1",
         visual_qa_provider=_choice(
             form, "visual_qa_provider", {"dashscope"}, "Visual QA provider"
@@ -1326,6 +1573,8 @@ def _run_pipeline_worker(
     budget_override: bool = False,
     production_profile: ProductionProfile = ProductionProfile.FINAL,
     generation_scope: GenerationScope | None = None,
+    planning_run_id: str | None = None,
+    allow_planning_retry_after_uncertain: bool = False,
 ) -> None:
     async def runner() -> None:
         async def progress(
@@ -1337,6 +1586,8 @@ def _run_pipeline_worker(
             total_beats: int | None,
             failed_beat: str | None,
         ) -> None:
+            if job_manager.cancellation_event(job_id).is_set():
+                raise asyncio.CancelledError
             await job_manager.update_pipeline_state(
                 job_id,
                 stage=getattr(stage, "value", str(stage)),
@@ -1358,6 +1609,11 @@ def _run_pipeline_worker(
                 budget_override=budget_override,
                 production_profile=production_profile,
                 generation_scope=generation_scope,
+                planning_run_id=planning_run_id,
+                allow_planning_retry_after_uncertain=(
+                    allow_planning_retry_after_uncertain
+                ),
+                cancellation_requested=job_manager.cancellation_event(job_id).is_set,
             )
             await job_manager.set_pipeline_result(
                 job_id,
@@ -1382,6 +1638,33 @@ def _job_payload(job: GenerationJob) -> dict[str, object]:
     )
     with SessionLocal() as session:
         costs = summarize_project_cost(session, job.project_id, job_id=job.id)
+        current_job_attempts = list(
+            session.scalars(
+                select(PlanningProviderAttempt)
+                .where(PlanningProviderAttempt.job_id == job.id)
+                .order_by(PlanningProviderAttempt.started_at)
+            )
+        )
+        planning_run_id = (
+            current_job_attempts[-1].planning_run_id
+            if current_job_attempts
+            else job.id
+        )
+        planning_attempts = list(
+            session.scalars(
+                select(PlanningProviderAttempt)
+                .where(PlanningProviderAttempt.planning_run_id == planning_run_id)
+                .order_by(PlanningProviderAttempt.attempt_number)
+            )
+        )
+        project = session.get(Project, job.project_id)
+        planning_budget = (
+            planning_budget_snapshot(
+                session, job.project_id, planning_run_id
+            )
+            if project is not None
+            else None
+        )
         try:
             estimate = estimate_project_generation_cost(session, job.project_id)
             draft_estimate = estimate_project_generation_cost(
@@ -1397,6 +1680,12 @@ def _job_payload(job: GenerationJob) -> dict[str, object]:
             final_estimate = None
             budget = None
     estimated_remaining = estimate.maximum if estimate is not None else None
+    planning_progress = _planning_progress_payload(
+        job,
+        project,
+        planning_attempts,
+        planning_budget.as_dict() if planning_budget is not None else None,
+    )
     return {
         "id": job.id,
         "project_id": job.project_id,
@@ -1420,6 +1709,47 @@ def _job_payload(job: GenerationJob) -> dict[str, object]:
         "report": job.report,
         "diagnostic": diagnostic,
         "budget_pause": budget_pause,
+        "planning_attempts": [
+            {
+                "id": item.id,
+                "planning_run_id": item.planning_run_id,
+                "kind": item.attempt_kind,
+                "number": item.attempt_number,
+                "provider": item.provider,
+                "model": item.model,
+                "status": item.status,
+                "billing_status": item.billing_status,
+                "cost_certainty": item.cost_certainty,
+                "input_token_estimate": item.input_token_estimate,
+                "max_output_tokens": item.configured_max_output_tokens,
+                "estimated_max_cost": (
+                    float(item.estimated_max_cost)
+                    if item.estimated_max_cost is not None
+                    else None
+                ),
+                "actual_cost": (
+                    float(item.actual_cost) if item.actual_cost is not None else None
+                ),
+                "currency": item.currency,
+                "provider_request_id": item.provider_request_id,
+                "input_tokens": item.input_tokens,
+                "output_tokens": item.output_tokens,
+                "total_tokens": item.total_tokens,
+                "safe_error": item.safe_error,
+                "started_at": item.started_at.isoformat(),
+                "finished_at": (
+                    item.finished_at.isoformat() if item.finished_at else None
+                ),
+            }
+            for item in planning_attempts
+        ],
+        "planning_attempt_limit": (
+            project.planning_max_paid_requests if project is not None else 2
+        ),
+        "planning_budget": (
+            planning_budget.as_dict() if planning_budget is not None else None
+        ),
+        "planning_progress": planning_progress,
         "budget": budget.as_dict() if budget is not None else None,
         "cost": costs.as_dict(),
         "cost_estimate": estimate.as_dict() if estimate is not None else None,
@@ -1433,6 +1763,140 @@ def _job_payload(job: GenerationJob) -> dict[str, object]:
         "created_at": job.created_at.isoformat(),
         "updated_at": job.updated_at.isoformat(),
         "completed_at": job.completed_at.isoformat() if job.completed_at else None,
+    }
+
+
+def _planning_progress_payload(
+    job: GenerationJob,
+    project: Project | None,
+    attempts: list[PlanningProviderAttempt],
+    budget: dict[str, object] | None,
+) -> dict[str, object]:
+    """Build safe structured planning state without parsing logs or prompts."""
+    active = attempts[-1] if attempts else None
+    now = datetime.now(UTC)
+    state: str | None = None
+    if job.status is GenerationJobStatus.PAUSED_BUDGET and job.failed_stage == "PLANNING":
+        state = "PAUSED_BUDGET"
+    elif job.status is GenerationJobStatus.PAUSED_PLANNING:
+        state = "PAUSED_AFTER_TIMEOUT"
+    elif job.status is GenerationJobStatus.FAILED and job.failed_stage == "PLANNING":
+        state = "FAILED"
+    elif job.current_stage == "PLANNING":
+        state = active.progress_state if active is not None else "PREPARING_SCOPE"
+    elif active is not None:
+        state = active.progress_state
+    elif job.status is GenerationJobStatus.COMPLETED:
+        state = "COMPLETED"
+
+    elapsed_seconds: float | None = None
+    request_started_at: str | None = None
+    if active is not None:
+        start = active.dispatched_at or active.started_at
+        end = active.response_received_at or active.finished_at or now
+        elapsed_seconds = round(max((end - start).total_seconds(), 0.0), 3)
+        request_started_at = start.isoformat()
+
+    scope_type = job.generation_scope_type
+    scope_value = job.generation_scope_value
+    scope_labels = {
+        "FULL": "Full narration",
+        "STYLE_PREVIEW": "Style preview — 3 images",
+    }
+    scope_label = scope_labels.get(scope_type, scope_type.replace("_", " ").title())
+    if scope_type == "FIRST_SECONDS" and scope_value is not None:
+        scope_label = f"First {scope_value:g} seconds"
+
+    timeout = state == "PAUSED_AFTER_TIMEOUT"
+    repair_reason = next(
+        (
+            item.validation_category
+            for item in reversed(attempts)
+            if item.validation_category
+        ),
+        None,
+    )
+    return {
+        "state": state,
+        "scope": {
+            "type": scope_type,
+            "value": scope_value,
+            "label": scope_label,
+        },
+        "provider": {
+            "name": active.provider if active is not None else (
+                project.planning_provider if project is not None else None
+            ),
+            "model": active.model if active is not None else (
+                project.planning_model if project is not None else None
+            ),
+        },
+        "request": {
+            "number": active.attempt_number if active is not None else None,
+            "maximum": (
+                project.planning_max_paid_requests if project is not None else 2
+            ),
+            "type": active.attempt_kind if active is not None else None,
+            "status": active.status if active is not None else None,
+            "started_at": request_started_at,
+            "elapsed_seconds": elapsed_seconds,
+            "is_running": bool(
+                active is not None
+                and active.progress_state == "WAITING_FOR_PROVIDER"
+                and active.finished_at is None
+            ),
+        },
+        "tokens": {
+            "input_estimate": (
+                active.input_token_estimate if active is not None else None
+            ),
+            "max_output": (
+                active.configured_max_output_tokens if active is not None else None
+            ),
+            "actual_input": active.input_tokens if active is not None else None,
+            "actual_output": active.output_tokens if active is not None else None,
+        },
+        "cost": {
+            "estimated_max": (
+                float(active.estimated_max_cost)
+                if active is not None and active.estimated_max_cost is not None
+                else None
+            ),
+            "actual_or_estimated": (
+                float(active.actual_cost)
+                if active is not None and active.actual_cost is not None
+                else None
+            ),
+            "currency": active.currency if active is not None else (
+                project.generation_budget_currency if project is not None else None
+            ),
+            "certainty": active.cost_certainty if active is not None else None,
+            "budget": budget,
+        },
+        "repair": {
+            "reason": repair_reason,
+            "attempt": (
+                active.attempt_number if active is not None
+                and active.attempt_kind == "REPAIR" else None
+            ),
+            "maximum": (
+                project.planning_max_paid_requests if project is not None else 2
+            ),
+        },
+        "timeout": {
+            "paused": timeout,
+            "billing_unknown": bool(
+                timeout
+                or (active is not None and active.billing_status == "UNKNOWN")
+            ),
+            "automatic_retry_stopped": timeout,
+            "message": (
+                "The local request timed out. The provider may still have completed "
+                "and billed it. Automatic retry has been stopped."
+                if timeout
+                else None
+            ),
+        },
     }
 
 

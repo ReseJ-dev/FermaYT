@@ -2,29 +2,41 @@
 
 import asyncio
 from collections.abc import Iterator
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 from test_master_scene import _plan
+from test_visual_asset_execution import _plan_payload, _setup_execution
 
 import app.main as main_module
+import app.services.prompt_assembly as prompt_assembly_module
 from app.database import (
     create_session_factory,
     create_sqlite_engine,
     init_database,
 )
 from app.errors import MasterSceneError
-from app.jobs import GenerationJobManager, GenerationJobType
+from app.jobs import (
+    GenerationJob,
+    GenerationJobManager,
+    GenerationJobStatus,
+    GenerationJobType,
+)
+from app.models.visual_plan import VisualPlan
+from app.persistence import PlanningProviderAttempt
+from app.provider_capabilities import ImageProviderCapabilities
 from app.provider_diagnostics import ImageProviderDiagnostic
 from app.repositories import (
+    create_beat_visual_result,
     create_master_scene_asset,
     create_scene,
     get_master_scene_asset,
     get_project,
     list_scenes,
+    save_project_visual_plan_record,
     update_project,
 )
 from app.secret_store import (
@@ -34,6 +46,7 @@ from app.secret_store import (
     KIE_API_KEY,
     KIMI_API_KEY,
 )
+from app.services.visual_planning import hash_story_text
 
 
 class FakeSecretStore:
@@ -87,6 +100,188 @@ def _create_project(client: TestClient) -> str:
     )
     assert response.status_code == 303
     return response.headers["location"].rsplit("/", 1)[-1]
+
+
+def _save_prompt_sheet_plan(session_factory: object, project_id: str, plan: object) -> None:
+    with session_factory() as session:  # type: ignore[operator]
+        project = get_project(session, project_id)
+        assert project is not None
+        save_project_visual_plan_record(
+            session,
+            project_id=project_id,
+            schema_version="visual_plan_v1",
+            visual_director_version="visual_director_v2",
+            story_text_hash=hash_story_text(project.story_text),
+            plan_json=plan.model_dump(mode="json"),  # type: ignore[attr-defined]
+        )
+
+
+def _planning_job(
+    project_id: str,
+    *,
+    status: GenerationJobStatus = GenerationJobStatus.RUNNING,
+    failed_stage: str | None = None,
+) -> GenerationJob:
+    now = datetime.now(UTC)
+    return GenerationJob(
+        id="planning-job",
+        project_id=project_id,
+        type=GenerationJobType.GENERATE_VIDEO,
+        status=status,
+        progress=8,
+        message="Planning",
+        error=None,
+        created_at=now,
+        updated_at=now,
+        current_stage="PLANNING",
+        failed_stage=failed_stage,
+        generation_scope_type="FIRST_SECONDS",
+        generation_scope_value=30,
+    )
+
+
+def _planning_attempt(project_id: str, state: str) -> PlanningProviderAttempt:
+    now = datetime.now(UTC)
+    return PlanningProviderAttempt(
+        project_id=project_id,
+        job_id="planning-job",
+        planning_run_id="planning-job",
+        provider="kimi",
+        model="kimi-k2.6",
+        attempt_kind="INITIAL",
+        attempt_number=1,
+        request_revision="safe-revision",
+        input_token_estimate=1100,
+        configured_max_output_tokens=4000,
+        estimated_max_cost=0.08,
+        currency="USD",
+        status="PENDING",
+        billing_status="UNKNOWN",
+        cost_certainty="UNKNOWN",
+        progress_state=state,
+        started_at=now - timedelta(seconds=102),
+        dispatched_at=now - timedelta(seconds=102),
+    )
+
+
+def test_structured_planning_progress_covers_all_user_visible_states(
+    web_app: tuple,
+) -> None:
+    client, session_factory, _ = web_app
+    project_id = _create_project(client)
+    with session_factory() as session:
+        project = get_project(session, project_id)
+        assert project is not None
+        attempt = _planning_attempt(project_id, "WAITING_FOR_PROVIDER")
+        initial = main_module._planning_progress_payload(
+            _planning_job(project_id), project, [attempt], None
+        )
+        assert initial["state"] == "WAITING_FOR_PROVIDER"
+        assert initial["request"]["type"] == "INITIAL"
+        assert initial["request"]["elapsed_seconds"] >= 102
+        assert initial["tokens"] == {
+            "input_estimate": 1100,
+            "max_output": 4000,
+            "actual_input": None,
+            "actual_output": None,
+        }
+
+        attempt.progress_state = "REPAIRING_PLAN"
+        attempt.attempt_kind = "REPAIR"
+        attempt.attempt_number = 2
+        attempt.validation_category = "UNKNOWN_REFERENCE"
+        repair = main_module._planning_progress_payload(
+            _planning_job(project_id), project, [attempt], None
+        )
+        assert repair["state"] == "REPAIRING_PLAN"
+        assert repair["repair"]["reason"] == "UNKNOWN_REFERENCE"
+        assert repair["request"]["type"] == "REPAIR"
+
+        attempt.progress_state = "PAUSED_AFTER_TIMEOUT"
+        timeout = main_module._planning_progress_payload(
+            _planning_job(
+                project_id, status=GenerationJobStatus.PAUSED_PLANNING,
+                failed_stage="PLANNING",
+            ),
+            project,
+            [attempt],
+            None,
+        )
+        assert timeout["state"] == "PAUSED_AFTER_TIMEOUT"
+        assert timeout["timeout"]["billing_unknown"] is True
+        assert timeout["timeout"]["automatic_retry_stopped"] is True
+
+        budget = main_module._planning_progress_payload(
+            _planning_job(
+                project_id, status=GenerationJobStatus.PAUSED_BUDGET,
+                failed_stage="PLANNING",
+            ),
+            project,
+            [attempt],
+            {"enabled": True, "reserved_unknown": 0.08},
+        )
+        assert budget["state"] == "PAUSED_BUDGET"
+
+        attempt.progress_state = "COMPLETED"
+        success = main_module._planning_progress_payload(
+            _planning_job(project_id), project, [attempt], None
+        )
+        assert success["state"] == "COMPLETED"
+
+        attempt.progress_state = "FAILED"
+        failure = main_module._planning_progress_payload(
+            _planning_job(
+                project_id, status=GenerationJobStatus.FAILED,
+                failed_stage="PLANNING",
+            ),
+            project,
+            [attempt],
+            None,
+        )
+        assert failure["state"] == "FAILED"
+
+
+def test_job_api_exposes_active_planning_request_without_log_parsing(
+    web_app: tuple,
+) -> None:
+    client, session_factory, _ = web_app
+    project_id = _create_project(client)
+
+    async def create_running_job() -> str:
+        job = await main_module.job_manager.create_job(
+            project_id,
+            GenerationJobType.GENERATE_VIDEO,
+            generation_scope_type="FIRST_SECONDS",
+            generation_scope_value=30,
+        )
+        await main_module.job_manager.update_pipeline_state(
+            job.id,
+            stage="PLANNING",
+            progress=8,
+            stage_progress=0,
+            message="Preparing planning scope",
+            current_beat=None,
+            total_beats=None,
+            failed_beat=None,
+        )
+        return job.id
+
+    job_id = asyncio.run(create_running_job())
+    with session_factory() as session:
+        attempt = _planning_attempt(project_id, "WAITING_FOR_PROVIDER")
+        attempt.job_id = job_id
+        attempt.planning_run_id = job_id
+        session.add(attempt)
+        session.commit()
+
+    response = client.get(f"/api/jobs/{job_id}")
+    assert response.status_code == 200
+    progress = response.json()["planning_progress"]
+    assert progress["state"] == "WAITING_FOR_PROVIDER"
+    assert progress["scope"]["label"] == "First 30 seconds"
+    assert progress["provider"] == {"name": "kimi", "model": "kimi-k2.6"}
+    assert progress["request"]["number"] == 1
+    assert progress["request"]["is_running"] is True
 
 
 def test_job_api_exposes_safe_provider_diagnostic_without_changing_summary(
@@ -154,8 +349,8 @@ def test_completed_job_does_not_restart_page_polling(web_app: tuple) -> None:
 
     assert page.status_code == 200
     assert 'data-job-status="completed"' in page.text
-    assert "/static/app.js?v=20260912-1" in page.text
-    assert "/static/app.css?v=20260911-3" in page.text
+    assert "/static/app.js?v=20260916-1" in page.text
+    assert "/static/app.css?v=20260916-1" in page.text
     assert script.status_code == 200
     assert '["queued", "running"].includes(existingJobStatus)' in script.text
     assert "fermayt-completed-job-reloaded" in script.text
@@ -878,3 +1073,204 @@ def test_style_reference_upload_is_png_only_and_immutable(web_app: tuple) -> Non
         assert reference is not None
         assert Path(reference.file_path).read_bytes() == first_png
         assert Path(reference.file_path).is_relative_to(projects_root)
+
+
+def test_prompt_sheet_dynamically_separates_masters_beats_and_free_operations(
+    web_app: tuple,
+) -> None:
+    client, session_factory, _ = web_app
+    project_id = _create_project(client)
+    plan = VisualPlan.model_validate(_plan_payload())
+    _save_prompt_sheet_plan(session_factory, project_id, plan)
+
+    page = client.get(f"/projects/{project_id}/prompts")
+    sheet = client.get(f"/api/projects/{project_id}/prompt-sheet")
+
+    assert page.status_code == 200
+    assert page.text.index("MASTER SCENES") < page.text.index("BEAT VISUALS")
+    assert 'data-target-id="shaft_master"' in page.text
+    assert 'data-target-id="beat_1"' in page.text
+    assert 'data-target-id="beat_8"' in page.text
+    assert "data-prompt-search" in page.text
+    assert "data-prompt-filter" in page.text
+    rows = sheet.json()["targets"]
+    by_id = {row["target_id"]: row for row in rows}
+    assert by_id["beat_2"]["prompt_mode"] == "NO_PROVIDER_CALL"
+    assert by_id["beat_5"]["prompt_mode"] == "NO_PROVIDER_CALL"
+    assert by_id["beat_7"]["prompt_mode"] == "NO_PROVIDER_CALL"
+    reuse = client.get(f"/api/projects/{project_id}/prompts/BEAT/beat_7").json()
+    assert reuse["final_provider_prompt"] is None
+    assert reuse["target_metadata"]["source_visual_id"] == "beat_6"
+
+
+def test_prompt_sheet_override_lifecycle_and_exact_provider_preview(
+    web_app: tuple,
+) -> None:
+    client, session_factory, _ = web_app
+    project_id = _create_project(client)
+    plan = VisualPlan.model_validate(_plan_payload())
+    _save_prompt_sheet_plan(session_factory, project_id, plan)
+    before = client.post(
+        f"/api/projects/{project_id}/prompts/BEAT/beat_1/preview",
+        json={"provider": "seedream", "model": "seedream-5-0-260128"},
+    ).json()
+
+    override_text = "Helmeted miners in a very simple shaft " * 80
+    saved = client.put(
+        f"/api/projects/{project_id}/prompts/BEAT/beat_1/override",
+        json={"scene_prompt_override": override_text},
+    )
+    reloaded = client.get(f"/api/projects/{project_id}/prompts/BEAT/beat_1")
+    zimage = client.post(
+        f"/api/projects/{project_id}/prompts/BEAT/beat_1/preview",
+        json={"provider": "zimage", "model": "z-image"},
+    )
+
+    assert saved.status_code == 200
+    assert reloaded.json()["manual_scene_override"] == override_text.strip()
+    assert reloaded.json()["override_state"] == "ACTIVE"
+    assert reloaded.json()["final_provider_prompt"] != before["final_provider_prompt"]
+    assert len(zimage.json()["final_provider_prompt"]) <= 800
+    assert any(
+        item["type"] == "ZIMAGE_LIMIT_NORMALIZATION"
+        for item in zimage.json()["provider_transformations"]
+    )
+    page = client.get(f"/projects/{project_id}/prompts")
+    assert 'data-target-id="beat_1" data-mode="OVERRIDE"' in page.text
+
+    cleared = client.delete(
+        f"/api/projects/{project_id}/prompts/BEAT/beat_1/override"
+    )
+    automatic = client.get(f"/api/projects/{project_id}/prompts/BEAT/beat_1")
+    unknown = client.put(
+        f"/api/projects/{project_id}/prompts/BEAT/not-a-real-beat/override",
+        json={"scene_prompt_override": "wrong target"},
+    )
+    assert cleared.json() == {"cleared": True}
+    assert automatic.json()["override_state"] == "AUTO"
+    assert automatic.json()["manual_scene_override"] is None
+    assert unknown.status_code == 400
+
+
+def test_prompt_sheet_stale_review_and_stable_id_mapping(web_app: tuple) -> None:
+    client, session_factory, _ = web_app
+    project_id = _create_project(client)
+    plan = VisualPlan.model_validate(_plan_payload())
+    _save_prompt_sheet_plan(session_factory, project_id, plan)
+    response = client.put(
+        f"/api/projects/{project_id}/prompts/BEAT/beat_8/override",
+        json={"scene_prompt_override": "Alternate tunnel with the same miners"},
+    )
+    override_id = response.json()["override_id"]
+
+    stale_payload = plan.model_dump(mode="json")
+    stale_payload["visual_strategy"] = "New plan revision, same beat semantics"
+    stale_plan = VisualPlan.model_validate(stale_payload)
+    _save_prompt_sheet_plan(session_factory, project_id, stale_plan)
+    stale = client.get(f"/api/projects/{project_id}/prompts/BEAT/beat_8").json()
+    beat_one = client.get(f"/api/projects/{project_id}/prompts/BEAT/beat_1").json()
+    assert stale["stored_override"]["id"] == override_id
+    assert stale["stored_override"]["state"] == "STALE"
+    assert stale["manual_scene_override"] is None
+    assert beat_one["stored_override"] is None
+
+    changed_payload = stale_plan.model_dump(mode="json")
+    changed_payload["visual_beats"][7]["physical_state"] = "A flooded tunnel"
+    changed = VisualPlan.model_validate(changed_payload)
+    _save_prompt_sheet_plan(session_factory, project_id, changed)
+    review = client.get(f"/api/projects/{project_id}/prompts/BEAT/beat_8").json()
+    assert review["stored_override"]["state"] == "REVIEW_REQUIRED"
+    assert review["manual_scene_override"] is None
+
+
+def test_prompt_sheet_exposes_immutable_historical_attempt(web_app: tuple) -> None:
+    client, session_factory, _ = web_app
+    with session_factory() as session:
+        project_id, _, execution = _setup_execution(session)
+        snapshot = {
+            "target_id": "beat_1",
+            "target_type": "BEAT",
+            "qa_correction": None,
+            "provider": "seedream",
+            "model": "historical-model",
+            "final_provider_prompt": "immutable historical provider prompt",
+        }
+        create_beat_visual_result(
+            session,
+            project_id=project_id,
+            visual_plan_id=execution.visual_plan_id,
+            visual_plan_revision=execution.visual_plan_revision,
+            execution_plan_id=execution.id,
+            beat_id="beat_1",
+            resolved_operation="NEW_IMAGE",
+            source_result_id=None,
+            source_master_asset_id=None,
+            source_path=None,
+            output_path="/tmp/historical.png",
+            file_sha256="a" * 64,
+            master_scene_id="shaft_master",
+            prompt_used="historical assembled prompt",
+            prompt_assembly_snapshot=snapshot,
+            provider="seedream",
+            model="historical-model",
+            style_version="rough_explainer_v1",
+            reference_snapshot=[],
+            generation_status="SUCCEEDED",
+            qa_status="PASS",
+            qa_result="PASS",
+            is_accepted=True,
+            error=None,
+            semantic_state_snapshot={"beat_position": 0},
+            generation_revision="e" * 64,
+            attempt=1,
+        )
+
+    detail = client.get(
+        f"/api/projects/{project_id}/prompts/BEAT/beat_1"
+    ).json()
+    assert detail["attempts"][0]["prompt_assembly"] == snapshot
+    client.put(
+        f"/api/projects/{project_id}/prompts/BEAT/beat_1/override",
+        json={"scene_prompt_override": "A new desired scene"},
+    )
+    unchanged = client.get(
+        f"/api/projects/{project_id}/prompts/BEAT/beat_1"
+    ).json()
+    assert unchanged["attempts"][0]["prompt_assembly"] == snapshot
+
+
+def test_prompt_sheet_with_one_hundred_beats_makes_no_provider_call(
+    web_app: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_factory, _ = web_app
+    project_id = _create_project(client)
+    payload = _plan_payload()
+    prototype = payload["visual_beats"][0]
+    payload["visual_beats"] = [
+        {
+            **prototype,
+            "id": f"beat_{index:03d}",
+            "narration_segment": f"Narration segment {index}",
+            "geography_established_by": None,
+        }
+        for index in range(100)
+    ]
+    plan = VisualPlan.model_validate(payload)
+    _save_prompt_sheet_plan(session_factory, project_id, plan)
+
+    class NoNetworkProvider:
+        capabilities = ImageProviderCapabilities()
+
+        async def generate(self, prompt: str) -> str:
+            raise AssertionError(f"Prompt Sheet must not call image provider: {prompt}")
+
+    monkeypatch.setattr(
+        prompt_assembly_module,
+        "get_image_provider",
+        lambda provider, config: NoNetworkProvider(),
+    )
+    page = client.get(f"/projects/{project_id}/prompts")
+
+    assert page.status_code == 200
+    assert page.text.count("data-prompt-row") == 101  # one master plus 100 beats

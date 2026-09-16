@@ -53,5 +53,22 @@ for _ in $(seq 1 50); do
   sleep 0.1
 done
 
-echo "FermaYT did not stop within 5 seconds (PID $server_pid)." >&2
+if ! is_fermayt_process "$server_pid"; then
+  rm -f -- "$PID_FILE"
+  echo "FermaYT stopped."
+  exit 0
+fi
+
+echo "FermaYT did not stop gracefully; forcing shutdown (PID $server_pid)." >&2
+kill -KILL "$server_pid" || exit 1
+for _ in $(seq 1 20); do
+  if ! kill -0 "$server_pid" 2>/dev/null; then
+    rm -f -- "$PID_FILE"
+    echo "FermaYT stopped."
+    exit 0
+  fi
+  sleep 0.1
+done
+
+echo "FermaYT process is still present after forced shutdown (PID $server_pid)." >&2
 exit 1

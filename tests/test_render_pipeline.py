@@ -5,11 +5,10 @@ from pathlib import Path
 
 import pytest
 
-import app.pipeline.final_render as final_render
-import app.pipeline.render_pipeline as render_pipeline
 from app.errors import VideoRenderError
 from app.models.job import VideoJob, VideoJobStatus
 from app.models.scene import Scene
+from app.pipeline import final_render, render_pipeline
 from app.pipeline.final_render import render_final_video
 from app.pipeline.render_pipeline import render_job_scenes
 from app.storage import ProjectMediaPaths

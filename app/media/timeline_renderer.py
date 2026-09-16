@@ -58,6 +58,8 @@ def render_timeline_entry(
             "-frames:v", str(frame_count),
             "-r", str(config.fps),
             "-an", "-c:v", config.video_codec,
+            "-crf", str(config.video_crf),
+            "-preset", config.video_preset,
             "-pix_fmt", config.pixel_format,
             "-movflags", "+faststart",
             str(destination),
@@ -86,7 +88,12 @@ def mux_narration(
     command = [
         "ffmpeg", "-y", "-i", str(video_path), "-i", str(narration_path),
         "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
-        "-c:a", config.audio_codec, "-t", f"{duration:.9f}",
+        "-af", (
+            f"loudnorm=I={config.audio_loudness_lufs:g}:"
+            f"TP={config.audio_true_peak_db:g}:LRA={config.audio_loudness_range:g}"
+        ),
+        "-c:a", config.audio_codec, "-b:a", config.audio_bitrate,
+        "-t", f"{duration:.9f}",
         "-movflags", "+faststart", str(destination),
     ]
     _run_ffmpeg(command, "narration mux")

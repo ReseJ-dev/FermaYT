@@ -167,7 +167,9 @@ class BytePlusImageApiClient:
         from app.generators.image import validate_image_prompt
 
         try:
-            validated_prompt = validate_image_prompt(prompt)
+            validated_prompt, _ = normalize_image_prompt_for_provider(
+                validate_image_prompt(prompt), "seedream"
+            )
         except ValueError as exc:
             raise _diagnostic_error(
                 "Invalid image prompt",
@@ -393,7 +395,9 @@ class QwenImageApiClient:
         from app.generators.image import validate_image_prompt
 
         try:
-            validated_prompt = validate_image_prompt(prompt)
+            validated_prompt, _ = normalize_image_prompt_for_provider(
+                validate_image_prompt(prompt), "qwen"
+            )
         except ValueError as exc:
             raise _diagnostic_error(
                 "Invalid image prompt",
@@ -678,7 +682,9 @@ class KieZImageApiClient:
         from app.generators.image import validate_image_prompt
 
         try:
-            validated_prompt = validate_image_prompt(prompt)
+            validated_prompt, _ = normalize_image_prompt_for_provider(
+                validate_image_prompt(prompt), "zimage"
+            )
         except ValueError as exc:
             raise _diagnostic_error(
                 "Invalid image prompt",
@@ -709,7 +715,7 @@ class KieZImageApiClient:
         payload = {
             "model": self.model,
             "input": {
-                "prompt": _fit_kie_zimage_prompt(validated_prompt),
+                "prompt": validated_prompt,
                 "aspect_ratio": self.aspect_ratio,
                 "nsfw_checker": True,
             },
@@ -910,37 +916,75 @@ def _fit_kie_zimage_prompt(prompt: str) -> str:
     compact = " ".join(prompt.split())
     if len(compact) <= maximum:
         return compact
-    marker = "STYLE CONTRACT ["
-    if marker not in compact:
+    style_marker = "Use this permanent drawing style throughout the entire illustration."
+    legacy_marker = "STYLE CONTRACT ["
+    if style_marker in compact:
+        dynamic = compact.split(style_marker, 1)[0].strip()
+    elif legacy_marker in compact:
+        dynamic = compact.split(legacy_marker, 1)[0].strip()
+    else:
         separator = "..."
         head = (maximum - len(separator)) * 2 // 3
         tail = maximum - len(separator) - head
         return f"{compact[:head].rstrip()}{separator}{compact[-tail:].lstrip()}"
-    dynamic = compact.split(marker, 1)[0].strip()
     style = (
-        "STYLE: rough amateur hand-drawn 2D explainer; thick uneven black outlines; "
-        "crude geometry; simple cartoon people with dot eyes; flat muted colors; "
-        "minimal shading; sparse background; imperfect perspective. NO photorealism, "
-        "realistic materials/anatomy, cinematic light, polished art, 3D, depth of "
-        "field, or gradients. Simplicity over detail."
+        "Draw a rough amateur hand-drawn 2D explainer with thick uneven black "
+        "outlines, crude geometry, simple cartoon people with dot eyes, flat muted "
+        "colors, minimal shading, sparse backgrounds, and imperfect perspective. "
+        "Do not depict photorealism, realistic materials or anatomy, cinematic "
+        "light, polished art, 3D, depth of field, or gradients. Prefer simplicity."
     )
     available = maximum - len(style) - 1
     semantic_sections = _extract_kie_semantic_sections(dynamic)
+    desired_scene = _extract_kie_instruction(
+        dynamic,
+        "Create an illustration showing ",
+        (
+            " Create a new image for",
+            " Edit the source image",
+            " Use the attached images",
+            " Also follow this project",
+        ),
+    )
+    qa_correction = _extract_kie_instruction(
+        dynamic,
+        "Regenerate the illustration so that ",
+        (" Preserve every correct visual element",),
+    )
     if semantic_sections:
         labels_and_limits = (
-            ("Focus", "VISUAL FOCUS", 115),
-            ("State", "CURRENT PHYSICAL STATE", 85),
-            ("Change", "WHAT CHANGED", 90),
-            ("Camera", "CURRENT CAMERA / COMPOSITION", 65),
-            ("Location", "LOCATION CONTINUITY", 65),
-            ("Avoid", "DO NOT SHOW", 45),
+            ("{}", "VISUAL FOCUS", 115),
+            ("Depict {}.", "CURRENT PHYSICAL STATE", 85),
+            ("Show how {}.", "WHAT CHANGED", 90),
+            ("Frame the scene as {}.", "CURRENT CAMERA / COMPOSITION", 65),
+            ("Keep the setting recognizable as {}.", "LOCATION CONTINUITY", 65),
+            ("Exclude {}.", "DO NOT SHOW", 45),
         )
         parts = ["No visible text, labels, titles, watermarks, or UI."]
+        if desired_scene:
+            parts.append(
+                f"Show {_truncate_at_word(desired_scene, 150).rstrip('.')} clearly."
+            )
+        if qa_correction:
+            parts.append(
+                f"Correct {_truncate_at_word(qa_correction, 115).rstrip('.')} while preserving correct elements."
+            )
         parts.extend(
-            f"{label}: {_kie_semantic_excerpt(heading, section, limit)}"
-            for label, heading, limit in labels_and_limits
+            template.format(_kie_semantic_excerpt(heading, section, limit))
+            for template, heading, limit in labels_and_limits
             if (section := semantic_sections.get(heading))
         )
+        dynamic = " ".join(parts)
+    elif desired_scene or qa_correction:
+        parts = ["No visible text, labels, titles, watermarks, or UI."]
+        if desired_scene:
+            parts.append(
+                f"Show {_truncate_at_word(desired_scene, 300).rstrip('.')} clearly."
+            )
+        if qa_correction:
+            parts.append(
+                f"Correct {_truncate_at_word(qa_correction, 150).rstrip('.')} while preserving correct elements."
+            )
         dynamic = " ".join(parts)
     if len(dynamic) > available:
         dynamic = _truncate_at_word(dynamic, available)
@@ -948,24 +992,71 @@ def _fit_kie_zimage_prompt(prompt: str) -> str:
     return _truncate_at_word(fitted, maximum)
 
 
-_KIE_SEMANTIC_HEADINGS = (
-    "LOCATION CONTINUITY",
-    "PROJECT STYLE DIRECTION",
-    "CHARACTER CONTINUITY",
-    "OBJECT CONTINUITY",
-    "CURRENT CAMERA / COMPOSITION",
-    "CURRENT PHYSICAL STATE",
-    "WHAT CHANGED",
-    "VISUAL FOCUS",
-    "DO NOT SHOW",
-    "SIMPLIFICATION RULE",
+def normalize_image_prompt_for_provider(
+    prompt: str,
+    provider: str,
+) -> tuple[str, list[dict[str, object]]]:
+    """Return the exact provider prompt and an inspectable transformation trace."""
+    normalized = prompt.strip()
+    if not normalized:
+        raise ValueError("image prompt must not be empty")
+    transformations: list[dict[str, object]] = []
+    if normalized != prompt:
+        transformations.append(
+            {"type": "TRIM", "before_length": len(prompt), "after_length": len(normalized)}
+        )
+    provider_id = provider.strip().lower()
+    if provider_id == "zimage":
+        fitted = _fit_kie_zimage_prompt(normalized)
+        if fitted != normalized:
+            transformations.append(
+                {
+                    "type": "ZIMAGE_LIMIT_NORMALIZATION",
+                    "before_length": len(normalized),
+                    "after_length": len(fitted),
+                    "maximum_characters": KieZImageApiClient.PROMPT_MAX_CHARACTERS,
+                }
+            )
+        normalized = fitted
+    return normalized, transformations
+
+
+_KIE_SEMANTIC_PREFIXES = (
+    ("LOCATION CONTINUITY", "Draw the recurring setting with this stable layout."),
+    ("PROJECT STYLE DIRECTION", "Follow this project drawing direction."),
+    (
+        "CHARACTER CONTINUITY",
+        "Show these people with their established roles and appearance.",
+    ),
+    (
+        "OBJECT CONTINUITY",
+        "Include these story objects in their established positions.",
+    ),
+    ("CURRENT CAMERA / COMPOSITION", "Frame the scene this way."),
+    ("CURRENT PHYSICAL STATE", "Depict this physical situation."),
+    ("WHAT CHANGED", "Make this new physical change clearly visible."),
+    ("VISUAL FOCUS", "Guide attention to the story-critical action."),
+    ("DO NOT SHOW", "Exclude these story mistakes."),
+    (
+        "SIMPLIFICATION RULE",
+        "Keep the image visually simple and immediately readable.",
+    ),
+    ("LOCATION CONTINUITY", "LOCATION CONTINUITY:"),
+    ("PROJECT STYLE DIRECTION", "PROJECT STYLE DIRECTION:"),
+    ("CHARACTER CONTINUITY", "CHARACTER CONTINUITY:"),
+    ("OBJECT CONTINUITY", "OBJECT CONTINUITY:"),
+    ("CURRENT CAMERA / COMPOSITION", "CURRENT CAMERA / COMPOSITION:"),
+    ("CURRENT PHYSICAL STATE", "CURRENT PHYSICAL STATE:"),
+    ("WHAT CHANGED", "WHAT CHANGED:"),
+    ("VISUAL FOCUS", "VISUAL FOCUS:"),
+    ("DO NOT SHOW", "DO NOT SHOW:"),
+    ("SIMPLIFICATION RULE", "SIMPLIFICATION RULE:"),
 )
 
 
 def _extract_kie_semantic_sections(dynamic_prompt: str) -> dict[str, str]:
     positions: list[tuple[int, str, int]] = []
-    for heading in _KIE_SEMANTIC_HEADINGS:
-        marker = f"{heading}:"
+    for heading, marker in _KIE_SEMANTIC_PREFIXES:
         position = dynamic_prompt.find(marker)
         if position >= 0:
             positions.append((position, heading, position + len(marker)))
@@ -986,8 +1077,23 @@ def _extract_kie_semantic_sections(dynamic_prompt: str) -> dict[str, str]:
 def _kie_semantic_excerpt(heading: str, value: str, maximum: int) -> str:
     if heading == "VISUAL FOCUS" and "First notice:" in value:
         before, first_notice = value.split("First notice:", 1)
-        value = f"First notice: {first_notice.strip()} {before.strip()}"
+        value = f"{first_notice.strip()} {before.strip()}"
+    value = value.replace(":", ",")
     return _truncate_at_word(value, maximum)
+
+
+def _extract_kie_instruction(
+    prompt: str,
+    marker: str,
+    end_markers: tuple[str, ...],
+) -> str | None:
+    if marker not in prompt:
+        return None
+    value = prompt.split(marker, 1)[1]
+    endings = [value.find(item) for item in end_markers if item in value]
+    if endings:
+        value = value[: min(endings)]
+    return value.strip(" .") or None
 
 
 def _truncate_at_word(value: str, maximum: int) -> str:

@@ -6,8 +6,9 @@ from pathlib import Path
 
 import pytest
 
+from app.media import timeline_renderer
 from app.media.probe import probe_media
-from app.media.timeline_renderer import render_timeline_entry
+from app.media.timeline_renderer import mux_narration, render_timeline_entry
 from app.models.render import ProjectRenderConfig, RenderImageFit
 from app.models.timeline import NormalizedOverlay, NormalizedTransform
 
@@ -97,8 +98,54 @@ def test_every_overlay_type_produces_legal_video(
 def test_render_config_is_versioned_json_safe_and_rejects_odd_dimensions() -> None:
     config = ProjectRenderConfig()
     payload = config.model_dump(mode="json")
-    assert payload["version"] == "project_render_config_v1"
+    assert payload["version"] == "project_render_config_v2"
     assert payload["image_fit_mode"] == "COVER"
     assert payload["default_transition"] == "CUT"
     with pytest.raises(ValueError, match="even"):
         ProjectRenderConfig(width=319)
+
+
+def test_final_mux_applies_loudness_normalization(monkeypatch: pytest.MonkeyPatch) -> None:
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        timeline_renderer,
+        "_run_ffmpeg",
+        lambda command, stage: commands.append(command),
+    )
+
+    mux_narration(
+        "video.mp4",
+        "narration.wav",
+        "final.mp4",
+        frame_count=240,
+        config=ProjectRenderConfig(fps=24),
+    )
+
+    command = commands[0]
+    assert command[command.index("-af") + 1] == "loudnorm=I=-15:TP=-1:LRA=11"
+    assert command[command.index("-b:a") + 1] == "192k"
+
+
+def test_timeline_segments_use_crf_encoding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    commands: list[list[str]] = []
+    source = tmp_path / "source.png"
+    source.write_bytes(b"png")
+    monkeypatch.setattr(
+        timeline_renderer,
+        "_run_ffmpeg",
+        lambda command, stage: commands.append(command),
+    )
+
+    render_timeline_entry(
+        source,
+        tmp_path / "segment.mp4",
+        frame_count=24,
+        config=ProjectRenderConfig(fps=24),
+    )
+
+    command = commands[0]
+    assert command[command.index("-crf") + 1] == "20"
+    assert command[command.index("-preset") + 1] == "medium"

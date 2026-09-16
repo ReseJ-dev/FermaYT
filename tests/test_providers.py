@@ -2,7 +2,11 @@
 
 import pytest
 
-from app.clients.image_api import QwenImageProvider, SeedreamImageProvider, ZImageProvider
+from app.clients.image_api import (
+    QwenImageProvider,
+    SeedreamImageProvider,
+    ZImageProvider,
+)
 from app.clients.tts_api import ElevenLabsTTSApiClient, QwenTTSApiClient
 from app.providers import (
     ImageProvider,

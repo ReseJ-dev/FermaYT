@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pytest
 
-import app.pipeline.image_pipeline as image_pipeline
 from app.clients.image_api import ImageGenerationError
 from app.models.job import VideoJob, VideoJobStatus
 from app.models.scene import Scene
+from app.pipeline import image_pipeline
 from app.pipeline.image_pipeline import generate_job_images, generate_scene_image
 
 

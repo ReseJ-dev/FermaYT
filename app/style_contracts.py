@@ -10,7 +10,7 @@ from typing import Final
 from app.errors import StyleContractError
 
 NO_VISIBLE_TEXT_INSTRUCTION: Final = (
-    "Create one illustration containing absolutely no visible text of any kind: no "
+    "Create one illustration containing absolutely no visible text of any kind. No "
     "letters, words, numbers, captions, signs, labels, titles, watermarks, prompt "
     "wording, technical metadata, or UI. All instructions are metadata only."
 )
@@ -51,6 +51,20 @@ detailed rendering. Objects must use the minimum number of shapes needed for qui
 understanding. {self.priority_rule}
 
 This contract overrides any conflicting style instruction elsewhere in the request."""
+
+    def render_for_image_provider(self) -> str:
+        """Render the same contract as natural visual direction, without debug labels."""
+        required = "; ".join(self.required)
+        prohibited = "; ".join(self.prohibited)
+        return (
+            "Use this permanent drawing style throughout the entire illustration. "
+            f"{self.description} Required visual traits are {required}. "
+            f"Exclude {prohibited}. Historical accuracy applies to important layout "
+            "and recognizable objects, not detailed rendering. Objects must use the "
+            "minimum number of shapes needed for quick understanding. "
+            f"{self.priority_rule} These permanent drawing rules override any "
+            "conflicting style request."
+        )
 
 
 _ROUGH_EXPLAINER_CONFLICT_RULES: Final = (
@@ -136,6 +150,11 @@ IMAGE_STYLE_CONTRACTS: Final = MappingProxyType(
 )
 
 _STYLE_MARKER = re.compile(r"STYLE CONTRACT \[([^\]]+)]")
+_RAW_PROVIDER_METADATA_LABEL = re.compile(
+    r"(?i)\b(?:purpose|state|change|visual\s+operation|visual\s+reference|"
+    r"reference\s+instructions?|image\s+reference|planner\s+notes?|qa\s+notes?|"
+    r"style\s+contract)\s*:"
+)
 _TOKEN = re.compile(r"[a-z0-9]+(?:'[a-z]+)?")
 _HARD_CLAUSE_BOUNDARY = re.compile(r"[\n.;:!?]+")
 _SOFT_CLAUSE_BOUNDARY = re.compile(r"[,]+")
@@ -232,23 +251,36 @@ def apply_image_style_contract(
         raise ValueError("image prompt must not be empty")
 
     contract = get_image_style_contract(style_id)
-    rendered_contract = contract.render()
+    rendered_contract = contract.render_for_image_provider()
+    if normalized_prompt.endswith(rendered_contract):
+        dynamic_prompt = normalized_prompt[: -len(rendered_contract)].rstrip()
+        validate_image_style_prompt(dynamic_prompt, style_id)
+        return (
+            f"{sanitize_image_provider_prompt_text(dynamic_prompt)}\n\n"
+            f"{rendered_contract}"
+        )
     existing_markers = _STYLE_MARKER.findall(normalized_prompt)
     if existing_markers:
         if (
             existing_markers == [contract.style_id]
-            and normalized_prompt.endswith(rendered_contract)
-            and normalized_prompt.count(rendered_contract) == 1
+            and normalized_prompt.endswith(contract.render())
+            and normalized_prompt.count(contract.render()) == 1
         ):
-            dynamic_prompt = normalized_prompt[: -len(rendered_contract)].rstrip()
+            dynamic_prompt = normalized_prompt[: -len(contract.render())].rstrip()
             validate_image_style_prompt(dynamic_prompt, style_id)
-            return normalized_prompt
+            return (
+                f"{sanitize_image_provider_prompt_text(dynamic_prompt)}\n\n"
+                f"{rendered_contract}"
+            )
         raise StyleContractError(
             "Image prompt already contains a different or duplicated style contract"
         )
 
     validate_image_style_prompt(normalized_prompt, style_id)
-    return append_image_style_contract(normalized_prompt, style_id)
+    return append_image_style_contract(
+        sanitize_image_provider_prompt_text(normalized_prompt),
+        style_id,
+    )
 
 
 def append_image_style_contract(
@@ -264,7 +296,12 @@ def append_image_style_contract(
             "Validated image prompt must not already contain a style contract"
         )
     contract = get_image_style_contract(style_id)
-    return f"{normalized_prompt}\n\n{contract.render()}"
+    rendered_contract = contract.render_for_image_provider()
+    if normalized_prompt.endswith(rendered_contract):
+        raise StyleContractError(
+            "Validated image prompt must not already contain drawing rules"
+        )
+    return f"{normalized_prompt}\n\n{rendered_contract}"
 
 
 def prepare_image_prompt_for_provider(
@@ -276,17 +313,27 @@ def prepare_image_prompt_for_provider(
     if not normalized_prompt:
         raise ValueError("image prompt must not be empty")
     contract = get_image_style_contract(style_id)
-    rendered_contract = contract.render()
+    rendered_contract = contract.render_for_image_provider()
+    if normalized_prompt.endswith(rendered_contract):
+        dynamic_prompt = normalized_prompt[: -len(rendered_contract)].rstrip()
+        return _with_no_visible_text_instruction(
+            f"{sanitize_image_provider_prompt_text(dynamic_prompt)}\n\n"
+            f"{rendered_contract}"
+        )
     existing_markers = _STYLE_MARKER.findall(normalized_prompt)
     if not existing_markers:
         assembled = apply_image_style_contract(normalized_prompt, style_id)
         return _with_no_visible_text_instruction(assembled)
     if (
         existing_markers == [contract.style_id]
-        and normalized_prompt.endswith(rendered_contract)
-        and normalized_prompt.count(rendered_contract) == 1
+        and normalized_prompt.endswith(contract.render())
+        and normalized_prompt.count(contract.render()) == 1
     ):
-        return _with_no_visible_text_instruction(normalized_prompt)
+        dynamic_prompt = normalized_prompt[: -len(contract.render())].rstrip()
+        return _with_no_visible_text_instruction(
+            f"{sanitize_image_provider_prompt_text(dynamic_prompt)}\n\n"
+            f"{rendered_contract}"
+        )
     raise StyleContractError(
         "Image prompt contains a different, duplicated, or misplaced style contract"
     )
@@ -296,6 +343,12 @@ def _with_no_visible_text_instruction(prompt: str) -> str:
     if prompt.startswith(NO_VISIBLE_TEXT_INSTRUCTION):
         return prompt
     return f"{NO_VISIBLE_TEXT_INSTRUCTION}\n\n{prompt}"
+
+
+def sanitize_image_provider_prompt_text(value: str) -> str:
+    """Remove raw metadata-label syntax before text reaches an image model."""
+    sanitized = _RAW_PROVIDER_METADATA_LABEL.sub("", value)
+    return sanitized.replace(":", ",").strip()
 
 
 def validate_image_style_prompt(

@@ -445,9 +445,9 @@ def test_eight_beat_story_executes_asset_graph_without_unnecessary_calls(
         "reference", # beat 8
     ]
     assert "Narration for beat_1" not in (results[0].prompt_used or "")
-    assert "STYLE CONTRACT [rough_explainer_v1]" in (results[0].prompt_used or "")
-    assert "KEEP UNCHANGED" in (results[2].prompt_used or "")
-    assert "CHANGE ONLY" in (results[2].prompt_used or "")
+    assert "Use this permanent drawing style" in (results[0].prompt_used or "")
+    assert "Preserve the following established elements" in (results[2].prompt_used or "")
+    assert "Change only this physical state" in (results[2].prompt_used or "")
     assert results[1].source_result_id == results[0].id
     assert results[1].transform_metadata["type"] == "ZOOM_IN"
     assert results[4].source_result_id == results[3].id
@@ -464,7 +464,9 @@ def test_eight_beat_story_executes_asset_graph_without_unnecessary_calls(
     master = get_master_scene_asset(session, project_id, "shaft_master")
     assert master is not None
     assert Path(master.file_path).is_file()
-    assert plan.model_dump(mode="json") == _plan_payload()
+    expected_plan = _plan_payload()
+    expected_plan["planning_scope"] = None
+    assert plan.model_dump(mode="json") == expected_plan
 
     call_count = len(provider.calls)
     repeated = asyncio.run(executor.execute_project(project_id, execution.id))
@@ -776,7 +778,7 @@ def test_generated_candidate_passes_qa_and_becomes_accepted(
     assert result.qa_status == "PASS"
     assert result.qa_provider == "fake-vision"
     assert result.qa_model == "fake-vision-model"
-    assert result.qa_prompt_version == "visual_qa_v3"
+    assert result.qa_prompt_version == "visual_qa_v4"
     assert result.accepted_at is not None
     assert len(result.qa_evaluations) == 1
     assert client.calls[0][1][0] == result.output_path
@@ -788,7 +790,7 @@ def test_generated_candidate_passes_qa_and_becomes_accepted(
     assert len(client.calls) == 1
 
 
-def test_invalid_visual_qa_result_keeps_generated_beat_with_warning(
+def test_invalid_visual_qa_result_rejects_generated_beat(
     session: Session,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -808,20 +810,16 @@ def test_invalid_visual_qa_result_keeps_generated_beat_with_warning(
         qa_service=VisualQAService(client),
     )
 
-    result = asyncio.run(executor.execute_beat(project_id, execution.id, "beat_1"))
+    with pytest.raises(BeatVisualExecutionError, match="Visual QA unavailable"):
+        asyncio.run(executor.execute_beat(project_id, execution.id, "beat_1"))
 
+    result = list_beat_visual_results(session, project_id, beat_id="beat_1")[-1]
     assert result.generation_status == "SUCCEEDED"
-    assert result.is_accepted is True
-    assert result.qa_status == "PASS_WITH_WARNING"
-    assert result.qa_problem_categories == ["OTHER"]
+    assert result.is_accepted is False
+    assert result.qa_status == "ERROR"
     assert result.qa_warning is not None
-    assert "kept without automated QA" in result.qa_warning
+    assert "rejected without automated QA" in result.qa_warning
     assert result.qa_evaluations == []
-    assert Path(result.output_path or "").is_file()
-
-    repeated = asyncio.run(executor.execute_beat(project_id, execution.id, "beat_1"))
-    assert repeated.id == result.id
-    assert len(client.calls) == 1
 
 
 def test_complete_asset_graph_produces_visual_qa_debug_summary(
@@ -920,10 +918,10 @@ def test_edit_qa_retry_preserves_source_references_and_original_constraints(
     assert [reference.reference_id for reference in edit_calls[0][2]] == [
         reference.reference_id for reference in edit_calls[1][2]
     ]
-    assert "KEEP UNCHANGED" in edit_calls[1][1]
-    assert "CHANGE ONLY" in edit_calls[1][1]
+    assert "Preserve the following established elements" in edit_calls[1][1]
+    assert "Change only this physical state" in edit_calls[1][1]
     assert "Restore the original camera" in edit_calls[1][1]
-    assert "STYLE CONTRACT [rough_explainer_v1]" in edit_calls[1][1]
+    assert "Use this permanent drawing style" in edit_calls[1][1]
 
 
 def test_hard_qa_failures_stop_at_limit_and_rejected_never_becomes_source(
@@ -1154,7 +1152,7 @@ def test_visual_qa_result_and_immutable_evaluation_survive_restart(
         assert persisted.qa_revision is not None
         assert persisted.is_accepted is True
         assert len(persisted.qa_evaluations) == 1
-        assert persisted.qa_evaluations[0].prompt_version == "visual_qa_v3"
+        assert persisted.qa_evaluations[0].prompt_version == "visual_qa_v4"
     engine.dispose()
 
 

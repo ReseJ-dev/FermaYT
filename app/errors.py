@@ -53,6 +53,39 @@ class StructuredAIProviderError(RuntimeError):
         self.user_summary = user_summary or message
 
 
+class PlanningBillingUncertainError(RuntimeError):
+    """Pause boundary after a request may have executed remotely."""
+
+    user_summary = (
+        "Planning request timed out locally. Provider billing status is unknown. "
+        "Retrying may create a second charge."
+    )
+
+    def __init__(self, attempt_id: str, outcome: str) -> None:
+        super().__init__(self.user_summary)
+        self.attempt_id = attempt_id
+        self.outcome = outcome
+
+
+class PlanningAttemptLimitError(RuntimeError):
+    """Raised before dispatch when the visible paid planning budget is exhausted."""
+
+    def __init__(self, limit: int) -> None:
+        self.limit = limit
+        self.user_summary = f"Paid planning request limit reached ({limit})"
+        super().__init__(self.user_summary)
+
+
+class PlanningTooLargeError(RuntimeError):
+    """A planning prompt cannot fit inside its configured hard token ceilings."""
+
+    code = "PLANNING_TOO_LARGE_FOR_SINGLE_REQUEST"
+
+    def __init__(self, message: str) -> None:
+        self.user_summary = f"{self.code}: {message}"
+        super().__init__(self.user_summary)
+
+
 class ProjectVisualPlanError(RuntimeError):
     """Raised when a persisted Project visual plan cannot be loaded safely."""
 

@@ -8,6 +8,7 @@ from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
 
+from app.asset_roles import RENDERABLE_VISUAL_ASSET_ROLES
 from app.generators.style_reference import to_style_image_reference
 from app.models.visual_plan import VisualBeat, VisualOperation, VisualPlan
 from app.persistence import (
@@ -53,6 +54,8 @@ def select_source_asset(
     explicit_sources = set(decision.source_visual_ids)
 
     for result in accepted_results:
+        if result.asset_role not in RENDERABLE_VISUAL_ASSET_ROLES:
+            continue
         state = result.semantic_state_snapshot
         position = int(state.get("beat_position", -1))
         if position >= current_position or not result.output_path or not result.file_sha256:

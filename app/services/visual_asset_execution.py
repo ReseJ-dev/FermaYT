@@ -22,7 +22,6 @@ from app.errors import (
     VisualOperationResolutionError,
     VisualQAError,
 )
-from app.generators.image_prompt import ImagePromptBuilder
 from app.generators.master_scene import (
     ContinuityGenerationRequest,
     generate_continuity_image,
@@ -54,7 +53,6 @@ from app.persistence import (
 from app.pipeline.visual_qa import (
     VisualQAContext,
     VisualQAService,
-    apply_visual_qa_correction,
     build_visual_qa_request,
     is_hard_qa_failure,
     qa_candidate_penalty,
@@ -83,6 +81,11 @@ from app.repositories import (
     mark_beat_visual_result_failed,
     mark_beat_visual_result_succeeded,
     next_beat_visual_attempt,
+)
+from app.services.prompt_assembly import (
+    PromptTargetType,
+    build_auto_beat_scene_prompt,
+    compile_prompt_assembly,
 )
 from app.services.visual_asset_selection import (
     SelectedVisualReference,
@@ -372,13 +375,29 @@ class VisualBeatAssetExecutor:
             source=source,
         )
         references = tuple(item.reference for item in selected_references)
-        prompt = self._build_prompt(
+        auto_prompt = build_auto_beat_scene_prompt(
             context.project,
             context.plan,
             beat,
             operation,
             references,
+            style_id=self.style_id,
         )
+        base_assembly = compile_prompt_assembly(
+            self.session,
+            project=context.project,
+            plan_record=context.execution_plan.visual_plan,
+            plan=context.plan,
+            target_type=PromptTargetType.BEAT,
+            target_id=beat.id,
+            operation=operation,
+            auto_scene_prompt=auto_prompt,
+            references=references,
+            style_id=self.style_id,
+            provider=context.execution_plan.provider,
+            model=context.execution_plan.model,
+        )
+        prompt = base_assembly.assembled_prompt_before_provider_transform
         transform = _build_transform(beat) if operation is VisualOperation.TRANSFORM else None
         overlay = _build_overlay(beat) if operation is VisualOperation.OVERLAY else None
         semantic_state = _semantic_state_snapshot(
@@ -404,7 +423,7 @@ class VisualBeatAssetExecutor:
                 "style_version": self.style_id,
                 "provider": context.execution_plan.provider,
                 "model": context.execution_plan.model,
-                "prompt": prompt,
+                "prompt_assembly": base_assembly.as_dict(),
                 "transform": transform,
                 "overlay": overlay,
                 "visual_qa_policy": {
@@ -453,6 +472,7 @@ class VisualBeatAssetExecutor:
             beat=beat,
             operation=operation,
             prompt=prompt,
+            prompt_assembly_snapshot=base_assembly.as_dict(),
             semantic_state=semantic_state,
             generation_revision=generation_revision,
             reference_snapshot=reference_snapshot,
@@ -464,6 +484,7 @@ class VisualBeatAssetExecutor:
             beat=beat,
             operation=operation,
             prompt=prompt,
+            prompt_assembly_snapshot=base_assembly.as_dict(),
             semantic_state=semantic_state,
             generation_revision=generation_revision,
             source=source,
@@ -494,11 +515,22 @@ class VisualBeatAssetExecutor:
             else:
                 assert source is not None
                 planned_output_path = source.path
-            prompt_used = apply_visual_qa_correction(
-                prompt or "",
-                correction,
-                self.style_id,
-            ) if correction is not None else prompt
+            attempt_assembly = compile_prompt_assembly(
+                self.session,
+                project=context.project,
+                plan_record=context.execution_plan.visual_plan,
+                plan=context.plan,
+                target_type=PromptTargetType.BEAT,
+                target_id=beat.id,
+                operation=operation,
+                auto_scene_prompt=auto_prompt,
+                references=references,
+                style_id=self.style_id,
+                provider=context.execution_plan.provider,
+                model=context.execution_plan.model,
+                qa_correction=correction,
+            )
+            prompt_used = attempt_assembly.assembled_prompt_before_provider_transform
             if operation in generated_operations and self.budget_guard is not None:
                 self.budget_guard.check_paid_call(
                     pipeline_stage="VISUAL_GENERATION",
@@ -528,6 +560,7 @@ class VisualBeatAssetExecutor:
                 file_sha256=None,
                 master_scene_id=beat.master_scene_id,
                 prompt_used=prompt_used,
+                prompt_assembly_snapshot=attempt_assembly.as_dict(),
                 provider=context.execution_plan.provider,
                 model=context.execution_plan.model,
                 production_profile=context.execution_plan.production_profile,
@@ -553,7 +586,7 @@ class VisualBeatAssetExecutor:
                 if operation in generated_operations:
                     request = ContinuityGenerationRequest(
                         operation=operation,
-                        prompt=prompt_used or "",
+                        prompt=attempt_assembly.final_provider_prompt or "",
                         master_scene_id=beat.master_scene_id,
                         master_image_path=(
                             master_asset.file_path
@@ -568,6 +601,7 @@ class VisualBeatAssetExecutor:
                         planned_output_path,
                         context.provider,
                         downloader=self.downloader,
+                        prompt_is_final=True,
                     )
                     self._record_usage(
                         context,
@@ -643,7 +677,7 @@ class VisualBeatAssetExecutor:
                 context,
                 beat,
                 operation,
-                prompt_used or "",
+                attempt_assembly.final_provider_prompt or "",
                 source_path=source.path if source is not None else None,
                 master_asset=master_asset,
                 style_id=self.style_id,
@@ -706,31 +740,21 @@ class VisualBeatAssetExecutor:
                     )
                     warning = (
                         f"Visual QA unavailable for beat {beat.id}; "
-                        "generated candidate kept without automated QA"
+                        "generated candidate rejected without automated QA"
                     )
                     logger.warning(
                         "%s",
                         warning,
                         extra={"error_type": type(exc).__name__},
                     )
-                    unavailable_decision = VisualQADecision(
-                        result="PASS_WITH_WARNING",
-                        problem_categories=["OTHER"],
-                        reasons=["Visual QA provider did not return a valid decision"],
-                        correction_instruction=None,
-                        severity="minor",
-                    )
-                    return apply_automated_visual_qa_decision(
-                        self.session,
-                        result,
-                        unavailable_decision,
-                        qa_revision=qa_revision,
-                        prompt_version=self.qa_service.prompt_version,
-                        provider=self.qa_service.provider,
-                        model=self.qa_service.model,
-                        qa_attempt=qa_attempt,
-                        warning=warning,
-                    )
+                    result.qa_status = "ERROR"
+                    result.qa_warning = warning
+                    result.is_accepted = False
+                    result.accepted_at = None
+                    self.session.commit()
+                    raise BeatVisualExecutionError(
+                        f"Visual QA unavailable for beat {beat.id}"
+                    ) from exc
             else:
                 qa_decision = VisualQADecision.model_validate(
                     previous_evaluation.decision_snapshot
@@ -808,6 +832,7 @@ class VisualBeatAssetExecutor:
         beat: VisualBeat,
         operation: VisualOperation,
         prompt: str | None,
+        prompt_assembly_snapshot: dict[str, Any],
         semantic_state: dict[str, Any],
         generation_revision: str,
         reference_snapshot: list[dict[str, Any]],
@@ -833,9 +858,6 @@ class VisualBeatAssetExecutor:
                 candidate.execution_plan_id != context.execution_plan.id
                 and candidate.production_profile
                 == context.execution_plan.production_profile
-                and candidate.visual_plan_id == context.execution_plan.visual_plan_id
-                and candidate.visual_plan_revision
-                == context.execution_plan.visual_plan_revision
                 and candidate.resolved_operation == operation.value
                 and candidate.semantic_state_snapshot == semantic_state
                 and candidate.prompt_used == prompt
@@ -865,6 +887,7 @@ class VisualBeatAssetExecutor:
                 file_sha256=candidate.file_sha256,
                 master_scene_id=beat.master_scene_id,
                 prompt_used=prompt,
+                prompt_assembly_snapshot=prompt_assembly_snapshot,
                 provider=candidate.provider,
                 model=candidate.model,
                 production_profile=context.execution_plan.production_profile,
@@ -912,6 +935,7 @@ class VisualBeatAssetExecutor:
         beat: VisualBeat,
         operation: VisualOperation,
         prompt: str | None,
+        prompt_assembly_snapshot: dict[str, Any],
         semantic_state: dict[str, Any],
         generation_revision: str,
         source: SelectedVisualReference | None,
@@ -943,9 +967,6 @@ class VisualBeatAssetExecutor:
         for candidate in candidates:
             if not (
                 candidate.production_profile == ProductionProfile.DRAFT.value
-                and candidate.visual_plan_id == context.execution_plan.visual_plan_id
-                and candidate.visual_plan_revision
-                == context.execution_plan.visual_plan_revision
                 and candidate.resolved_operation == operation.value
                 and candidate.semantic_state_snapshot == semantic_state
                 and candidate.prompt_used == prompt
@@ -982,6 +1003,7 @@ class VisualBeatAssetExecutor:
                 file_sha256=candidate.file_sha256,
                 master_scene_id=beat.master_scene_id,
                 prompt_used=prompt,
+                prompt_assembly_snapshot=prompt_assembly_snapshot,
                 provider=context.execution_plan.provider,
                 model=context.execution_plan.model,
                 production_profile=ProductionProfile.FINAL.value,
@@ -1065,37 +1087,6 @@ class VisualBeatAssetExecutor:
             is_qa_retry=is_qa_retry,
         )
 
-    @staticmethod
-    def _build_prompt(
-        project: Project,
-        plan: VisualPlan,
-        beat: VisualBeat,
-        operation: VisualOperation,
-        references: tuple[Any, ...],
-    ) -> str | None:
-        if operation in {
-            VisualOperation.REUSE,
-            VisualOperation.TRANSFORM,
-            VisualOperation.OVERLAY,
-        }:
-            return None
-        builder = ImagePromptBuilder()
-        if operation is VisualOperation.EDIT_EXISTING:
-            return builder.build_edit(
-                plan,
-                beat,
-                references=references,
-                project_style_prompt=project.global_image_style_prompt,
-            )
-        return builder.build(
-            plan,
-            beat,
-            operation,
-            references=references,
-            project_style_prompt=project.global_image_style_prompt,
-        )
-
-
 def _build_qa_context(
     context: _ExecutionContext,
     beat: VisualBeat,
@@ -1118,6 +1109,20 @@ def _build_qa_context(
         for item in context.plan.important_objects
         if item.id in object_ids
     )
+    location = next(
+        item for item in context.plan.locations if item.id == beat.location_id
+    )
+    required_entities = tuple(
+        item.name for item in context.plan.characters if item.id in character_ids
+    )
+    required_attributes = tuple(
+        item.description for item in context.plan.characters if item.id in character_ids
+    )
+    forbidden_mismatches = list(beat.must_not_show)
+    if any("miner" in value.lower() for value in (*required_entities, *required_attributes)):
+        forbidden_mismatches.extend(
+            ("generic civilians", "people without work clothing", "people without mining helmets")
+        )
     return VisualQAContext(
         visual_purpose=beat.visual_purpose,
         what_viewer_should_understand=beat.what_viewer_should_understand,
@@ -1148,6 +1153,11 @@ def _build_qa_context(
         information_added_beyond_narration=(
             beat.information_added_beyond_narration
         ),
+        required_entities=required_entities,
+        required_attributes=required_attributes,
+        required_environment=f"{location.description}; {location.spatial_layout}",
+        required_state=beat.physical_state,
+        forbidden_major_mismatches=tuple(dict.fromkeys(forbidden_mismatches)),
     )
 
 

@@ -1,8 +1,8 @@
 """Pipeline for rendering prepared scenes."""
 
 import asyncio
-from pathlib import Path
 from collections.abc import Sequence
+from pathlib import Path
 
 from app.media.scene_renderer import ImageFit, render_scene
 from app.models.job import VideoJob, VideoJobStatus

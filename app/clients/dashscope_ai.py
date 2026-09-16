@@ -8,8 +8,12 @@ import os
 from pathlib import Path
 from typing import Any, ClassVar
 
+from app.clients.structured_completion import (
+    StructuredCompletionMetadata,
+    complete_json_chat,
+    missing_key_error,
+)
 from app.errors import StructuredAIProviderError
-from app.clients.structured_completion import complete_json_chat, missing_key_error
 
 
 class _DashScopeStructuredClient:
@@ -32,6 +36,7 @@ class _DashScopeStructuredClient:
         max_attempts: int = MAX_ATTEMPTS,
         retry_base_delay: float = RETRY_BASE_DELAY_SECONDS,
         max_output_tokens: int = MAX_OUTPUT_TOKENS,
+        allow_transport_retries: bool = True,
     ) -> None:
         self.api_key = api_key
         self.model = model.strip()
@@ -40,6 +45,9 @@ class _DashScopeStructuredClient:
         self.max_attempts = max_attempts
         self.retry_base_delay = retry_base_delay
         self.max_output_tokens = max_output_tokens
+        self.configured_max_output_tokens = max_output_tokens
+        self.allow_transport_retries = allow_transport_retries
+        self.last_completion_metadata: StructuredCompletionMetadata | None = None
         if not self.model:
             raise ValueError("DashScope model must not be empty")
         if timeout <= 0:
@@ -65,6 +73,7 @@ class _DashScopeStructuredClient:
                 operation=operation,
                 environment_name="DASHSCOPE_API_KEY",
             )
+        self.last_completion_metadata = None
         return await complete_json_chat(
             provider=self.provider,
             model=self.model,
@@ -73,11 +82,15 @@ class _DashScopeStructuredClient:
             api_key=api_key,
             messages=messages,
             timeout=self.timeout,
-            max_attempts=self.max_attempts,
-            retry_base_delay=self.retry_base_delay,
+            max_attempts=self.max_attempts if self.allow_transport_retries else 1,
+            retry_base_delay=(self.retry_base_delay if self.allow_transport_retries else 0),
             max_output_tokens=self.max_output_tokens,
             temperature=0.1,
+            on_metadata=self._capture_metadata,
         )
+
+    def _capture_metadata(self, metadata: StructuredCompletionMetadata) -> None:
+        self.last_completion_metadata = metadata
 
 
 class DashScopeVisualPlanningClient(_DashScopeStructuredClient):
@@ -90,8 +103,8 @@ class DashScopeVisualPlanningClient(_DashScopeStructuredClient):
         model: str = "qwen-plus",
         endpoint: str | None = None,
         timeout: float = 600.0,
-        max_attempts: int = _DashScopeStructuredClient.MAX_ATTEMPTS,
-        retry_base_delay: float = _DashScopeStructuredClient.RETRY_BASE_DELAY_SECONDS,
+        max_attempts: int = 1,
+        retry_base_delay: float = 0.0,
         max_output_tokens: int = _DashScopeStructuredClient.MAX_OUTPUT_TOKENS,
     ) -> None:
         super().__init__(
@@ -102,6 +115,7 @@ class DashScopeVisualPlanningClient(_DashScopeStructuredClient):
             max_attempts=max_attempts,
             retry_base_delay=retry_base_delay,
             max_output_tokens=max_output_tokens,
+            allow_transport_retries=False,
         )
 
     async def generate(self, prompt: str) -> str:

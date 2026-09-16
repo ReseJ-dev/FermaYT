@@ -5,10 +5,10 @@ from pathlib import Path
 
 import pytest
 
-import app.pipeline.audio_pipeline as audio_pipeline
 from app.errors import TTSGenerationError
 from app.models.job import VideoJob, VideoJobStatus
 from app.models.scene import Scene
+from app.pipeline import audio_pipeline
 from app.pipeline.audio_pipeline import (
     generate_job_audio,
     generate_scene_audio,

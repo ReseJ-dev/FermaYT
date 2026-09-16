@@ -13,6 +13,7 @@ from app.persistence import (
     BeatVisualQAEvaluation,
     BeatVisualResult,
     MasterSceneAsset,
+    MasterSceneGenerationAttempt,
     Project,
     ProjectNarrationAlignment,
     ProjectNarrationAsset,
@@ -148,6 +149,11 @@ PROJECT_UPDATE_FIELDS = frozenset(
         "scene_count",
         "planning_provider",
         "planning_model",
+        "planning_budget_amount",
+        "planning_max_paid_requests",
+        "planning_max_input_tokens",
+        "planning_max_output_tokens",
+        "planning_max_total_estimated_tokens",
         "visual_qa_enabled",
         "visual_qa_provider",
         "visual_qa_model",
@@ -225,6 +231,11 @@ def create_project(
     scene_count: int | None = None,
     planning_provider: str = "dashscope",
     planning_model: str = "qwen-plus",
+    planning_budget_amount: float | None = None,
+    planning_max_paid_requests: int = 2,
+    planning_max_input_tokens: int = 20_000,
+    planning_max_output_tokens: int = 32_768,
+    planning_max_total_estimated_tokens: int = 100_000,
     visual_qa_enabled: bool = True,
     visual_qa_provider: str = "dashscope",
     visual_qa_model: str = "qwen-vl-max",
@@ -264,6 +275,11 @@ def create_project(
         scene_count=scene_count,
         planning_provider=planning_provider,
         planning_model=planning_model,
+        planning_budget_amount=planning_budget_amount,
+        planning_max_paid_requests=planning_max_paid_requests,
+        planning_max_input_tokens=planning_max_input_tokens,
+        planning_max_output_tokens=planning_max_output_tokens,
+        planning_max_total_estimated_tokens=planning_max_total_estimated_tokens,
         visual_qa_enabled=visual_qa_enabled,
         visual_qa_provider=visual_qa_provider,
         visual_qa_model=visual_qa_model,
@@ -343,12 +359,28 @@ def delete_project(session: Session, project_id: str) -> bool:
 def get_project_visual_plan_record(
     session: Session,
     project_id: str,
+    *,
+    scope_key: str | None = None,
 ) -> ProjectVisualPlan | None:
-    """Load the current persisted visual-plan record for a Project."""
+    """Load the active scoped plan, defaulting safely to the canonical FULL plan."""
+    active = session.info.get("active_visual_plan")
+    if scope_key is None and isinstance(active, tuple) and active[0] == project_id:
+        statement = select(ProjectVisualPlan).where(ProjectVisualPlan.id == active[1])
+        return session.scalar(statement)
+    effective_scope = scope_key or "FULL"
     statement = select(ProjectVisualPlan).where(
-        ProjectVisualPlan.project_id == project_id
+        ProjectVisualPlan.project_id == project_id,
+        ProjectVisualPlan.scope_key == effective_scope,
     )
     return session.scalar(statement)
+
+
+def set_active_project_visual_plan(
+    session: Session,
+    project_id: str,
+    visual_plan_id: str,
+) -> None:
+    session.info["active_visual_plan"] = (project_id, visual_plan_id)
 
 
 def save_project_visual_plan_record(
@@ -359,19 +391,43 @@ def save_project_visual_plan_record(
     visual_director_version: str,
     story_text_hash: str,
     plan_json: dict[str, Any],
+    scope_key: str = "FULL",
+    scope_type: str = "FULL",
+    requested_seconds: float | None = None,
+    requested_beats: int | None = None,
+    source_start_char: int = 0,
+    source_end_char: int = 0,
+    source_hash: str = "",
+    is_partial: bool = False,
+    continuation_boundary_char: int | None = None,
+    expected_beat_count: int | None = None,
+    planning_max_output_tokens: int | None = None,
 ) -> ProjectVisualPlan:
     """Atomically create or replace a Project's validated visual plan."""
     project = get_project(session, project_id)
     if project is None:
         raise ValueError(f"Project not found: {project_id}")
 
-    record = get_project_visual_plan_record(session, project_id)
+    record = get_project_visual_plan_record(
+        session, project_id, scope_key=scope_key
+    )
     if record is None:
         record = ProjectVisualPlan(
             project=project,
             schema_version=schema_version,
             visual_director_version=visual_director_version,
             story_text_hash=story_text_hash,
+            scope_key=scope_key,
+            scope_type=scope_type,
+            requested_seconds=requested_seconds,
+            requested_beats=requested_beats,
+            source_start_char=source_start_char,
+            source_end_char=source_end_char,
+            source_hash=source_hash,
+            is_partial=is_partial,
+            continuation_boundary_char=continuation_boundary_char,
+            expected_beat_count=expected_beat_count,
+            planning_max_output_tokens=planning_max_output_tokens,
             plan_json=plan_json,
         )
         session.add(record)
@@ -379,6 +435,16 @@ def save_project_visual_plan_record(
         record.schema_version = schema_version
         record.visual_director_version = visual_director_version
         record.story_text_hash = story_text_hash
+        record.scope_type = scope_type
+        record.requested_seconds = requested_seconds
+        record.requested_beats = requested_beats
+        record.source_start_char = source_start_char
+        record.source_end_char = source_end_char
+        record.source_hash = source_hash
+        record.is_partial = is_partial
+        record.continuation_boundary_char = continuation_boundary_char
+        record.expected_beat_count = expected_beat_count
+        record.planning_max_output_tokens = planning_max_output_tokens
         record.plan_json = plan_json
         record.updated_at = datetime.now(UTC)
 
@@ -809,6 +875,7 @@ def create_master_scene_asset(
     file_sha256: str,
     style_version: str,
     generation_prompt: str,
+    prompt_assembly_snapshot: dict[str, Any] | None = None,
     provider: str,
     model: str | None = None,
     seed: int | None = None,
@@ -828,6 +895,7 @@ def create_master_scene_asset(
         file_sha256=file_sha256,
         style_version=style_version,
         generation_prompt=generation_prompt,
+        prompt_assembly_snapshot=prompt_assembly_snapshot,
         provider=provider,
         model=model,
         seed=seed,
@@ -837,6 +905,84 @@ def create_master_scene_asset(
     session.commit()
     session.refresh(asset)
     return asset
+
+
+def create_master_scene_generation_attempt(
+    session: Session,
+    *,
+    project_id: str,
+    visual_plan_id: str,
+    visual_plan_revision: str,
+    master_scene_id: str,
+    prompt_assembly_snapshot: dict[str, Any],
+    provider: str,
+    model: str | None,
+    output_path: str,
+) -> MasterSceneGenerationAttempt:
+    """Persist the immutable request trace before dispatching a master call."""
+    attempt = (
+        session.scalar(
+            select(func.max(MasterSceneGenerationAttempt.attempt)).where(
+                MasterSceneGenerationAttempt.project_id == project_id,
+                MasterSceneGenerationAttempt.visual_plan_revision
+                == visual_plan_revision,
+                MasterSceneGenerationAttempt.master_scene_id == master_scene_id,
+            )
+        )
+        or 0
+    ) + 1
+    record = MasterSceneGenerationAttempt(
+        project_id=project_id,
+        visual_plan_id=visual_plan_id,
+        visual_plan_revision=visual_plan_revision,
+        master_scene_id=master_scene_id,
+        attempt=attempt,
+        prompt_assembly_snapshot=prompt_assembly_snapshot,
+        provider=provider,
+        model=model,
+        output_path=output_path,
+        generation_status="PENDING",
+    )
+    session.add(record)
+    session.commit()
+    session.refresh(record)
+    return record
+
+
+def update_master_scene_generation_attempt(
+    session: Session,
+    record: MasterSceneGenerationAttempt,
+    *,
+    generation_status: str | None = None,
+    qa_result: dict[str, Any] | None = None,
+    error: str | None = None,
+) -> MasterSceneGenerationAttempt:
+    if generation_status is not None:
+        record.generation_status = generation_status
+    if qa_result is not None:
+        record.qa_result = qa_result
+    if error is not None:
+        record.error = error
+    record.updated_at = datetime.now(UTC)
+    session.commit()
+    session.refresh(record)
+    return record
+
+
+def list_master_scene_generation_attempts(
+    session: Session,
+    project_id: str,
+) -> list[MasterSceneGenerationAttempt]:
+    return list(
+        session.scalars(
+            select(MasterSceneGenerationAttempt)
+            .where(MasterSceneGenerationAttempt.project_id == project_id)
+            .order_by(
+                MasterSceneGenerationAttempt.created_at,
+                MasterSceneGenerationAttempt.attempt,
+            )
+        )
+    )
 
 
 def get_master_scene_asset(

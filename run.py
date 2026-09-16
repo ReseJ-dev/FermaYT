@@ -5,7 +5,6 @@ from pathlib import Path
 
 import uvicorn
 
-
 HOST = "127.0.0.1"
 PORT = 8000
 APP_DIR = Path(__file__).resolve().parent
@@ -48,5 +47,14 @@ def main() -> None:
         remove_own_pid_file()
 
 
-if __name__ == "__main__":
+def cli_main() -> None:
+    """Run the server and never wait for abandoned worker threads on shutdown."""
     main()
+    # Cancelling an asyncio.to_thread task cannot stop its underlying provider
+    # worker. Uvicorn has already completed application shutdown at this point,
+    # so exit the desktop process instead of waiting indefinitely for that thread.
+    os._exit(0)
+
+
+if __name__ == "__main__":
+    cli_main()

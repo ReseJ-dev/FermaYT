@@ -40,6 +40,20 @@ class BudgetSnapshot:
         return asdict(self)
 
 
+@dataclass(frozen=True, slots=True)
+class PlanningBudgetSnapshot:
+    enabled: bool
+    amount: float | None
+    currency: str
+    spent: float
+    reserved_unknown: float
+    remaining: float | None
+    next_estimated_cost: float | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return asdict(self)
+
+
 class GenerationBudgetError(RuntimeError):
     """A safe, structured pause reason raised before a paid request."""
 
@@ -82,6 +96,48 @@ class GenerationBudgetError(RuntimeError):
             "master_scene_id": self.master_scene_id,
             "budget": self.snapshot.as_dict(),
         }
+
+
+class PlanningBudgetError(GenerationBudgetError):
+    """Planning-specific budget pause carrying reservation accounting."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        planning_snapshot: PlanningBudgetSnapshot,
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> None:
+        amount = planning_snapshot.amount
+        committed = planning_snapshot.spent + planning_snapshot.reserved_unknown
+        generic_snapshot = BudgetSnapshot(
+            enabled=planning_snapshot.enabled,
+            amount=amount,
+            currency=planning_snapshot.currency,
+            spent=committed,
+            available=planning_snapshot.remaining,
+            used_percent=(committed / amount * 100 if amount else None),
+            warning_threshold_percent=100,
+            warning=None,
+        )
+        self.planning_snapshot = planning_snapshot
+        super().__init__(
+            code,
+            message,
+            snapshot=generic_snapshot,
+            pipeline_stage="PLANNING",
+            next_call_cost=planning_snapshot.next_estimated_cost,
+            provider=provider,
+            model=model,
+            operation="PLANNING",
+        )
+
+    def as_dict(self) -> dict[str, object]:
+        result = super().as_dict()
+        result["planning_budget"] = self.planning_snapshot.as_dict()
+        return result
 
 
 class ProjectBudgetGuard:

@@ -49,12 +49,6 @@ def build_production_pipeline_dependencies(
     planning_timeout = _environment_float(
         "VISUAL_PLANNING_TIMEOUT_SECONDS", 600.0, minimum=1.0
     )
-    planning_max_attempts = _environment_int(
-        "VISUAL_PLANNING_MAX_ATTEMPTS", 3, minimum=1
-    )
-    planning_retry_delay = _environment_float(
-        "VISUAL_PLANNING_RETRY_BASE_SECONDS", 1.0, minimum=0.0
-    )
     planning_max_tokens = _environment_int(
         "VISUAL_PLANNING_MAX_OUTPUT_TOKENS", 32_768, minimum=1
     )
@@ -128,8 +122,8 @@ def build_production_pipeline_dependencies(
             api_key=dashscope_key,
             model=project.planning_model,
             timeout=planning_timeout,
-            max_attempts=planning_max_attempts,
-            retry_base_delay=planning_retry_delay,
+            max_attempts=1,
+            retry_base_delay=0,
             max_output_tokens=planning_max_tokens,
         )
     elif project.planning_provider == "kimi":
@@ -149,8 +143,8 @@ def build_production_pipeline_dependencies(
             api_key=kimi_key,
             model=project.planning_model,
             timeout=planning_timeout,
-            max_attempts=planning_max_attempts,
-            retry_base_delay=planning_retry_delay,
+            max_attempts=1,
+            retry_base_delay=0,
             max_output_tokens=planning_max_tokens,
             reasoning_effort=planning_reasoning_effort,
         )

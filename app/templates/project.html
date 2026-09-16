@@ -9,7 +9,7 @@
       <h1>{{ project.name }}</h1>
       <p class="lead">{{ scene_cards | length }} сцен · {{ project.width }}×{{ project.height }} · {{ project.fps }} FPS</p>
     </div>
-    <span class="status-pill">{{ 'COMPLETED' if final_video_url else ('PILOT READY' if pilot_video_url else ('DRAFT READY' if draft_video_url else (latest_job.status.value | upper if latest_job else 'NEW'))) }}</span>
+    <div class="compact-actions"><a class="button button-secondary" href="/projects/{{ project.id }}/prompts">Visual Plan → Prompts</a><span class="status-pill">{{ 'COMPLETED' if final_video_url else ('PILOT READY' if pilot_video_url else ('DRAFT READY' if draft_video_url else (latest_job.status.value | upper if latest_job else 'NEW'))) }}</span></div>
   </div>
 
   <div class="workspace-layout">
@@ -40,6 +40,14 @@
                   </select>
                 </label>
                 <label>Planning model<input id="planning-model" name="planning_model" required value="{{ project.planning_model }}"><small id="planning-provider-help"></small></label>
+                <h3>Hard planning guards</h3>
+                <div class="form-grid two-columns">
+                  <label>Planning budget<input name="planning_budget_amount" type="number" min="0.000001" step="0.000001" value="{{ project.planning_budget_amount or '' }}" placeholder="0.25"><small>Пусто — отдельный денежный лимит выключен.</small></label>
+                  <label>Платных запросов максимум<input name="planning_max_paid_requests" type="number" min="1" required value="{{ project.planning_max_paid_requests }}"></label>
+                  <label>Input tokens максимум<input name="planning_max_input_tokens" type="number" min="1" required value="{{ project.planning_max_input_tokens }}"></label>
+                  <label>Output tokens максимум<input name="planning_max_output_tokens" type="number" min="1" required value="{{ project.planning_max_output_tokens }}"></label>
+                  <label>Input + output максимум<input name="planning_max_total_estimated_tokens" type="number" min="1" required value="{{ project.planning_max_total_estimated_tokens }}"></label>
+                </div>
                 <label>Style contract<input name="style_id" required value="{{ project.style_id }}"><small>{{ 'Style reference зарегистрирован' if style_reference else 'Используется текстовый style contract' }}</small></label>
                 <label class="qa-toggle"><input name="visual_qa_enabled" type="checkbox" value="1" {% if project.visual_qa_enabled %}checked{% endif %}> Проверять каждый AI-кадр через Visual QA</label>
                 <input type="hidden" name="visual_qa_provider" value="dashscope">
@@ -267,11 +275,14 @@
             <small>Оценка Final: {% if final_cost_estimate.minimum is not none %}{{ '%.4f' | format(final_cost_estimate.minimum) }}–{{ '%.4f' | format(final_cost_estimate.maximum) }} {{ final_cost_estimate.currency }}{% else %}после visual plan / настройки тарифов{% endif %}</small>
           </div>
           <button class="button button-secondary button-full" id="continue-over-budget" type="button" {% if not latest_job or latest_job.status.value != 'paused_budget' %}hidden{% endif %}>Продолжить несмотря на лимит</button>
+          <button class="button button-secondary button-full" id="retry-planning-anyway" type="button" {% if not latest_job or latest_job.status.value != 'paused_planning' %}hidden{% endif %}>RETRY ANYWAY — возможна повторная оплата</button>
+          <button class="button button-secondary button-full" id="cancel-generation" type="button" {% if not latest_job or latest_job.status.value not in ['queued', 'running', 'paused_planning'] %}hidden{% endif %}>{{ 'Stop' if latest_job and latest_job.status.value == 'paused_planning' else 'Остановить локально' }}</button>
         </div>
         <section class="pipeline-progress" id="pipeline-progress" {% if not latest_job %}hidden{% endif %}>
-          <div class="pipeline-progress-head"><strong id="pipeline-stage">{{ latest_job.current_stage or latest_job.status.value if latest_job else '' }}</strong><span id="pipeline-percent">{{ latest_job.progress if latest_job else 0 }}%</span></div>
-          <progress id="pipeline-progress-bar" max="100" value="{{ latest_job.progress if latest_job else 0 }}"></progress>
+          <div class="pipeline-progress-head"><strong id="pipeline-stage">{{ latest_job.current_stage or latest_job.status.value if latest_job else '' }}</strong><span id="pipeline-percent" {% if latest_job and latest_job.current_stage == 'PLANNING' %}hidden{% endif %}>{{ latest_job.progress if latest_job else 0 }}%</span></div>
+          <progress id="pipeline-progress-bar" max="100" value="{{ latest_job.progress if latest_job else 0 }}" {% if latest_job and latest_job.current_stage == 'PLANNING' %}hidden{% endif %}></progress>
           <p id="pipeline-message">{{ latest_job.message or '' if latest_job else '' }}</p>
+          <p id="planning-attempts"></p>
           <p class="pipeline-error" id="pipeline-error">{{ latest_job.error or '' if latest_job else '' }}</p>
         </section>
         <section class="cost-summary" id="cost-summary">

@@ -15,6 +15,7 @@ from pydantic import ValidationError
 
 from app.budgets import GenerationBudgetError
 from app.errors import VisualQAError
+from app.generators.image_prompt import sanitize_provider_visual_text
 from app.models.visual_plan import VisualBeat
 from app.models.visual_qa import (
     VisualQADecision,
@@ -29,7 +30,7 @@ from app.style_contracts import (
 
 logger = logging.getLogger(__name__)
 
-VISUAL_QA_PROMPT_VERSION = "visual_qa_v3"
+VISUAL_QA_PROMPT_VERSION = "visual_qa_v4"
 
 
 class VisualQAClient(Protocol):
@@ -59,6 +60,12 @@ class VisualQAContext:
     previous_frame_path: str | None = None
     source_reference_path: str | None = None
     information_added_beyond_narration: str | None = None
+    required_entities: tuple[str, ...] = ()
+    required_attributes: tuple[str, ...] = ()
+    required_environment: str | None = None
+    required_state: str | None = None
+    forbidden_major_mismatches: tuple[str, ...] = ()
+    generated_text_explicitly_required: bool = False
 
     @classmethod
     def from_beat(
@@ -159,6 +166,7 @@ async def generate_with_visual_qa(
     max_retries: int = 2,
     before_qa_request: Callable[[int], object] | None = None,
     on_qa_request: Callable[[int, bool], object] | None = None,
+    on_qa_decision: Callable[[str, VisualQADecision], object] | None = None,
 ) -> VisualQAOutcome:
     """Generate, inspect and correct a frame without an unbounded retry loop."""
     if not 0 <= max_retries <= 5:
@@ -196,6 +204,8 @@ async def generate_with_visual_qa(
             if before_qa_request is not None:
                 before_qa_request(attempt)
             decision = await qa_service.evaluate(generated_path, context)
+            if on_qa_decision is not None:
+                on_qa_decision(generated_path, decision)
             if on_qa_request is not None:
                 on_qa_request(attempt, True)
         except VisualQAError:
@@ -312,18 +322,30 @@ REQUIRED STORY INFORMATION:
 - camera / composition: {context.camera_view}
 - provider-ready generation prompt: {context.generation_prompt or 'not supplied'}
 - information added beyond narration: {information_added}
+- required entities: {', '.join(context.required_entities) or 'none'}
+- required identity attributes: {', '.join(context.required_attributes) or 'none'}
+- required environment: {context.required_environment or context.location_id}
+- required story state: {context.required_state or context.expected_physical_state}
+- forbidden major mismatches: {', '.join(context.forbidden_major_mismatches) or 'none'}
 
 CHECK STORY ACCURACY: required objects, visible physical action, and intended purpose.
+Explicitly verify every required entity, its story-critical role/identity attributes,
+the required environment, and required physical state. Generic people cannot replace
+named roles such as miners: required work clothing and mining helmets must remain
+recognizable. Use MISSING_REQUIRED_ENTITY, WRONG_ENTITY_IDENTITY, WRONG_ENVIRONMENT,
+or WRONG_PHYSICAL_STATE for these hard failures.
 CHECK CONTINUITY: master location, recurring characters and objects; reject environment
 redesign. CHECK STYLE: reject realism, excess detail, polish, cinematic treatment,
 childishness, and unwanted textures. CHECK COMPOSITION: action prominence, clutter,
 scale of important objects, and overcrowding. CHECK VIDEO READABILITY: rapid
 understanding, needed simplification, and whether crop/framing should change.
-CHECK UNWANTED TEXT: reject any visible prompt wording, section heading, operation name,
+CHECK UNINTENDED TEXT: reject any visible prompt wording, pseudo-text, caption, section
+heading, operation name,
 technical label, watermark, or interface text unless readable story-world text is
-explicitly required by the scene. Any visible phrase such as VISUAL OPERATION, VISUAL
+explicitly required by the scene ({context.generated_text_explicitly_required}). Any
+visible phrase such as VISUAL OPERATION, PURPOSE, STATE, CHANGE, VISUAL
 REFERENCE, REFERENCE INSTRUCTIONS, IMAGE REFERENCE, or STYLE CONTRACT is always a hard
-REGENERATE with problem category UNWANTED_TEXT, never PASS or PASS_WITH_WARNING.
+REGENERATE with problem category UNINTENDED_TEXT, never PASS or PASS_WITH_WARNING.
 CHECK VISUAL PROGRESSION: compared with the previous frame when supplied, confirm
 that the beat advances state, understanding, framing, or route information without
 an arbitrary location switch or needless repetition.
@@ -352,6 +374,9 @@ this schema, with no markdown or commentary:
 
 
 _HARD_FAILURE_CATEGORIES = {
+    VisualQAProblemCategory.MISSING_REQUIRED_ENTITY,
+    VisualQAProblemCategory.WRONG_ENTITY_IDENTITY,
+    VisualQAProblemCategory.WRONG_ENVIRONMENT,
     VisualQAProblemCategory.MISSING_REQUIRED_OBJECT,
     VisualQAProblemCategory.WRONG_PHYSICAL_STATE,
     VisualQAProblemCategory.WRONG_CHARACTER,
@@ -359,9 +384,11 @@ _HARD_FAILURE_CATEGORIES = {
     VisualQAProblemCategory.STORY_ACCURACY,
     VisualQAProblemCategory.CONTINUITY,
     VisualQAProblemCategory.STYLE_DRIFT_REALISM,
+    VisualQAProblemCategory.STYLE_DRIFT,
     VisualQAProblemCategory.EDIT_CHANGED_TOO_MUCH,
     VisualQAProblemCategory.COMPOSITION_UNCLEAR,
     VisualQAProblemCategory.UNWANTED_TEXT,
+    VisualQAProblemCategory.UNINTENDED_TEXT,
     VisualQAProblemCategory.VIDEO_READABILITY,
 }
 
@@ -399,13 +426,17 @@ def apply_visual_qa_correction(
         raise ValueError("correction_instruction must not be empty")
     if "STYLE CONTRACT [" in correction:
         raise VisualQAError("QA correction cannot replace the image style contract")
-    contract = get_image_style_contract(style_id).render()
+    style = get_image_style_contract(style_id)
+    contract = style.render_for_image_provider()
     normalized_prompt = prompt.strip()
     if normalized_prompt.endswith(contract):
         normalized_prompt = normalized_prompt[: -len(contract)].rstrip()
+    elif normalized_prompt.endswith(style.render()):
+        normalized_prompt = normalized_prompt[: -len(style.render())].rstrip()
+    correction = sanitize_provider_visual_text(correction)
     corrected_dynamic_prompt = (
-        f"{normalized_prompt}\n\nVISUAL QA CORRECTION FOR REGENERATION:\n"
-        f"{correction}\nPreserve all elements that QA did not identify as problems."
+        f"{normalized_prompt}\n\nRegenerate the illustration so that {correction}. "
+        "Preserve every correct visual element."
     )
     return apply_image_style_contract(corrected_dynamic_prompt, style_id)
 
@@ -440,7 +471,10 @@ def _candidate_penalty(decision: VisualQADecision) -> int:
         VisualQAProblemCategory.COMPOSITION: 4,
         VisualQAProblemCategory.STYLE_DRIFT: 3,
     }
-    return sum(category_weights[category] for category in decision.problem_categories)
+    return sum(
+        category_weights.get(category, 2)
+        for category in decision.problem_categories
+    )
 
 
 def _candidate_path(output_path: str, attempt: int) -> str:

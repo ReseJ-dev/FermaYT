@@ -82,6 +82,17 @@ class Project(Base):
             name="ck_projects_generation_budget_warning_threshold",
         ),
         CheckConstraint(
+            "planning_budget_amount IS NULL OR planning_budget_amount > 0",
+            name="ck_projects_planning_budget_amount",
+        ),
+        CheckConstraint("planning_max_paid_requests > 0", name="ck_projects_planning_paid"),
+        CheckConstraint("planning_max_input_tokens > 0", name="ck_projects_planning_input"),
+        CheckConstraint("planning_max_output_tokens > 0", name="ck_projects_planning_output"),
+        CheckConstraint(
+            "planning_max_total_estimated_tokens > 0",
+            name="ck_projects_planning_total_tokens",
+        ),
+        CheckConstraint(
             "draft_paid_visual_ratio BETWEEN 0.05 AND 1",
             name="ck_projects_draft_paid_visual_ratio",
         ),
@@ -110,6 +121,21 @@ class Project(Base):
     )
     planning_model: Mapped[str] = mapped_column(
         String(255), nullable=False, default="qwen-plus"
+    )
+    planning_budget_amount: Mapped[float | None] = mapped_column(
+        Numeric(18, 8), nullable=True, default=None
+    )
+    planning_max_paid_requests: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=2
+    )
+    planning_max_input_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=20_000
+    )
+    planning_max_output_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=32_768
+    )
+    planning_max_total_estimated_tokens: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=100_000
     )
     visual_qa_enabled: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=True
@@ -184,10 +210,10 @@ class Project(Base):
         cascade="all, delete-orphan",
         order_by="Scene.position",
     )
-    visual_plan: Mapped[ProjectVisualPlan | None] = relationship(
+    visual_plans: Mapped[list[ProjectVisualPlan]] = relationship(
         back_populates="project",
         cascade="all, delete-orphan",
-        uselist=False,
+        order_by="ProjectVisualPlan.updated_at",
     )
     visual_execution_plans: Mapped[list[ProjectVisualExecutionPlan]] = relationship(
         back_populates="project",
@@ -233,6 +259,23 @@ class Project(Base):
         back_populates="project",
         passive_deletes=True,
         order_by="ProviderUsageRecord.created_at",
+    )
+    planning_provider_attempts: Mapped[list[PlanningProviderAttempt]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="PlanningProviderAttempt.started_at",
+    )
+    visual_prompt_overrides: Mapped[list[VisualPromptOverride]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="VisualPromptOverride.updated_at",
+    )
+    master_scene_generation_attempts: Mapped[list[MasterSceneGenerationAttempt]] = (
+        relationship(
+            back_populates="project",
+            cascade="all, delete-orphan",
+            order_by="MasterSceneGenerationAttempt.created_at",
+        )
     )
 
     @validates("story_text")
@@ -288,6 +331,26 @@ class Project(Base):
         del key
         if value is not None and value <= 0:
             raise ValueError("generation_budget_amount must be positive")
+        return value
+
+    @validates("planning_budget_amount")
+    def validate_planning_budget_amount(
+        self, key: str, value: float | None
+    ) -> float | None:
+        del key
+        if value is not None and value <= 0:
+            raise ValueError("planning_budget_amount must be positive")
+        return value
+
+    @validates(
+        "planning_max_paid_requests",
+        "planning_max_input_tokens",
+        "planning_max_output_tokens",
+        "planning_max_total_estimated_tokens",
+    )
+    def validate_planning_limit(self, key: str, value: int) -> int:
+        if value < 1:
+            raise ValueError(f"{key} must be positive")
         return value
 
     @validates("generation_budget_currency")
@@ -428,13 +491,14 @@ class Scene(Base):
 
 
 class ProjectVisualPlan(Base):
-    """Current validated semantic visual plan for one Project."""
+    """One full or partial scoped semantic visual plan for a Project."""
 
     __tablename__ = "project_visual_plans"
     __table_args__ = (
         UniqueConstraint(
             "project_id",
-            name="uq_project_visual_plans_project",
+            "scope_key",
+            name="uq_project_visual_plans_project_scope",
         ),
     )
 
@@ -454,6 +518,21 @@ class ProjectVisualPlan(Base):
         nullable=False,
     )
     story_text_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    scope_key: Mapped[str] = mapped_column(String(64), nullable=False, default="FULL")
+    scope_type: Mapped[str] = mapped_column(String(32), nullable=False, default="FULL")
+    requested_seconds: Mapped[float | None] = mapped_column(Float, nullable=True)
+    requested_beats: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    source_start_char: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    source_end_char: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    source_hash: Mapped[str] = mapped_column(String(64), nullable=False, default="")
+    is_partial: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    continuation_boundary_char: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
+    expected_beat_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    planning_max_output_tokens: Mapped[int | None] = mapped_column(
+        Integer, nullable=True
+    )
     plan_json: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime(),
@@ -467,7 +546,7 @@ class ProjectVisualPlan(Base):
         nullable=False,
     )
 
-    project: Mapped[Project] = relationship(back_populates="visual_plan")
+    project: Mapped[Project] = relationship(back_populates="visual_plans")
     execution_plans: Mapped[list[ProjectVisualExecutionPlan]] = relationship(
         back_populates="visual_plan",
         cascade="all, delete-orphan",
@@ -635,6 +714,9 @@ class BeatVisualResult(Base):
     )
     beat_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
     resolved_operation: Mapped[str] = mapped_column(String(32), nullable=False)
+    asset_role: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="RENDERABLE_BEAT"
+    )
     source_result_id: Mapped[str | None] = mapped_column(
         ForeignKey("beat_visual_results.id", ondelete="SET NULL"),
         nullable=True,
@@ -649,6 +731,9 @@ class BeatVisualResult(Base):
     file_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
     master_scene_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     prompt_used: Mapped[str | None] = mapped_column(Text, nullable=True)
+    prompt_assembly_snapshot: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True
+    )
     provider: Mapped[str] = mapped_column(String(50), nullable=False)
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     production_profile: Mapped[str] = mapped_column(
@@ -1089,6 +1174,9 @@ class MasterSceneAsset(Base):
     file_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
     style_version: Mapped[str] = mapped_column(String(64), nullable=False)
     generation_prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    prompt_assembly_snapshot: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True
+    )
     provider: Mapped[str] = mapped_column(String(50), nullable=False)
     model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     seed: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -1104,6 +1192,88 @@ class MasterSceneAsset(Base):
     )
 
     project: Mapped[Project] = relationship(back_populates="master_scene_assets")
+
+
+class VisualPromptOverride(Base):
+    """Desired scene content override scoped to one immutable plan revision target."""
+
+    __tablename__ = "visual_prompt_overrides"
+    __table_args__ = (
+        UniqueConstraint(
+            "project_id",
+            "visual_plan_revision",
+            "target_type",
+            "target_id",
+            name="uq_visual_prompt_override_revision_target",
+        ),
+        CheckConstraint(
+            "target_type IN ('BEAT', 'MASTER_SCENE')",
+            name="ck_visual_prompt_override_target_type",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    visual_plan_id: Mapped[str] = mapped_column(
+        String(36), nullable=False, index=True
+    )
+    visual_plan_revision: Mapped[str] = mapped_column(
+        String(64), nullable=False, index=True
+    )
+    target_type: Mapped[str] = mapped_column(String(20), nullable=False)
+    target_id: Mapped[str] = mapped_column(String(255), nullable=False)
+    scene_prompt_override: Mapped[str] = mapped_column(Text, nullable=False)
+    base_semantic_fingerprint: Mapped[str] = mapped_column(
+        String(64), nullable=False
+    )
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utc_now, onupdate=_utc_now, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="visual_prompt_overrides")
+
+
+class MasterSceneGenerationAttempt(Base):
+    """Immutable master prompt trace plus mutable request/QA outcome metadata."""
+
+    __tablename__ = "master_scene_generation_attempts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    visual_plan_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    visual_plan_revision: Mapped[str] = mapped_column(
+        String(64), nullable=False, index=True
+    )
+    master_scene_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    attempt: Mapped[int] = mapped_column(Integer, nullable=False)
+    prompt_assembly_snapshot: Mapped[dict[str, Any]] = mapped_column(
+        JSON, nullable=False
+    )
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    output_path: Mapped[str] = mapped_column(Text, nullable=False)
+    generation_status: Mapped[str] = mapped_column(String(32), nullable=False)
+    qa_result: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utc_now, onupdate=_utc_now, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(
+        back_populates="master_scene_generation_attempts"
+    )
 
 
 class StyleReferenceAsset(Base):
@@ -1206,6 +1376,77 @@ class ProviderUsageRecord(Base):
     )
 
     project: Mapped[Project] = relationship(back_populates="provider_usage_records")
+
+
+class PlanningProviderAttempt(Base):
+    """Durable audit record created before one paid planning POST is dispatched."""
+
+    __tablename__ = "planning_provider_attempts"
+    __table_args__ = (
+        UniqueConstraint(
+            "planning_run_id",
+            "attempt_number",
+            name="uq_planning_provider_attempt_run_number",
+        ),
+        CheckConstraint(
+            "attempt_number >= 1",
+            name="ck_planning_provider_attempt_number",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    job_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    planning_run_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    provider: Mapped[str] = mapped_column(String(100), nullable=False)
+    model: Mapped[str] = mapped_column(String(255), nullable=False)
+    attempt_kind: Mapped[str] = mapped_column(String(16), nullable=False)
+    attempt_number: Mapped[int] = mapped_column(Integer, nullable=False)
+    request_revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    input_token_estimate: Mapped[int] = mapped_column(Integer, nullable=False)
+    configured_max_output_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    expected_beat_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    estimated_max_cost: Mapped[float | None] = mapped_column(
+        Numeric(18, 8), nullable=True
+    )
+    actual_cost: Mapped[float | None] = mapped_column(Numeric(18, 8), nullable=True)
+    currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    status: Mapped[str] = mapped_column(String(64), nullable=False)
+    billing_status: Mapped[str] = mapped_column(String(16), nullable=False)
+    cost_certainty: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="UNKNOWN"
+    )
+    progress_state: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="WAITING_FOR_PROVIDER"
+    )
+    validation_category: Mapped[str | None] = mapped_column(
+        String(100), nullable=True
+    )
+    remote_execution_status: Mapped[str | None] = mapped_column(
+        String(64), nullable=True
+    )
+    provider_request_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True
+    )
+    input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    safe_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    started_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utc_now, nullable=False
+    )
+    dispatched_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    response_received_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+    validation_started_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+    finished_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+
+    project: Mapped[Project] = relationship(back_populates="planning_provider_attempts")
 
 
 @event.listens_for(MasterSceneAsset, "before_update")

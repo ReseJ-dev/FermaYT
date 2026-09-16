@@ -34,7 +34,7 @@ def test_contract_is_appended_after_scene_prompt() -> None:
 
     assert result.startswith("A wide mine cutaway\n\n")
     assert result.endswith(
-        "This contract overrides any conflicting style instruction elsewhere in the request."
+        "These permanent drawing rules override any conflicting style request."
     )
 
 
@@ -42,7 +42,18 @@ def test_contract_injection_is_idempotent() -> None:
     once = apply_image_style_contract("A wide mine cutaway")
 
     assert apply_image_style_contract(once) == once
-    assert once.count("STYLE CONTRACT [rough_explainer_v1]") == 1
+    assert once.count("Use this permanent drawing style") == 1
+
+
+def test_provider_boundary_strips_raw_planner_metadata_labels() -> None:
+    prompt = prepare_image_prompt_for_provider(
+        "Purpose: show miners. State: rising water. Change: blocked exit."
+    )
+
+    assert "Purpose:" not in prompt
+    assert "State:" not in prompt
+    assert "Change:" not in prompt
+    assert "STYLE CONTRACT" not in prompt
 
 
 @pytest.mark.parametrize(
@@ -63,7 +74,7 @@ def test_scene_prompt_cannot_override_contract(prompt: str) -> None:
 def test_explicit_negative_constraint_is_not_treated_as_override() -> None:
     result = apply_image_style_contract("A mine scene, not photorealistic")
 
-    assert "STYLE CONTRACT [rough_explainer_v1]" in result
+    assert "Use this permanent drawing style" in result
 
 
 def test_unknown_future_style_version_fails_explicitly() -> None:
@@ -331,7 +342,7 @@ def test_validation_precedes_contract_injection(
     result = style_contracts.apply_image_style_contract("A flat cartoon mine")
 
     assert observed_prompts == ["A flat cartoon mine"]
-    assert "STYLE CONTRACT [rough_explainer_v1]" in result
+    assert "Use this permanent drawing style" in result
 
 
 def test_existing_permanent_contract_is_not_validated_as_dynamic_content(

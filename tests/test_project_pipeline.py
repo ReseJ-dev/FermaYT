@@ -21,22 +21,29 @@ from app.generation_scope import GenerationScope, GenerationScopeType
 from app.jobs import GenerationJobManager, GenerationJobType
 from app.models.visual_plan import VisualPlan
 from app.models.visual_qa import VisualQADecision
-from app.persistence import ProviderUsageRecord
+from app.persistence import ProjectVisualPlan, ProviderUsageRecord
 from app.pipeline.visual_qa import VisualQAService
 from app.production_profiles import ProductionProfile
 from app.provider_capabilities import ImageProviderCapabilities
 from app.repositories import (
     create_project,
+    get_project_visual_plan_record,
     list_beat_visual_results,
     list_master_scene_assets,
     list_project_narration_assets,
     list_project_timelines,
     list_project_video_renders,
+    save_project_visual_plan_record,
     update_project,
 )
 from app.services.project_pipeline import (
     ProjectPipelineDependencies,
     run_project_video_pipeline,
+)
+from app.services.visual_planning import (
+    VISUAL_DIRECTOR_VERSION,
+    VISUAL_PLAN_SCHEMA_VERSION,
+    hash_story_text,
 )
 from app.tts_capabilities import TTSProviderCapabilities
 
@@ -55,10 +62,15 @@ class FakePlanningClient:
     def __init__(self, plan: VisualPlan | None = None) -> None:
         self.calls = 0
         self.plan = plan or _plan()
+        self.prompts: list[str] = []
 
     async def generate(self, prompt: str) -> str:
         self.calls += 1
-        assert "COMPLETE NARRATION" in prompt
+        self.prompts.append(prompt)
+        assert (
+            "COMPLETE NARRATION" in prompt
+            or "SCOPED NARRATION EXCERPT" in prompt
+        )
         return json.dumps(self.plan.model_dump(mode="json"))
 
 
@@ -88,7 +100,8 @@ class FakeImageProvider:
 
     async def _call(self, prompt: str) -> str:
         self.calls += 1
-        assert "STYLE CONTRACT" in prompt
+        assert "Use this permanent drawing style" in prompt
+        assert "STYLE CONTRACT" not in prompt
         if self.calls == self.fail_call:
             raise RuntimeError("fake image timeout")
         return f"fake://image/{self.calls}"
@@ -388,7 +401,7 @@ def test_full_pipeline_uses_semantic_master_fallback_for_text_only_provider(
         planning_client=FakePlanningClient(),
         image_provider_resolver=image_resolver,
         tts_provider_resolver=lambda name, config: FakeTTSProvider(audio),
-        visual_qa_service=None,
+        visual_qa_service=VisualQAService(PassingQAClient()),
         projects_root=tmp_path / "projects",
         downloader=downloader,
     )
@@ -449,6 +462,37 @@ def test_full_pipeline_from_story_only_completes_background_job(
     assert render.status == "SUCCEEDED"
     assert Path(render.output_path or "").is_file()
     assert qa.calls >= 2  # master and generated beat
+
+
+def test_pipeline_replans_current_story_saved_by_legacy_visual_director(
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    image, audio = _assets(tmp_path)
+    project = _project(session)
+    legacy_plan = _plan()
+    save_project_visual_plan_record(
+        session,
+        project_id=project.id,
+        schema_version=VISUAL_PLAN_SCHEMA_VERSION,
+        visual_director_version="visual_director_v1",
+        story_text_hash=hash_story_text(project.story_text),
+        plan_json=legacy_plan.model_dump(mode="json"),
+    )
+    planning = FakePlanningClient(legacy_plan)
+    provider = FakeImageProvider()
+    qa = PassingQAClient()
+    dependencies = _dependencies(tmp_path, provider, image, audio, planning, qa)
+
+    report = asyncio.run(
+        run_project_video_pipeline(session, project.id, dependencies)
+    )
+
+    record = get_project_visual_plan_record(session, project.id)
+    assert planning.calls == 1
+    assert report.reused["visual_plan"] is False
+    assert record is not None
+    assert record.visual_director_version == VISUAL_DIRECTOR_VERSION
 
 
 def test_pipeline_preflight_budget_blocks_images_before_provider_call(
@@ -761,6 +805,12 @@ def test_pilot_renders_prefix_then_full_reuses_pilot_assets(
     assert full_render.render_revision != pilot_render.render_revision
     assert full_render.generation_scope_type == "FULL"
     assert project.story_text == original_story
+    scoped_plan_rows = session.execute(
+        select(ProjectVisualPlan.scope_type).where(
+            ProjectVisualPlan.project_id == project.id
+        )
+    ).scalars().all()
+    assert sorted(scoped_plan_rows) == ["FIRST_BEATS", "FULL"]
     assert len(list_project_narration_assets(session, project.id)) == 1
     pilot_usage = list(
         session.scalars(
@@ -774,3 +824,54 @@ def test_pilot_renders_prefix_then_full_reuses_pilot_assets(
     )
     assert pilot_usage and full_usage
     assert any(item.status == "CACHED" for item in full_usage)
+
+
+def test_thirty_second_pilot_of_long_story_plans_excerpt_and_renders(
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    image, audio = _assets(tmp_path)
+    story = " ".join(
+        f"word{index}{'.' if (index + 1) % 20 == 0 else ''}"
+        for index in range(1441)
+    )
+    project = _project(session)
+    project = update_project(session, project.id, story_text=story)
+    assert project is not None
+    payload = _plan().model_dump(mode="json")
+    base = payload["visual_beats"][0]
+    payload["visual_beats"] = [
+        {
+            **base,
+            "id": f"beat_{index}",
+            "narration_segment": f"word{(index - 1) * 20} through word{index * 20 - 1}",
+        }
+        for index in range(1, 7)
+    ]
+    planning = FakePlanningClient(VisualPlan.model_validate(payload))
+    provider = FakeImageProvider()
+    qa = PassingQAClient()
+
+    report = asyncio.run(
+        run_project_video_pipeline(
+            session,
+            project.id,
+            _dependencies(tmp_path, provider, image, audio, planning, qa),
+            job_id="long-pilot",
+            generation_scope=GenerationScope(
+                GenerationScopeType.FIRST_SECONDS,
+                30,
+            ),
+        )
+    )
+
+    assert Path(report.final_mp4).is_file()
+    assert "SCOPED NARRATION EXCERPT" in planning.prompts[0]
+    assert "word1440" not in planning.prompts[0]
+    scoped_records = [
+        item for item in project.visual_plans if item.scope_type == "FIRST_SECONDS"
+    ]
+    assert len(scoped_records) == 1
+    assert scoped_records[0].is_partial is True
+    assert scoped_records[0].requested_seconds == 30
+    assert scoped_records[0].source_end_char < len(story)

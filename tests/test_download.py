@@ -9,7 +9,6 @@ import pytest
 
 from app.utils.download import download_file
 
-
 ResponseHandler = Callable[[httpx.Request], httpx.Response]
 
 

@@ -73,8 +73,8 @@ def test_kimi_planning_does_not_require_dashscope_when_qa_is_disabled(
     assert dependencies.planning_client.model == "kimi-k3"
     assert dependencies.planning_client.api_key == "kimi-key"
     assert dependencies.planning_client.timeout == 720
-    assert dependencies.planning_client.max_attempts == 2
-    assert dependencies.planning_client.retry_base_delay == 0.25
+    assert dependencies.planning_client.max_attempts == 1
+    assert dependencies.planning_client.retry_base_delay == 0
     assert dependencies.planning_client.max_output_tokens == 20_000
     assert dependencies.planning_client.reasoning_effort == "high"
     engine.dispose()

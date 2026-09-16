@@ -1,0 +1,76 @@
+{% extends "base.html" %}
+
+{% macro prompt_row(row) %}
+  <tr class="prompt-row" data-prompt-row data-target-type="{{ row.target_type }}" data-target-id="{{ row.target_id }}" data-mode="{{ row.prompt_mode or row.override_state }}" data-search="{{ row.target_id }} {{ row.narration or '' }} {{ row.summary or '' }}">
+    <td><code>{{ row.target_id }}</code></td>
+    <td><span class="prompt-summary">{{ row.narration or row.summary or '—' }}</span>{% if row.narration and row.summary %}<small>{{ row.summary }}</small>{% endif %}</td>
+    <td><span class="operation-pill">{{ row.operation or '—' }}</span>{% if row.operation_detail %}<small>{{ row.operation_detail }}</small>{% endif %}</td>
+    <td><span class="prompt-mode prompt-mode-{{ (row.prompt_mode or row.override_state) | lower }}" data-row-mode>{{ row.prompt_mode or row.override_state }}</span></td>
+    <td><span>{{ row.qa_status or row.generation_status or '—' }}</span></td>
+    <td><button class="button button-secondary button-small" type="button" data-inspect-prompt>Inspect / Edit</button></td>
+  </tr>
+{% endmacro %}
+
+{% block content %}
+  <div class="breadcrumbs"><a href="/">Проекты</a><span>/</span><a href="/projects/{{ project.id }}">{{ project.name }}</a><span>/</span><span>Visual Plan · Prompts</span></div>
+
+  <div class="page-heading prompt-sheet-heading">
+    <div><p class="eyebrow">Visual Plan</p><h1>Project Prompt Sheet</h1><p class="lead">{{ master_rows | length }} master scenes · {{ beat_rows | length }} visual beats</p></div>
+    <a class="button button-secondary" href="/projects/{{ project.id }}">Вернуться в проект</a>
+  </div>
+
+  <section class="panel prompt-sheet" data-prompt-sheet data-project-id="{{ project.id }}" data-provider="{{ project.image_provider }}" data-model="{{ project.image_model or '' }}">
+    <div class="prompt-sheet-toolbar">
+      <label class="prompt-search">Поиск<input type="search" placeholder="Beat ID, narration, semantic summary…" data-prompt-search></label>
+      <label>Режим<select data-prompt-filter><option value="ALL">ALL</option><option value="AUTO">AUTO ONLY</option><option value="OVERRIDE">OVERRIDES</option><option value="STALE">STALE</option><option value="REVIEW_REQUIRED">REVIEW REQUIRED</option><option value="NO_PROVIDER_CALL">NO PROVIDER CALL</option></select></label>
+      <div class="prompt-sheet-count" data-prompt-count>{{ master_rows | length + beat_rows | length }} targets</div>
+    </div>
+
+    {% if not master_rows and not beat_rows %}
+      <div class="empty-state compact-empty"><h3>Visual Plan ещё не создан</h3><p>Запустите планирование видео. После этого master scenes и beats появятся здесь автоматически.</p></div>
+    {% else %}
+      <section class="prompt-group" aria-labelledby="prompt-masters-title">
+        <div class="prompt-group-heading"><div><p class="eyebrow">Continuity first</p><h2 id="prompt-masters-title">MASTER SCENES</h2></div><span class="status-pill">{{ master_rows | length }}</span></div>
+        <div class="prompt-table-scroll"><table class="prompt-table"><thead><tr><th>ID</th><th>Semantic summary</th><th>Operation</th><th>Prompt mode</th><th>QA / generation</th><th></th></tr></thead><tbody>{% for row in master_rows %}{{ prompt_row(row) }}{% endfor %}</tbody></table></div>
+      </section>
+
+      <section class="prompt-group" aria-labelledby="prompt-beats-title">
+        <div class="prompt-group-heading"><div><p class="eyebrow">Timeline visuals</p><h2 id="prompt-beats-title">BEAT VISUALS</h2></div><span class="status-pill">{{ beat_rows | length }}</span></div>
+        <div class="prompt-table-scroll"><table class="prompt-table"><thead><tr><th>ID</th><th>Narration / semantic summary</th><th>Operation</th><th>Prompt mode</th><th>QA / generation</th><th></th></tr></thead><tbody>{% for row in beat_rows %}{{ prompt_row(row) }}{% endfor %}</tbody></table></div>
+      </section>
+    {% endif %}
+
+    {% if orphaned_rows %}
+      <details class="orphaned-overrides"><summary>ORPHANED OVERRIDES · {{ orphaned_rows | length }}</summary><p>Эти targets отсутствуют в текущем VisualPlan. Overrides не применяются.</p><ul>{% for row in orphaned_rows %}<li><code>{{ row.target_type }} / {{ row.target_id }}</code></li>{% endfor %}</ul></details>
+    {% endif %}
+  </section>
+
+  <dialog class="modal prompt-detail-modal" id="prompt-detail-dialog">
+    <div class="prompt-detail-shell">
+      <div class="modal-heading"><div><p class="eyebrow" data-detail-type>TARGET</p><h2 data-detail-id>—</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Закрыть">×</button></div>
+      <div class="prompt-detail-status" data-detail-status></div>
+      <div class="prompt-detail-grid">
+        <section class="prompt-detail-main">
+          <div class="prompt-field" data-narration-field><h3>NARRATION</h3><p data-detail-narration>—</p></div>
+          <div class="prompt-field"><h3>SEMANTIC REQUIREMENT</h3><dl class="prompt-kv" data-detail-semantics></dl></div>
+          <div class="prompt-field" data-provider-prompt-fields><h3>AUTO SCENE PROMPT</h3><pre data-detail-auto></pre></div>
+          <div class="prompt-field prompt-override-editor" data-provider-prompt-fields><div class="prompt-field-heading"><h3>MANUAL SCENE OVERRIDE</h3><span data-override-state>AUTO</span></div><textarea rows="6" data-override-input placeholder="Describe only the desired visual scene…"></textarea><small>Style, operation, references, semantics and QA remain automatic.</small><div class="prompt-editor-actions"><button class="button button-secondary button-small" type="button" data-edit-override>Edit Override</button><button class="button button-primary button-small" type="button" data-save-override>Save Override</button><button class="button button-secondary button-small" type="button" data-clear-override>Clear Override · Use Auto Prompt</button></div></div>
+          <div class="prompt-field" data-provider-prompt-fields><h3>EFFECTIVE SCENE PROMPT</h3><pre data-detail-effective></pre></div>
+          <div class="prompt-field"><h3>OPERATION</h3><p><strong data-detail-operation>—</strong></p><p data-detail-operation-instructions></p><p data-detail-operation-detail></p></div>
+          <div class="prompt-field"><h3>SOURCE ASSET</h3><p data-detail-source>—</p></div>
+          <div class="prompt-field"><h3>REFERENCES</h3><ul class="prompt-reference-list" data-detail-references></ul></div>
+          <div class="prompt-field"><h3>STYLE</h3><p><code data-detail-style>—</code></p></div>
+        </section>
+        <aside class="prompt-detail-preview">
+          <div class="prompt-preview-controls"><label>Provider<select data-preview-provider><option value="seedream">Seedream</option><option value="qwen">Qwen Image</option><option value="zimage">Z-Image</option></select></label><label>Model<input data-preview-model></label><button class="button button-secondary button-small" type="button" data-refresh-preview>Refresh exact preview</button></div>
+          <div class="prompt-field" data-provider-prompt-fields><h3>QA CORRECTION</h3><p data-detail-qa-correction>—</p></div>
+          <div class="prompt-field" data-provider-prompt-fields><h3>FINAL PROVIDER PROMPT</h3><pre class="final-provider-prompt" data-detail-final></pre></div>
+          <div class="prompt-field" data-provider-prompt-fields><h3>PROVIDER TRANSFORMATIONS</h3><ul data-detail-transformations></ul></div>
+          <div class="prompt-no-provider" data-no-provider hidden><strong>NO IMAGE PROVIDER CALL</strong><p>This operation uses an existing asset or a deterministic local operation.</p></div>
+        </aside>
+      </div>
+      <section class="prompt-history"><h3>GENERATION HISTORY</h3><div data-detail-history></div></section>
+      <p class="prompt-feedback" data-prompt-feedback role="status"></p>
+    </div>
+  </dialog>
+{% endblock %}

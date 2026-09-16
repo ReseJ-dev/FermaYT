@@ -5,6 +5,7 @@ import json
 import logging
 import re
 import sqlite3
+import threading
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -13,6 +14,7 @@ from pathlib import Path
 from uuid import uuid4
 
 from app.budgets import GenerationBudgetError
+from app.errors import PlanningBillingUncertainError
 from app.provider_diagnostics import (
     find_image_provider_diagnostic,
     find_structured_ai_provider_diagnostic,
@@ -28,6 +30,8 @@ class GenerationJobStatus(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     PAUSED_BUDGET = "paused_budget"
+    PAUSED_PLANNING = "paused_planning"
+    CANCELLED = "cancelled"
 
 
 class GenerationJobType(str, Enum):
@@ -73,6 +77,7 @@ class GenerationJobManager:
     def __init__(self, db_path: str | Path = "data/app.db") -> None:
         self.db_path = Path(db_path)
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._cancel_events: dict[str, threading.Event] = {}
         self._started = False
 
     async def startup(self) -> None:
@@ -90,6 +95,7 @@ class GenerationJobManager:
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
         self._tasks.clear()
+        self._cancel_events.clear()
 
     async def create_job(
         self,
@@ -153,13 +159,35 @@ class GenerationJobManager:
             generation_scope_type=generation_scope_type,
             generation_scope_value=generation_scope_value,
         )
+        self._cancel_events[job.id] = threading.Event()
         task = asyncio.create_task(
             self._run_job(job.id, operation),
             name=f"generation-job-{job.id}",
         )
         self._tasks[job.id] = task
-        task.add_done_callback(lambda _: self._tasks.pop(job.id, None))
+        task.add_done_callback(lambda _: self._forget_local_job(job.id))
         return job
+
+    def cancellation_event(self, job_id: str) -> threading.Event:
+        return self._cancel_events.setdefault(job_id, threading.Event())
+
+    async def cancel_job(self, job_id: str) -> GenerationJob | None:
+        """Request local cancellation without claiming remote cancellation."""
+        job = await self.get_job(job_id)
+        if job is None:
+            return None
+        if job.status not in {GenerationJobStatus.QUEUED, GenerationJobStatus.RUNNING}:
+            return job
+        self.cancellation_event(job_id).set()
+        await asyncio.to_thread(
+            self._update_status,
+            job_id,
+            GenerationJobStatus.CANCELLED,
+            "Cancelled locally; remote provider execution may still continue",
+            "REMOTE_EXECUTION_STATUS_UNKNOWN",
+            None,
+        )
+        return await self.get_job(job_id)
 
     async def update_progress(
         self,
@@ -240,7 +268,23 @@ class GenerationJobManager:
         try:
             await operation(job_id)
         except asyncio.CancelledError:
+            if self.cancellation_event(job_id).is_set():
+                await asyncio.to_thread(
+                    self._update_status,
+                    job_id,
+                    GenerationJobStatus.CANCELLED,
+                    "Cancelled locally; remote provider execution may still continue",
+                    "REMOTE_EXECUTION_STATUS_UNKNOWN",
+                    None,
+                )
+                return
             raise
+        except PlanningBillingUncertainError as exc:
+            logger.warning(
+                "Planning paused because provider billing is unknown",
+                extra={"job_id": job_id, "planning_attempt_id": exc.attempt_id},
+            )
+            await asyncio.to_thread(self._mark_planning_paused, job_id, exc)
         except GenerationBudgetError as exc:
             logger.warning(
                 "Generation job paused by budget: %s",
@@ -323,6 +367,37 @@ class GenerationJobManager:
                     connection.execute(
                         f"ALTER TABLE generation_jobs ADD COLUMN {name} {sql_type}"
                     )
+            has_planning_attempts = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' "
+                "AND name = 'planning_provider_attempts'"
+            ).fetchone()
+            if has_planning_attempts is not None:
+                connection.execute(
+                    """
+                    UPDATE generation_jobs
+                    SET status = ?, message = ?, error = ?, failed_stage = current_stage,
+                        completed_at = ?, updated_at = ?
+                    WHERE status = ? AND current_stage = 'PLANNING'
+                      AND EXISTS (
+                          SELECT 1 FROM planning_provider_attempts p
+                          WHERE p.job_id = generation_jobs.id
+                            AND p.status IN (
+                                'INTERRUPTED_BILLING_UNKNOWN',
+                                'TIMED_OUT_BILLING_UNKNOWN',
+                                'CANCELLED_LOCALLY_BILLING_UNKNOWN',
+                                'FAILED_BILLING_POSSIBLE'
+                            )
+                      )
+                    """,
+                    (
+                        GenerationJobStatus.PAUSED_PLANNING.value,
+                        "Planning paused; provider billing status is unknown",
+                        "Retrying may create a second charge",
+                        now,
+                        now,
+                        GenerationJobStatus.RUNNING.value,
+                    ),
+                )
             connection.execute(
                 """
                 UPDATE generation_jobs
@@ -600,6 +675,43 @@ class GenerationJobManager:
                     job_id,
                 ),
             )
+
+    def _mark_planning_paused(
+        self,
+        job_id: str,
+        error: PlanningBillingUncertainError,
+    ) -> None:
+        now = _serialize_datetime(_utc_now())
+        report = {
+            "summary": error.user_summary,
+            "planning_billing_pause": {
+                "attempt_id": error.attempt_id,
+                "outcome": error.outcome,
+                "message": error.user_summary,
+            },
+        }
+        with self._connect() as connection:
+            connection.execute(
+                """
+                UPDATE generation_jobs
+                SET status = ?, message = ?, error = ?, failed_stage = current_stage,
+                    report_json = ?, completed_at = ?, updated_at = ?
+                WHERE id = ?
+                """,
+                (
+                    GenerationJobStatus.PAUSED_PLANNING.value,
+                    "Planning paused; billing status unknown",
+                    error.user_summary,
+                    json.dumps(report, ensure_ascii=False, sort_keys=True),
+                    now,
+                    now,
+                    job_id,
+                ),
+            )
+
+    def _forget_local_job(self, job_id: str) -> None:
+        self._tasks.pop(job_id, None)
+        self._cancel_events.pop(job_id, None)
 
     def _connect(self) -> sqlite3.Connection:
         connection = sqlite3.connect(self.db_path)
