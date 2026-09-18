@@ -8,6 +8,7 @@ import subprocess
 from collections.abc import Iterator, Mapping
 from itertools import pairwise
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -18,7 +19,7 @@ from app.asset_roles import VisualAssetRole
 from app.database import create_session_factory, create_sqlite_engine, init_database
 from app.errors import ProjectTimelineRenderError, StaleProjectVisualPlanError
 from app.media.probe import probe_media
-from app.models.render import ProjectRenderConfig
+from app.models.render import ProjectRenderConfig, RenderImageFit
 from app.models.timeline import (
     NarrationTimingGranularity,
     NarrationTimingItem,
@@ -121,9 +122,7 @@ def _resolver_with_calls(
 ) -> Any:
     def resolver(name: str, config: Mapping[str, Any] | None) -> FakeTTSProvider:
         options = dict(config or {})
-        provider_class = (
-            FakeWordTimestampTTS if name == "native" else FakeTTSProvider
-        )
+        provider_class = FakeWordTimestampTTS if name == "native" else FakeTTSProvider
         provider = provider_class(
             str(options.get("model") or "qwen3-tts-flash"),
             str(options.get("voice") or "Cherry"),
@@ -283,7 +282,8 @@ def _setup_graph(session: Session, tmp_path: Path) -> tuple[Any, Any, list[Any]]
         path = (
             Path(source.output_path)
             if source is not None
-            and beat.preferred_visual_operation.value in {"REUSE", "TRANSFORM", "OVERLAY"}
+            and beat.preferred_visual_operation.value
+            in {"REUSE", "TRANSFORM", "OVERLAY"}
             else tmp_path / f"beat-{position}.png"
         )
         if not path.exists():
@@ -302,13 +302,19 @@ def _setup_graph(session: Session, tmp_path: Path) -> tuple[Any, Any, list[Any]]
             output_path=str(path),
             file_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
             master_scene_id=None,
-            prompt_used="prompt" if beat.preferred_visual_operation.value not in {"REUSE", "TRANSFORM", "OVERLAY"} else None,
+            prompt_used="prompt"
+            if beat.preferred_visual_operation.value
+            not in {"REUSE", "TRANSFORM", "OVERLAY"}
+            else None,
             provider="seedream",
             model="fake-image",
             style_version="rough_explainer_v1",
             reference_snapshot=[],
             generation_status="SUCCEEDED",
-            qa_status="PASS" if beat.preferred_visual_operation.value not in {"REUSE", "TRANSFORM", "OVERLAY"} else "NOT_RUN",
+            qa_status="PASS"
+            if beat.preferred_visual_operation.value
+            not in {"REUSE", "TRANSFORM", "OVERLAY"}
+            else "NOT_RUN",
             is_accepted=True,
             error=None,
             transform_metadata=(
@@ -340,8 +346,17 @@ def _make_real_render_graph(session: Session, tmp_path: Path) -> tuple[Any, Any]
     source = tmp_path / "source.png"
     subprocess.run(
         [
-            "ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
-            "color=c=0x284466:s=320x180", "-frames:v", "1", str(source),
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=0x284466:s=320x180",
+            "-frames:v",
+            "1",
+            str(source),
         ],
         check=True,
     )
@@ -361,15 +376,27 @@ def _make_real_render_graph(session: Session, tmp_path: Path) -> tuple[Any, Any]
     )
     subprocess.run(
         [
-            "ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
-            "sine=frequency=440:duration=4", "-c:a", "pcm_s16le",
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=4",
+            "-c:a",
+            "pcm_s16le",
             narration.audio_path,
         ],
         check=True,
     )
-    narration.audio_sha256 = hashlib.sha256(Path(narration.audio_path).read_bytes()).hexdigest()
+    narration.audio_sha256 = hashlib.sha256(
+        Path(narration.audio_path).read_bytes()
+    ).hexdigest()
     session.commit()
-    return project, build_project_timeline(session, project.id, execution.id, narration.id)
+    return project, build_project_timeline(
+        session, project.id, execution.id, narration.id
+    )
 
 
 def test_story_narration_persists_and_unchanged_request_is_idempotent(
@@ -529,7 +556,9 @@ def test_native_word_and_sentence_timestamps_are_normalized() -> None:
         ],
     )
     normalized = normalize_provider_timing("One, two.", 1.0, word_track)
-    assert [(item.source_start_char, item.source_end_char) for item in normalized.items] == [(0, 3), (5, 8)]
+    assert [
+        (item.source_start_char, item.source_end_char) for item in normalized.items
+    ] == [(0, 3), (5, 8)]
 
     sentence_track = NarrationTimingTrack(
         source="NATIVE_SENTENCE_TIMESTAMPS",
@@ -606,8 +635,7 @@ def test_complete_eight_beat_timeline_is_gap_free_and_executable(
     assert timeline.entries[0].start_time == 0
     assert timeline.entries[-1].end_time == 32.0
     assert all(
-        left.end_time == right.start_time
-        for left, right in pairwise(timeline.entries)
+        left.end_time == right.start_time for left, right in pairwise(timeline.entries)
     )
     assert timeline.entries[1].asset_path == results[0].output_path
     assert timeline.entries[1].transform_metadata == {
@@ -620,7 +648,10 @@ def test_complete_eight_beat_timeline_is_gap_free_and_executable(
     assert timeline.entries[5].overlay_metadata["start"]["y"] == 0.25
     assert timeline.entries[6].asset_path == results[5].output_path
     assert timeline_is_current(session, timeline) is True
-    assert build_project_timeline(session, project.id, execution.id, narration.id).id == timeline.id
+    assert (
+        build_project_timeline(session, project.id, execution.id, narration.id).id
+        == timeline.id
+    )
     assert len(list_project_timelines(session, project.id)) == 1
     debug = format_timeline_debug(timeline)
     assert "Beat 01" in debug and "TRANSFORM" in debug and "OVERLAY" in debug
@@ -824,6 +855,21 @@ def test_overlay_is_counted_as_an_effective_screen_state_change() -> None:
     assert analysis.longest_unchanged_hold == 2.4
 
 
+def test_entry_fit_metadata_is_applied_and_invalid_metadata_is_rejected() -> None:
+    config = ProjectRenderConfig(width=320, height=180, fps=10)
+    entry = SimpleNamespace(beat_id="video-beat", fit_metadata={"mode": "contain"})
+
+    resolved = render_service._entry_render_config(entry, config)
+
+    assert resolved.image_fit_mode is RenderImageFit.CONTAIN
+    invalid = SimpleNamespace(
+        beat_id="video-beat",
+        fit_metadata={"mode": "cover", "ignored": True},
+    )
+    with pytest.raises(ValueError, match="Unsupported fit metadata"):
+        render_service._entry_render_config(invalid, config)
+
+
 def test_new_accepted_visual_and_tts_change_make_timeline_stale(
     session: Session,
     tmp_path: Path,
@@ -996,13 +1042,19 @@ def test_real_project_timeline_render_is_valid_and_idempotent(
     config = ProjectRenderConfig(width=320, height=180, fps=10)
 
     first = render_project_video(
-        session, project.id, timeline.id, config=config,
+        session,
+        project.id,
+        timeline.id,
+        config=config,
         projects_root=tmp_path / "render-projects",
     )
     output = Path(first.output_path or "")
     mtime = output.stat().st_mtime_ns
     second = render_project_video(
-        session, project.id, timeline.id, config=config,
+        session,
+        project.id,
+        timeline.id,
+        config=config,
         projects_root=tmp_path / "render-projects",
     )
     metadata = probe_media(output)
@@ -1041,7 +1093,9 @@ def test_render_failure_is_persisted_and_preserves_previous_success(
     project, timeline = _make_real_render_graph(session, tmp_path)
     root = tmp_path / "render-projects"
     successful = render_project_video(
-        session, project.id, timeline.id,
+        session,
+        project.id,
+        timeline.id,
         config=ProjectRenderConfig(width=320, height=180, fps=10),
         projects_root=root,
     )
@@ -1049,7 +1103,9 @@ def test_render_failure_is_persisted_and_preserves_previous_success(
 
     with pytest.raises(Exception, match="Timeline is stale"):
         render_project_video(
-            session, project.id, timeline.id,
+            session,
+            project.id,
+            timeline.id,
             config=ProjectRenderConfig(width=320, height=180, fps=10),
             projects_root=root,
         )

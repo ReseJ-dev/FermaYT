@@ -239,7 +239,11 @@ document.addEventListener("DOMContentLoaded", () => {
       if (costRun) costRun.textContent = job.cost.run_cost === null ? "—" : `${Number(job.cost.run_cost).toFixed(4)}${suffix}`;
       if (costTotal) costTotal.textContent = job.cost.historical_project_cost === null ? "—" : `${Number(job.cost.historical_project_cost).toFixed(4)}${suffix}`;
       if (costQaRetries) costQaRetries.textContent = `${Number(job.cost.qa_retry_cost || 0).toFixed(4)}${suffix}`;
-      if (costNote && job.cost.unpriced_records) costNote.textContent = `Без цены: ${job.cost.unpriced_records} запросов. Настройте версионированные тарифы.`;
+      if (costNote && job.cost.unknown_exposure_count) {
+        costNote.textContent = `UNKNOWN exposure: ${job.cost.unknown_exposure_count}. Итоговая стоимость неизвестна.`;
+      } else if (costNote && job.cost.unpriced_records) {
+        costNote.textContent = `Без цены: ${job.cost.unpriced_records} запросов. Настройте версионированные тарифы.`;
+      }
     }
     if (job.cost_estimate && job.cost_estimate.minimum !== null) {
       const suffix = job.cost_estimate.currency ? ` ${job.cost_estimate.currency}` : "";

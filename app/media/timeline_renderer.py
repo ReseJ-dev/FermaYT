@@ -99,6 +99,8 @@ def render_video_timeline_entry(
     config: ProjectRenderConfig,
     clip_start: float = 0.0,
     clip_end: float | None = None,
+    overlay: NormalizedOverlay | None = None,
+    overlay_style: OverlayStyleConfig | None = None,
 ) -> str:
     """Normalize a provider MP4 to an exact silent canonical timeline segment.
 
@@ -129,14 +131,38 @@ def render_video_timeline_entry(
     if clip_end is not None:
         command.extend(["-t", f"{max(clip_end - clip_start, 0.001):.6f}"])
     command.extend(["-i", str(source)])
+    video_filter = (
+        f"{fit},setsar=1,fps={config.fps},"
+        f"tpad=stop_mode=clone:stop_duration={duration:.6f},"
+        f"trim=duration={duration:.9f},setpts=N/({config.fps}*TB)"
+    )
+    overlay_path: Path | None = None
+    if overlay is not None:
+        overlay_path = destination.with_suffix(".overlay.svg")
+        overlay_path.write_text(
+            build_overlay_svg(overlay, config, overlay_style or OverlayStyleConfig()),
+            encoding="utf-8",
+        )
+        command.extend(
+            ["-loop", "1", "-framerate", str(config.fps), "-i", str(overlay_path)]
+        )
+        command.extend(
+            [
+                "-filter_complex",
+                (
+                    f"[0:v]{video_filter}[base];"
+                    f"[1:v]format=rgba[annotation];"
+                    f"[base][annotation]overlay=0:0:"
+                    f"enable='gte(t,{overlay.appear_offset:.6f})'[out]"
+                ),
+                "-map",
+                "[out]",
+            ]
+        )
+    else:
+        command.extend(["-vf", video_filter])
     command.extend(
         [
-            "-vf",
-            (
-                f"{fit},setsar=1,fps={config.fps},"
-                f"tpad=stop_mode=clone:stop_duration={duration:.6f},"
-                f"trim=duration={duration:.9f},setpts=N/({config.fps}*TB)"
-            ),
             "-frames:v",
             str(frame_count),
             "-an",
@@ -153,7 +179,11 @@ def render_video_timeline_entry(
             str(destination),
         ]
     )
-    _run_ffmpeg(command, "AI video timeline normalization")
+    try:
+        _run_ffmpeg(command, "AI video timeline normalization")
+    finally:
+        if overlay_path is not None:
+            overlay_path.unlink(missing_ok=True)
     return str(destination)
 
 

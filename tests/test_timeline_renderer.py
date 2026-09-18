@@ -272,16 +272,45 @@ def test_ai_video_is_normalized_and_provider_audio_is_removed(tmp_path: Path) ->
         check=True,
     )
     output = tmp_path / "normalized.mp4"
+    overlaid = tmp_path / "normalized-overlay.mp4"
+    config = ProjectRenderConfig(
+        width=320,
+        height=180,
+        fps=10,
+        image_fit_mode=RenderImageFit.CONTAIN,
+    )
 
     render_video_timeline_entry(
         source,
         output,
         frame_count=10,
-        config=ProjectRenderConfig(width=320, height=180, fps=10),
+        config=config,
+    )
+    render_video_timeline_entry(
+        source,
+        overlaid,
+        frame_count=10,
+        config=config,
+        overlay=NormalizedOverlay(
+            type="HIGHLIGHT",
+            instruction="Highlight the center",
+            semantic_anchor="center",
+            center={"x": 0.5, "y": 0.5},
+            appear_offset=0.1,
+        ),
     )
 
     metadata = probe_media(output)
+    overlay_metadata = probe_media(overlaid)
     assert metadata.has_video is True
     assert metadata.has_audio is False
     assert (metadata.width, metadata.height, metadata.fps) == (320, 180, 10)
     assert metadata.duration == pytest.approx(1.0, abs=0.04)
+    assert overlay_metadata.has_audio is False
+    assert (
+        overlay_metadata.width,
+        overlay_metadata.height,
+        overlay_metadata.fps,
+    ) == (320, 180, 10)
+    assert overlay_metadata.duration == pytest.approx(1.0, abs=0.04)
+    assert overlaid.read_bytes() != output.read_bytes()

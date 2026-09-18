@@ -95,6 +95,8 @@
                   <label>Clip duration<input name="video_clip_duration" type="number" min="1" max="30" value="{{ project.video_clip_duration }}"></label>
                   <label>Video budget<input name="video_budget_amount" type="number" min="0.000001" step="0.000001" value="{{ project.video_budget_amount or '' }}" placeholder="Optional"></label>
                 </div>
+                <input type="hidden" name="allow_unpriced_video_requests" value="0">
+                <label><input name="allow_unpriced_video_requests" type="checkbox" value="1" {% if project.allow_unpriced_video_requests %}checked{% endif %}> Allow paid video requests without configured pricing</label>
                 <small>Generated clip audio is persisted as metadata but always muted in the FermaYT timeline.</small>
               </section>
             </div>
@@ -302,11 +304,13 @@
           <div><span>Бюджет</span><b id="budget-amount">{% if budget_snapshot.enabled %}{{ '%.2f' | format(budget_snapshot.amount) }} {{ budget_snapshot.currency }}{% else %}Не включён{% endif %}</b></div>
           <div><span>Оценка до запуска</span><b id="cost-estimate">{% if cost_estimate.minimum is not none %}{{ '%.4f' | format(cost_estimate.minimum) }}–{{ '%.4f' | format(cost_estimate.maximum) }} {{ cost_estimate.currency }}{% elif 'persisted_visual_plan_required' in cost_estimate.unpriced_operations %}После построения visual plan{% else %}Тарифы не настроены{% endif %}</b></div>
           <div><span>Этот запуск</span><b id="cost-run">{% if cost_summary.run_cost is not none %}{{ '%.4f' | format(cost_summary.run_cost) }} {{ cost_summary.currency or '' }}{% else %}—{% endif %}</b></div>
+          <div><span>Подтверждено</span><b>{{ '%.4f' | format(cost_summary.confirmed_cost) }} {{ cost_summary.currency or '' }}</b></div>
+          <div><span>Оценочная экспозиция</span><b>{{ '%.4f' | format(cost_summary.estimated_exposure) }} {{ cost_summary.currency or '' }}</b></div>
           <div><span>Осталось (макс.)</span><b id="cost-remaining">{% if cost_estimate.maximum is not none %}{{ '%.4f' | format(cost_estimate.maximum) }} {{ cost_estimate.currency or '' }}{% else %}—{% endif %}</b></div>
           <div><span>Всего по проекту</span><b id="cost-total">{% if cost_summary.historical_project_cost is not none %}{{ '%.4f' | format(cost_summary.historical_project_cost) }} {{ cost_summary.currency or '' }}{% else %}—{% endif %}</b></div>
           <div><span>Доступно</span><b id="budget-available">{% if budget_snapshot.available is not none %}{{ '%.4f' | format(budget_snapshot.available) }} {{ budget_snapshot.currency }}{% else %}—{% endif %}</b></div>
           <div><span>QA retries</span><b id="cost-qa-retries">{{ '%.4f' | format(cost_summary.qa_retry_cost or 0) }} {{ cost_summary.currency or '' }}</b></div>
-          <small id="cost-note">{% if cost_summary.unpriced_records %}Без цены: {{ cost_summary.unpriced_records }} запросов. Настройте версионированные тарифы.{% else %}Суммы основаны на настроенных версиях тарифов.{% endif %}</small>
+          <small id="cost-note">{% if cost_summary.unknown_exposure_count %}UNKNOWN exposure: {{ cost_summary.unknown_exposure_count }}. Итоговая стоимость неизвестна.{% elif cost_summary.unpriced_records %}Без цены: {{ cost_summary.unpriced_records }} запросов. Настройте версионированные тарифы.{% else %}Суммы основаны на настроенных версиях тарифов.{% endif %}</small>
           <small id="budget-warning">{{ budget_snapshot.warning or '' }}</small>
         </section>
         <section class="style-reference-control">

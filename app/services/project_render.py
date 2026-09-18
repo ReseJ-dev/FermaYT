@@ -22,7 +22,7 @@ from app.media.timeline_renderer import (
     render_timeline_entry,
     render_video_timeline_entry,
 )
-from app.models.render import ProjectRenderConfig, RenderTransition
+from app.models.render import ProjectRenderConfig, RenderImageFit, RenderTransition
 from app.models.timeline import NormalizedOverlay, NormalizedTransform
 from app.persistence import (
     BeatVisualResult,
@@ -40,7 +40,7 @@ from app.repositories import (
 from app.services.timeline import timeline_is_current
 from app.storage import ProjectMediaPaths
 
-RENDERER_VERSION = "project_timeline_renderer_v2"
+RENDERER_VERSION = "project_timeline_renderer_v3"
 
 
 def render_project_video(
@@ -101,6 +101,7 @@ def render_project_video(
                 carried_transform = None
             effective_transform = own_transform or carried_transform
             overlay = _parse_overlay(entry)
+            entry_config = _entry_render_config(entry, render_config)
             clip_path = (
                 cache_dir / f"{entry.position:04d}-{entry.id}-{frame_count}f.mp4"
             )
@@ -112,16 +113,17 @@ def render_project_video(
                         entry.asset_path,
                         clip_path,
                         frame_count=frame_count,
-                        config=render_config,
+                        config=entry_config,
                         clip_start=entry.clip_start or 0.0,
                         clip_end=entry.clip_end,
+                        overlay=overlay,
                     )
                 else:
                     render_timeline_entry(
                         entry.asset_path,
                         clip_path,
                         frame_count=frame_count,
-                        config=render_config,
+                        config=entry_config,
                         transform=effective_transform,
                         overlay=overlay,
                     )
@@ -234,6 +236,7 @@ def build_render_manifest(
                 "frame_end": ranges[index][1],
                 "transform": entry.transform_metadata,
                 "overlay": entry.overlay_metadata,
+                "fit": entry.fit_metadata,
             }
             for index, entry in enumerate(timeline.entries)
         ],
@@ -330,6 +333,7 @@ def _validate_render_inputs(
             raise ValueError(f"Beat {entry.beat_id} generated visual did not pass QA")
         _parse_transform(entry)
         _parse_overlay(entry)
+        _entry_render_config(entry, config)
         if entry.transition_metadata not in (None, {}, {"type": "CUT"}):
             raise ValueError(
                 f"Unsupported transition metadata for beat {entry.beat_id}"
@@ -398,6 +402,21 @@ def _parse_overlay(entry: TimelineEntry) -> NormalizedOverlay | None:
     ):
         raise ValueError(f"Overlay appears after beat {entry.beat_id} ends")
     return overlay
+
+
+def _entry_render_config(
+    entry: TimelineEntry,
+    config: ProjectRenderConfig,
+) -> ProjectRenderConfig:
+    if entry.fit_metadata is None:
+        return config
+    if set(entry.fit_metadata) != {"mode"}:
+        raise ValueError(f"Unsupported fit metadata for beat {entry.beat_id}")
+    try:
+        mode = RenderImageFit(str(entry.fit_metadata["mode"]).upper())
+    except ValueError as exc:
+        raise ValueError(f"Unsupported fit mode for beat {entry.beat_id}") from exc
+    return config.model_copy(update={"image_fit_mode": mode})
 
 
 def _final_transform_state(transform: NormalizedTransform) -> NormalizedTransform:

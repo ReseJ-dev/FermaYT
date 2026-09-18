@@ -209,7 +209,9 @@ def test_exact_known_models_use_verified_profiles() -> None:
         (SeedanceVideoProvider, "seedance-1-0-pro-future"),
     ),
 )
-def test_unknown_model_names_never_inherit_paid_capabilities(provider, model: str) -> None:
+def test_unknown_model_names_never_inherit_paid_capabilities(
+    provider, model: str
+) -> None:
     instance = provider(api_key="secret", model=model)
     assert instance.model_profile.verified is False
     assert instance.model_profile.operations == {}
@@ -226,7 +228,9 @@ def test_vidu_reference_operation_uses_normal_images_not_subjects(
     operation = profile.operation_profile(VideoOperation.REFERENCE_TO_VIDEO)
     assert operation is not None
     assert operation.payload_strategy is VideoPayloadStrategy.VIDU_REFERENCE_IMAGES
-    assert operation.payload_strategy is not VideoPayloadStrategy.VIDU_REFERENCE_SUBJECTS
+    assert (
+        operation.payload_strategy is not VideoPayloadStrategy.VIDU_REFERENCE_SUBJECTS
+    )
 
     image = tmp_path / "character.png"
     image.write_bytes(b"png")
@@ -262,13 +266,9 @@ def test_vidu_reference_operation_uses_normal_images_not_subjects(
 
 
 def test_seedance_profiles_expose_only_documented_operation_sets() -> None:
-    lite = SeedanceVideoProvider(
-        api_key="secret", model="seedance-1-0-lite-i2v-250428"
-    )
+    lite = SeedanceVideoProvider(api_key="secret", model="seedance-1-0-lite-i2v-250428")
     pro = SeedanceVideoProvider(api_key="secret", model="seedance-1-0-pro-250528")
-    fast = SeedanceVideoProvider(
-        api_key="secret", model="seedance-1-0-pro-fast-251015"
-    )
+    fast = SeedanceVideoProvider(api_key="secret", model="seedance-1-0-pro-fast-251015")
 
     assert set(lite.model_profile.operations) == {
         VideoOperation.IMAGE_TO_VIDEO,
@@ -350,7 +350,9 @@ def test_adapter_capabilities_and_endpoint_come_from_same_model_profile(
 
 
 def test_vidu_i2v_full_payload_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = ViduVideoProvider(api_key="redacted", endpoint="https://vidu.test/ent/v2")
+    provider = ViduVideoProvider(
+        api_key="redacted", endpoint="https://vidu.test/ent/v2"
+    )
     request = VideoGenerationRequest(
         VideoOperation.IMAGE_TO_VIDEO,
         "Slow controlled head turn.",
@@ -378,7 +380,9 @@ def test_vidu_i2v_full_payload_snapshot(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_vidu_reference_full_payload_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = ViduVideoProvider(api_key="redacted", endpoint="https://vidu.test/ent/v2")
+    provider = ViduVideoProvider(
+        api_key="redacted", endpoint="https://vidu.test/ent/v2"
+    )
     request = VideoGenerationRequest(
         VideoOperation.REFERENCE_TO_VIDEO,
         "The same miner walks through the established tunnel.",
@@ -417,7 +421,9 @@ def test_vidu_reference_full_payload_snapshot(monkeypatch: pytest.MonkeyPatch) -
 
 
 def test_vidu_first_last_full_payload_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = ViduVideoProvider(api_key="redacted", endpoint="https://vidu.test/ent/v2")
+    provider = ViduVideoProvider(
+        api_key="redacted", endpoint="https://vidu.test/ent/v2"
+    )
     request = VideoGenerationRequest(
         VideoOperation.FIRST_LAST_TO_VIDEO,
         "Move from stable tunnel to falling debris.",
@@ -425,8 +431,12 @@ def test_vidu_first_last_full_payload_snapshot(monkeypatch: pytest.MonkeyPatch) 
         "1080p",
         "16:9",
         references=(
-            _remote_reference("first", VideoReferenceRole.FIRST_FRAME, "https://media.test/a.png"),
-            _remote_reference("last", VideoReferenceRole.LAST_FRAME, "https://media.test/b.png"),
+            _remote_reference(
+                "first", VideoReferenceRole.FIRST_FRAME, "https://media.test/a.png"
+            ),
+            _remote_reference(
+                "last", VideoReferenceRole.LAST_FRAME, "https://media.test/b.png"
+            ),
         ),
     )
     url, payload = _capture_submission(monkeypatch, provider, request)
@@ -453,7 +463,9 @@ def test_vidu_cancel_full_payload_snapshot(monkeypatch: pytest.MonkeyPatch) -> N
         return httpx.Response(200, json={})
 
     install_mock_transport(monkeypatch, handler)
-    provider = ViduVideoProvider(api_key="redacted", endpoint="https://vidu.test/ent/v2")
+    provider = ViduVideoProvider(
+        api_key="redacted", endpoint="https://vidu.test/ent/v2"
+    )
     asyncio.run(provider.cancel_task("vidu-task-7"))
     assert captured == {
         "method": "POST",
@@ -471,7 +483,9 @@ def test_wan_i2v_full_payload_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
         "720p",
         "16:9",
         references=(
-            _remote_reference("first", VideoReferenceRole.FIRST_FRAME, "https://media.test/first.png"),
+            _remote_reference(
+                "first", VideoReferenceRole.FIRST_FRAME, "https://media.test/first.png"
+            ),
         ),
     )
     url, payload = _capture_submission(monkeypatch, provider, request)
@@ -505,10 +519,14 @@ def test_wan_edit_full_payload_snapshot(monkeypatch: pytest.MonkeyPatch) -> None
         "16:9",
         references=(
             _remote_reference(
-                "source", VideoReferenceRole.SOURCE_VIDEO, "https://media.test/source.mp4"
+                "source",
+                VideoReferenceRole.SOURCE_VIDEO,
+                "https://media.test/source.mp4",
             ),
             _remote_reference(
-                "coat", VideoReferenceRole.CHARACTER_REFERENCE, "https://media.test/coat.png"
+                "coat",
+                VideoReferenceRole.CHARACTER_REFERENCE,
+                "https://media.test/coat.png",
             ),
         ),
     )
@@ -533,7 +551,9 @@ def test_wan_edit_full_payload_snapshot(monkeypatch: pytest.MonkeyPatch) -> None
     }
 
 
-def test_wan_continuation_full_payload_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_wan_continuation_full_payload_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     provider = WanVideoProvider(api_key="redacted", endpoint="https://wan.test/api/v1")
     request = VideoGenerationRequest(
         VideoOperation.VIDEO_CONTINUATION,
@@ -543,7 +563,9 @@ def test_wan_continuation_full_payload_snapshot(monkeypatch: pytest.MonkeyPatch)
         "16:9",
         references=(
             _remote_reference(
-                "source", VideoReferenceRole.SOURCE_VIDEO, "https://media.test/source.mp4"
+                "source",
+                VideoReferenceRole.SOURCE_VIDEO,
+                "https://media.test/source.mp4",
             ),
         ),
     )
@@ -603,7 +625,9 @@ def test_wan_source_video_rejects_local_base64_transport_before_http(
 
 
 def test_seedance_i2v_full_payload_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = SeedanceVideoProvider(api_key="redacted", endpoint="https://seed.test/api/v3")
+    provider = SeedanceVideoProvider(
+        api_key="redacted", endpoint="https://seed.test/api/v3"
+    )
     request = VideoGenerationRequest(
         VideoOperation.IMAGE_TO_VIDEO,
         "Subtle dust movement.",
@@ -611,7 +635,9 @@ def test_seedance_i2v_full_payload_snapshot(monkeypatch: pytest.MonkeyPatch) -> 
         "720p",
         "16:9",
         references=(
-            _remote_reference("first", VideoReferenceRole.FIRST_FRAME, "https://media.test/first.png"),
+            _remote_reference(
+                "first", VideoReferenceRole.FIRST_FRAME, "https://media.test/first.png"
+            ),
         ),
     )
     url, payload = _capture_submission(
@@ -635,8 +661,12 @@ def test_seedance_i2v_full_payload_snapshot(monkeypatch: pytest.MonkeyPatch) -> 
     }
 
 
-def test_seedance_first_last_full_payload_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = SeedanceVideoProvider(api_key="redacted", endpoint="https://seed.test/api/v3")
+def test_seedance_first_last_full_payload_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = SeedanceVideoProvider(
+        api_key="redacted", endpoint="https://seed.test/api/v3"
+    )
     request = VideoGenerationRequest(
         VideoOperation.FIRST_LAST_TO_VIDEO,
         "Transition between the two established states.",
@@ -644,8 +674,12 @@ def test_seedance_first_last_full_payload_snapshot(monkeypatch: pytest.MonkeyPat
         "1080p",
         "16:9",
         references=(
-            _remote_reference("first", VideoReferenceRole.FIRST_FRAME, "https://media.test/a.png"),
-            _remote_reference("last", VideoReferenceRole.LAST_FRAME, "https://media.test/b.png"),
+            _remote_reference(
+                "first", VideoReferenceRole.FIRST_FRAME, "https://media.test/a.png"
+            ),
+            _remote_reference(
+                "last", VideoReferenceRole.LAST_FRAME, "https://media.test/b.png"
+            ),
         ),
     )
     _, payload = _capture_submission(
@@ -674,8 +708,12 @@ def test_seedance_first_last_full_payload_snapshot(monkeypatch: pytest.MonkeyPat
     }
 
 
-def test_seedance_reference_full_payload_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
-    provider = SeedanceVideoProvider(api_key="redacted", endpoint="https://seed.test/api/v3")
+def test_seedance_reference_full_payload_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = SeedanceVideoProvider(
+        api_key="redacted", endpoint="https://seed.test/api/v3"
+    )
     request = VideoGenerationRequest(
         VideoOperation.REFERENCE_TO_VIDEO,
         "The referenced miner enters the referenced tunnel.",
@@ -684,10 +722,14 @@ def test_seedance_reference_full_payload_snapshot(monkeypatch: pytest.MonkeyPatc
         "16:9",
         references=(
             _remote_reference(
-                "character", VideoReferenceRole.CHARACTER_REFERENCE, "https://media.test/miner.png"
+                "character",
+                VideoReferenceRole.CHARACTER_REFERENCE,
+                "https://media.test/miner.png",
             ),
             _remote_reference(
-                "location", VideoReferenceRole.MASTER_LOCATION, "https://media.test/tunnel.png"
+                "location",
+                VideoReferenceRole.MASTER_LOCATION,
+                "https://media.test/tunnel.png",
             ),
         ),
     )
@@ -697,7 +739,10 @@ def test_seedance_reference_full_payload_snapshot(monkeypatch: pytest.MonkeyPatc
     assert payload == {
         "model": "seedance-1-0-lite-i2v-250428",
         "content": [
-            {"type": "text", "text": "The referenced miner enters the referenced tunnel."},
+            {
+                "type": "text",
+                "text": "The referenced miner enters the referenced tunnel.",
+            },
             {
                 "type": "image_url",
                 "image_url": {"url": "https://media.test/miner.png"},
@@ -727,7 +772,9 @@ def test_seedance_i2v_rejects_unverified_mixed_reference_mode(
         return httpx.Response(200, json={"id": "must-not-submit"})
 
     install_mock_transport(monkeypatch, handler)
-    provider = SeedanceVideoProvider(api_key="redacted", endpoint="https://seed.test/api/v3")
+    provider = SeedanceVideoProvider(
+        api_key="redacted", endpoint="https://seed.test/api/v3"
+    )
     request = VideoGenerationRequest(
         VideoOperation.IMAGE_TO_VIDEO,
         "Animate without redesign.",
@@ -735,9 +782,13 @@ def test_seedance_i2v_rejects_unverified_mixed_reference_mode(
         "720p",
         "16:9",
         references=(
-            _remote_reference("first", VideoReferenceRole.FIRST_FRAME, "https://media.test/first.png"),
             _remote_reference(
-                "style", VideoReferenceRole.STYLE_REFERENCE, "https://media.test/style.png"
+                "first", VideoReferenceRole.FIRST_FRAME, "https://media.test/first.png"
+            ),
+            _remote_reference(
+                "style",
+                VideoReferenceRole.STYLE_REFERENCE,
+                "https://media.test/style.png",
             ),
         ),
     )

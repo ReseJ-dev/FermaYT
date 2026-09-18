@@ -14,7 +14,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import case, func, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -31,6 +31,7 @@ from app.errors import (
     VIDEO_CAPABILITY_UNSUPPORTED,
     VIDEO_DOWNLOAD_FAILED,
     VIDEO_POLL_TIMEOUT,
+    VIDEO_PRICE_UNKNOWN,
     VIDEO_RECOVERY_CONFIGURATION_MISSING,
     VIDEO_SUBMISSION_TIMEOUT_UNKNOWN,
     VIDEO_TASK_FAILED,
@@ -230,12 +231,14 @@ async def execute_video_generation(
         beat_id,
         execution_context,
     )
+    _acquire_video_budget_transaction_lock(session, project.id)
     existing = session.scalar(
         select(VideoGenerationAttempt).where(
             VideoGenerationAttempt.request_hash == request_hash
         )
     )
     if existing is not None:
+        session.commit()
         return await _reuse_existing_attempt(
             session,
             existing,
@@ -248,7 +251,6 @@ async def execute_video_generation(
         )
 
     estimate, currency = _estimate_request(session, provider, request)
-    _check_video_budget(session, project, estimate, currency)
     snapshot = _request_snapshot(request)
     capability_snapshot = capabilities.snapshot()
     if model_profile is not None:
@@ -293,7 +295,17 @@ async def execute_video_generation(
     )
     session.add(attempt)
     try:
+        with session.no_autoflush:
+            _reserve_video_exposure(
+                session,
+                project,
+                estimate=estimate,
+                currency=currency,
+            )
         session.commit()
+    except VideoGenerationError:
+        session.rollback()
+        raise
     except IntegrityError:
         # Another worker won the unique request-hash race. The loser attaches
         # to the durable attempt and must never submit another paid task.
@@ -389,6 +401,7 @@ async def resume_video_attempt(
             # Remote completion and durable local completion are distinct.
             attempt.status = "REMOTE_SUCCEEDED"
             attempt.remote_result_url = result.result_url
+            _apply_provider_cost_reconciliation(session, attempt, result)
             session.commit()
             break
         if result.state in {
@@ -402,7 +415,8 @@ async def resume_video_attempt(
             )
             attempt.error_code = result.error_code or VIDEO_TASK_FAILED
             attempt.error_message = result.error_message or "Remote video task failed"
-            attempt.cost_certainty = "UNKNOWN"
+            if not _apply_provider_cost_reconciliation(session, attempt, result):
+                attempt.cost_certainty = "UNKNOWN"
             session.commit()
             raise VideoGenerationError(
                 VIDEO_TASK_FAILED,
@@ -496,13 +510,6 @@ async def resume_video_attempt(
     attempt.provider_has_audio = metadata.has_audio
     attempt.completed_at = datetime.now(UTC)
     attempt.status = "SUCCEEDED"
-    reconciled_cost, reconciled_currency = _reconcile_actual_cost(
-        session, attempt, result
-    )
-    if reconciled_cost is not None:
-        attempt.actual_cost = reconciled_cost
-        attempt.currency = reconciled_currency or attempt.currency
-        attempt.cost_certainty = "ACTUAL"
     session.commit()
     session.refresh(asset)
     _record_video_usage(session, attempt, result)
@@ -868,50 +875,145 @@ def _estimate_request(
     return round(float(pricing.price) * request.duration_seconds, 8), pricing.currency
 
 
-def _check_video_budget(
+def _reserve_video_exposure(
     session: Session,
     project: Project,
-    next_cost: float | None,
+    *,
+    estimate: float | None,
     currency: str | None,
 ) -> None:
-    if project.video_budget_amount is None:
+    if estimate is None or currency is None:
+        if not project.allow_unpriced_video_requests:
+            raise VideoGenerationError(
+                VIDEO_PRICE_UNKNOWN,
+                "Video pricing is unavailable; explicitly allow unpriced video "
+                "requests before paid submission",
+                provider=project.video_provider,
+            )
+        result = session.execute(
+            update(Project)
+            .where(Project.id == project.id)
+            .values(
+                video_unknown_exposure_count=(Project.video_unknown_exposure_count + 1)
+            )
+        )
+        if result.rowcount != 1:
+            raise ValueError("Project not found while reserving video exposure")
         return
-    if next_cost is None or currency is None:
+
+    amount = func.coalesce(Project.video_cost_exposure_amount, 0)
+    conditions = [
+        Project.id == project.id,
+        (
+            Project.video_cost_exposure_currency.is_(None)
+            | (Project.video_cost_exposure_currency == currency)
+        ),
+        (
+            Project.video_budget_amount.is_(None)
+            | (Project.generation_budget_currency == currency)
+        ),
+        (
+            Project.video_budget_amount.is_(None)
+            | (amount + estimate <= Project.video_budget_amount)
+        ),
+    ]
+    result = session.execute(
+        update(Project)
+        .where(*conditions)
+        .values(
+            video_cost_exposure_amount=amount + estimate,
+            video_cost_exposure_currency=func.coalesce(
+                Project.video_cost_exposure_currency, currency
+            ),
+        )
+    )
+    if result.rowcount == 1:
+        return
+
+    session.rollback()
+    current = session.get(Project, project.id)
+    if current is None:
+        raise ValueError("Project not found while reserving video exposure")
+    if (
+        current.video_cost_exposure_currency is not None
+        and current.video_cost_exposure_currency != currency
+    ):
         raise VideoGenerationError(
             VIDEO_BUDGET_EXCEEDED,
-            "Video price is not configured; a bounded paid submission cannot be made",
+            "Video pricing currency does not match existing project exposure",
         )
-    if currency != project.generation_budget_currency:
+    if (
+        current.video_budget_amount is not None
+        and current.generation_budget_currency != currency
+    ):
         raise VideoGenerationError(
             VIDEO_BUDGET_EXCEEDED,
             "Video pricing currency does not match project budget",
         )
-    attempts = list(
-        session.scalars(
-            select(VideoGenerationAttempt).where(
-                VideoGenerationAttempt.project_id == project.id,
-                VideoGenerationAttempt.submission_started_at.is_not(None),
-            )
+    raise VideoGenerationError(
+        VIDEO_BUDGET_EXCEEDED,
+        "Estimated video request would exceed the project video budget",
+        diagnostic={
+            "spent_or_reserved": float(current.video_cost_exposure_amount),
+            "next_estimated_cost": estimate,
+            "budget": (
+                float(current.video_budget_amount)
+                if current.video_budget_amount is not None
+                else None
+            ),
+        },
+    )
+
+
+def _acquire_video_budget_transaction_lock(
+    session: Session,
+    project_id: str,
+) -> None:
+    """Serialize deduplication, budget check, and reservation in the database."""
+    if session.new or session.dirty or session.deleted:
+        raise RuntimeError(
+            "Video budget reservation requires a clean database transaction"
+        )
+    if session.in_transaction():
+        session.commit()
+    bind = session.get_bind()
+    if bind.dialect.name == "sqlite":
+        session.connection().exec_driver_sql("BEGIN IMMEDIATE")
+        return
+    locked = session.scalar(
+        select(Project.id).where(Project.id == project_id).with_for_update()
+    )
+    if locked is None:
+        raise ValueError("Project not found while locking video budget")
+
+
+def _reconcile_video_exposure(
+    session: Session,
+    attempt: VideoGenerationAttempt,
+    *,
+    actual_cost: float,
+    currency: str | None,
+) -> None:
+    if currency is None:
+        return
+    estimated = float(attempt.estimated_cost or 0)
+    delta = actual_cost - estimated
+    unknown_delta = -1 if attempt.estimated_cost is None else 0
+    amount = func.coalesce(Project.video_cost_exposure_amount, 0) + delta
+    unknown_count = Project.video_unknown_exposure_count + unknown_delta
+    session.execute(
+        update(Project)
+        .where(Project.id == attempt.project_id)
+        .values(
+            video_cost_exposure_amount=case((amount < 0, 0), else_=amount),
+            video_cost_exposure_currency=func.coalesce(
+                Project.video_cost_exposure_currency, currency
+            ),
+            video_unknown_exposure_count=case(
+                (unknown_count < 0, 0), else_=unknown_count
+            ),
         )
     )
-    exposure = sum(
-        float(
-            item.actual_cost
-            if item.actual_cost is not None
-            else item.estimated_cost or 0
-        )
-        for item in attempts
-    )
-    if exposure + next_cost > float(project.video_budget_amount) + 1e-9:
-        raise VideoGenerationError(
-            VIDEO_BUDGET_EXCEEDED,
-            "Estimated video request would exceed the project video budget",
-            diagnostic={
-                "spent_or_reserved": exposure,
-                "next_estimated_cost": next_cost,
-                "budget": float(project.video_budget_amount),
-            },
-        )
 
 
 def _record_video_usage(
@@ -940,7 +1042,7 @@ def _record_video_usage(
 def _reconcile_actual_cost(
     session: Session, attempt: VideoGenerationAttempt, result: Any
 ) -> tuple[float | None, str | None]:
-    if result.actual_cost is not None:
+    if result.actual_cost is not None and attempt.currency is not None:
         return float(result.actual_cost), attempt.currency
     if result.consumed_credits is None:
         return None, attempt.currency
@@ -957,6 +1059,30 @@ def _reconcile_actual_cost(
         round(float(result.consumed_credits) * float(pricing.price), 8),
         pricing.currency,
     )
+
+
+def _apply_provider_cost_reconciliation(
+    session: Session,
+    attempt: VideoGenerationAttempt,
+    result: Any,
+) -> bool:
+    if attempt.actual_cost is not None:
+        return True
+    reconciled_cost, reconciled_currency = _reconcile_actual_cost(
+        session, attempt, result
+    )
+    if reconciled_cost is None:
+        return False
+    _reconcile_video_exposure(
+        session,
+        attempt,
+        actual_cost=reconciled_cost,
+        currency=reconciled_currency,
+    )
+    attempt.actual_cost = reconciled_cost
+    attempt.currency = reconciled_currency or attempt.currency
+    attempt.cost_certainty = "ACTUAL"
+    return True
 
 
 def _request_snapshot(request: VideoGenerationRequest) -> dict[str, Any]:

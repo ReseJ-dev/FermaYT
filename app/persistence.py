@@ -172,6 +172,18 @@ class Project(Base):
     video_budget_amount: Mapped[float | None] = mapped_column(
         Numeric(18, 8), nullable=True, default=None
     )
+    allow_unpriced_video_requests: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="0"
+    )
+    video_cost_exposure_amount: Mapped[float] = mapped_column(
+        Numeric(18, 8), nullable=False, default=0, server_default="0"
+    )
+    video_cost_exposure_currency: Mapped[str | None] = mapped_column(
+        String(3), nullable=True
+    )
+    video_unknown_exposure_count: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     tts_provider: Mapped[str] = mapped_column(String(50), nullable=False)
     tts_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     tts_voice: Mapped[str] = mapped_column(String(100), nullable=False)

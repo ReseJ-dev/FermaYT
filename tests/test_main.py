@@ -1,13 +1,18 @@
 """Tests for the local FastAPI application shell."""
 
+import pytest
 from fastapi.testclient import TestClient
 
 from app.main import app
 
-client = TestClient(app)
+
+@pytest.fixture
+def client():
+    with TestClient(app) as value:
+        yield value
 
 
-def test_index_returns_html() -> None:
+def test_index_returns_html(client: TestClient) -> None:
     response = client.get("/")
 
     assert response.status_code == 200
@@ -17,14 +22,14 @@ def test_index_returns_html() -> None:
     assert "/static/app.js" in response.text
 
 
-def test_health_returns_ok() -> None:
+def test_health_returns_ok(client: TestClient) -> None:
     response = client.get("/health")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
 
 
-def test_static_file_is_served_locally() -> None:
+def test_static_file_is_served_locally(client: TestClient) -> None:
     response = client.get("/static/app.css")
 
     assert response.status_code == 200

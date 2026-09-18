@@ -21,6 +21,7 @@ from app.errors import (
 from app.media.probe import MediaProbeResult
 from app.persistence import GeneratedVideoAsset, Project, VideoGenerationAttempt
 from app.repositories import create_project
+from app.services import video_generation as video_generation_service
 from app.services.video_generation import (
     execute_video_generation,
     resume_incomplete_video_attempts,
@@ -119,6 +120,7 @@ def _project(session: Session):
         video_generation_mode="MANUAL",
         video_provider="wan",
         video_model=RecoverableWanProvider.model,
+        allow_unpriced_video_requests=True,
     )
 
 
@@ -351,7 +353,7 @@ def test_process_crash_before_post_never_submits_on_restart(
         def crash_on_paid_boundary_commit() -> None:
             nonlocal commits
             commits += 1
-            if commits == 2:
+            if commits == 3:
                 raise SimulatedProcessExit
             real_commit()
 
@@ -383,6 +385,16 @@ def test_integrity_race_reloads_winner_without_raw_error_or_second_post(
     counters: dict[str, int] = {}
     engine = create_sqlite_engine(database)
     init_database(engine)
+    monkeypatch.setattr(
+        video_generation_service,
+        "_reserve_video_exposure",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        video_generation_service,
+        "_acquire_video_budget_transaction_lock",
+        lambda *args, **kwargs: None,
+    )
     factory = create_session_factory(engine)
     with factory() as session:
         project = _project(session)

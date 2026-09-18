@@ -5,25 +5,29 @@ from __future__ import annotations
 import asyncio
 import hashlib
 from collections.abc import Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.clients.video_api import WanVideoProvider
-from app.costs import PricingUnit, configure_provider_pricing
+from app.costs import PricingUnit, configure_provider_pricing, summarize_project_cost
 from app.database import create_session_factory, create_sqlite_engine, init_database
 from app.errors import (
     VIDEO_BUDGET_EXCEEDED,
     VIDEO_CAPABILITY_UNSUPPORTED,
     VIDEO_POLL_TIMEOUT,
+    VIDEO_PRICE_UNKNOWN,
     VIDEO_SUBMISSION_TIMEOUT_UNKNOWN,
+    VIDEO_TASK_FAILED,
     VideoGenerationError,
 )
 from app.media.probe import MediaProbeResult
-from app.persistence import ProviderUsageRecord, VideoGenerationAttempt
+from app.persistence import Project, ProviderUsageRecord, VideoGenerationAttempt
 from app.repositories import create_project
 from app.services.video_generation import execute_video_generation
 from app.video_providers import (
@@ -105,6 +109,7 @@ def _project(session: Session, **changes: object):
         "video_provider": "vidu",
         "video_model": "fake-video",
         "generation_budget_currency": "USD",
+        "allow_unpriced_video_requests": True,
     }
     values.update(changes)
     return create_project(session, **values)
@@ -128,6 +133,20 @@ def _request(tmp_path: Path) -> VideoGenerationRequest:
     )
 
 
+def _configure_video_price(session: Session, price: float = 0.03) -> None:
+    configure_provider_pricing(
+        session,
+        provider="vidu",
+        model="fake-video",
+        operation="IMAGE_TO_VIDEO",
+        pricing_unit=PricingUnit.PER_SECOND,
+        price=price,
+        currency="USD",
+        version="video-test-v1",
+        effective_from=datetime(2026, 1, 1, tzinfo=UTC),
+    )
+
+
 async def _download(_: str, destination: Path) -> Path:
     destination.parent.mkdir(parents=True, exist_ok=True)
     destination.write_bytes(b"local-immutable-mp4")
@@ -141,16 +160,18 @@ def _probe(_: str | Path) -> MediaProbeResult:
 def _execute(session: Session, project, provider, request, tmp_path: Path, **kwargs):
     downloader = kwargs.pop("downloader", _download)
     prober = kwargs.pop("prober", _probe)
+    beat_id = kwargs.pop("beat_id", "beat-1")
+    job_id = kwargs.pop("job_id", "job-1")
     return asyncio.run(
         execute_video_generation(
             session,
             project,
             provider,
             request,
-            beat_id="beat-1",
+            beat_id=beat_id,
             accepted_image_result_id=None,
             projects_root=tmp_path / "projects",
-            job_id="job-1",
+            job_id=job_id,
             poll_interval=0,
             downloader=downloader,
             prober=prober,
@@ -163,6 +184,7 @@ def test_task_id_is_persisted_then_result_is_downloaded_locally(
     session: Session, tmp_path: Path
 ) -> None:
     project = _project(session)
+    _configure_video_price(session)
     provider = FakeVideoProvider()
 
     asset = _execute(session, project, provider, _request(tmp_path), tmp_path)
@@ -181,12 +203,17 @@ def test_task_id_is_persisted_then_result_is_downloaded_locally(
     usage = session.scalar(select(ProviderUsageRecord))
     assert usage is not None
     assert float(usage.actual_cost) == pytest.approx(0.12)
+    costs = summarize_project_cost(session, project.id, job_id="job-1")
+    assert costs.confirmed_cost == pytest.approx(0.12)
+    assert costs.estimated_exposure == 0
+    assert costs.run_cost == pytest.approx(0.12)
 
 
 def test_poll_timeout_resumes_same_task_without_second_submission(
     session: Session, tmp_path: Path
 ) -> None:
     project = _project(session)
+    _configure_video_price(session)
     provider = FakeVideoProvider([VideoTaskResult(RemoteVideoTaskState.PROCESSING)])
     request = _request(tmp_path)
     with pytest.raises(VideoGenerationError) as first:
@@ -200,6 +227,8 @@ def test_poll_timeout_resumes_same_task_without_second_submission(
         )
     assert first.value.code == VIDEO_POLL_TIMEOUT
     assert provider.submit_calls == 1
+    costs = summarize_project_cost(session, project.id, job_id="job-1")
+    assert costs.estimated_exposure == pytest.approx(0.15)
 
     provider.states = [
         VideoTaskResult(
@@ -216,11 +245,13 @@ def test_download_failure_reuses_same_remote_task_without_second_submission(
     session: Session, tmp_path: Path
 ) -> None:
     project = _project(session)
+    _configure_video_price(session)
     provider = FakeVideoProvider(
         [
             VideoTaskResult(
                 RemoteVideoTaskState.SUCCEEDED,
                 result_url="https://provider.invalid/recovered.mp4",
+                actual_cost=0.12,
             )
         ]
     )
@@ -239,6 +270,11 @@ def test_download_failure_reuses_same_remote_task_without_second_submission(
             downloader=fail_download,
         )
     assert first.value.code == "VIDEO_DOWNLOAD_FAILED"
+    failed_download_cost = summarize_project_cost(
+        session, project.id, job_id="job-1"
+    )
+    assert failed_download_cost.confirmed_cost == pytest.approx(0.12)
+    assert failed_download_cost.estimated_exposure == 0
 
     asset = _execute(session, project, provider, request, tmp_path)
 
@@ -250,11 +286,13 @@ def test_ffprobe_failure_reuses_same_remote_task_without_second_submission(
     session: Session, tmp_path: Path
 ) -> None:
     project = _project(session)
+    _configure_video_price(session)
     provider = FakeVideoProvider(
         [
             VideoTaskResult(
                 RemoteVideoTaskState.SUCCEEDED,
                 result_url="https://provider.invalid/recovered.mp4",
+                actual_cost=0.12,
             )
         ]
     )
@@ -273,6 +311,11 @@ def test_ffprobe_failure_reuses_same_remote_task_without_second_submission(
             prober=fail_probe,
         )
     assert first.value.code == "VIDEO_VALIDATION_FAILED"
+    failed_validation_cost = summarize_project_cost(
+        session, project.id, job_id="job-1"
+    )
+    assert failed_validation_cost.confirmed_cost == pytest.approx(0.12)
+    assert failed_validation_cost.estimated_exposure == 0
 
     asset = _execute(session, project, provider, request, tmp_path)
 
@@ -284,6 +327,7 @@ def test_ambiguous_submission_is_never_automatically_resubmitted(
     session: Session, tmp_path: Path
 ) -> None:
     project = _project(session)
+    _configure_video_price(session)
     provider = AmbiguousProvider()
     request = _request(tmp_path)
     for _ in range(2):
@@ -295,6 +339,35 @@ def test_ambiguous_submission_is_never_automatically_resubmitted(
     assert attempt is not None
     assert attempt.status == "SUBMISSION_STATUS_UNKNOWN"
     assert attempt.cost_certainty == "UNKNOWN"
+    costs = summarize_project_cost(session, project.id, job_id="job-1")
+    assert costs.estimated_exposure == pytest.approx(0.15)
+    assert costs.unknown_exposure_count == 0
+
+
+def test_remote_failure_keeps_reconciled_financial_exposure(
+    session: Session, tmp_path: Path
+) -> None:
+    project = _project(session)
+    _configure_video_price(session)
+    provider = FakeVideoProvider(
+        [
+            VideoTaskResult(
+                RemoteVideoTaskState.FAILED,
+                error_code="REMOTE_REJECTED",
+                error_message="Remote generation failed after submission",
+                actual_cost=0.12,
+            )
+        ]
+    )
+
+    with pytest.raises(VideoGenerationError) as raised:
+        _execute(session, project, provider, _request(tmp_path), tmp_path)
+
+    assert raised.value.code == VIDEO_TASK_FAILED
+    costs = summarize_project_cost(session, project.id, job_id="job-1")
+    assert costs.confirmed_cost == pytest.approx(0.12)
+    assert costs.estimated_exposure == 0
+    assert provider.submit_calls == 1
 
 
 def test_budget_blocks_before_provider_submission(
@@ -318,6 +391,109 @@ def test_budget_blocks_before_provider_submission(
     assert raised.value.code == VIDEO_BUDGET_EXCEEDED
     assert provider.submit_calls == 0
     assert session.scalar(select(VideoGenerationAttempt)) is None
+
+
+def test_unpriced_video_is_blocked_unless_project_explicitly_allows_it(
+    session: Session, tmp_path: Path
+) -> None:
+    project = _project(session, allow_unpriced_video_requests=False)
+    provider = FakeVideoProvider(
+        [
+            VideoTaskResult(
+                RemoteVideoTaskState.SUCCEEDED,
+                result_url="https://provider.invalid/unpriced.mp4",
+            )
+        ]
+    )
+    request = _request(tmp_path)
+
+    with pytest.raises(VideoGenerationError) as blocked:
+        _execute(session, project, provider, request, tmp_path)
+    assert blocked.value.code == VIDEO_PRICE_UNKNOWN
+    assert provider.submit_calls == 0
+    assert session.scalar(select(VideoGenerationAttempt)) is None
+
+    project.allow_unpriced_video_requests = True
+    session.commit()
+    _execute(session, project, provider, request, tmp_path)
+
+    assert provider.submit_calls == 1
+    costs = summarize_project_cost(session, project.id, job_id="job-1")
+    assert costs.run_cost is None
+    assert costs.unknown_exposure_count == 1
+
+
+def test_concurrent_different_requests_cannot_overrun_video_budget(
+    tmp_path: Path,
+) -> None:
+    database = tmp_path / "concurrent-budget.db"
+    engine = create_sqlite_engine(database)
+    init_database(engine)
+    factory = create_session_factory(engine)
+    with factory() as setup:
+        project = _project(
+            setup,
+            video_budget_amount=0.10,
+            allow_unpriced_video_requests=False,
+        )
+        project_id = project.id
+        _configure_video_price(setup, price=0.012)
+    source_request = _request(tmp_path)
+    barrier = Barrier(2)
+
+    def worker(index: int) -> tuple[str, int]:
+        provider = FakeVideoProvider(
+            [
+                VideoTaskResult(
+                    RemoteVideoTaskState.SUCCEEDED,
+                    result_url=f"https://provider.invalid/{index}.mp4",
+                )
+            ]
+        )
+        request = VideoGenerationRequest(
+            operation=source_request.operation,
+            prompt=f"{source_request.prompt} Variation {index}.",
+            duration_seconds=source_request.duration_seconds,
+            resolution=source_request.resolution,
+            aspect_ratio=source_request.aspect_ratio,
+            references=source_request.references,
+        )
+        with factory() as worker_session:
+            worker_project = worker_session.get(Project, project_id)
+            assert worker_project is not None
+            barrier.wait()
+            try:
+                _execute(
+                    worker_session,
+                    worker_project,
+                    provider,
+                    request,
+                    tmp_path,
+                    beat_id=f"beat-{index}",
+                    job_id=f"job-{index}",
+                )
+            except VideoGenerationError as exc:
+                return exc.code, provider.submit_calls
+        return "SUCCEEDED", provider.submit_calls
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        outcomes = list(executor.map(worker, (1, 2)))
+    engine.dispose()
+
+    assert sorted(code for code, _ in outcomes) == [
+        "SUCCEEDED",
+        VIDEO_BUDGET_EXCEEDED,
+    ]
+    assert sum(calls for _, calls in outcomes) == 1
+
+    engine = create_sqlite_engine(database)
+    factory = create_session_factory(engine)
+    with factory() as verification:
+        stored_project = verification.get(Project, project_id)
+        assert stored_project is not None
+        assert float(stored_project.video_cost_exposure_amount) == pytest.approx(0.06)
+        assert len(list(verification.scalars(select(VideoGenerationAttempt)))) == 1
+    engine.dispose()
 
 
 def test_unsupported_operation_fails_before_submission(

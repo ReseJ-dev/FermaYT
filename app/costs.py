@@ -23,6 +23,7 @@ from app.persistence import (
     ProviderPricing,
     ProviderUsageRecord,
     StyleReferenceAsset,
+    VideoGenerationAttempt,
     VisualOperationDecisionRecord,
 )
 
@@ -66,6 +67,9 @@ class CostSummary:
     cost_by_model: dict[str, float]
     cost_by_beat: dict[str, float]
     unpriced_records: int
+    confirmed_cost: float
+    estimated_exposure: float
+    unknown_exposure_count: int
 
     def as_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -299,7 +303,29 @@ def summarize_project_cost(
     run_records = [
         record for record in all_records if job_id is None or record.job_id == job_id
     ]
+    video_attempts = list(
+        session.scalars(
+            select(VideoGenerationAttempt).where(
+                VideoGenerationAttempt.project_id == project_id,
+                VideoGenerationAttempt.submission_started_at.is_not(None),
+            )
+        )
+    )
+    recorded_revisions = {record.request_revision for record in all_records}
+    outstanding_attempts = [
+        attempt
+        for attempt in video_attempts
+        if attempt.request_hash not in recorded_revisions
+    ]
+    run_attempts = [
+        attempt
+        for attempt in outstanding_attempts
+        if job_id is None or attempt.job_id == job_id
+    ]
     currencies = {record.currency for record in all_records if record.currency}
+    currencies.update(
+        attempt.currency for attempt in outstanding_attempts if attempt.currency
+    )
     currency = next(iter(currencies)) if len(currencies) == 1 else None
 
     def valued(record: ProviderUsageRecord) -> float | None:
@@ -310,9 +336,23 @@ def summarize_project_cost(
         )
         return float(value) if value is not None else None
 
-    def total(records: list[ProviderUsageRecord]) -> float | None:
-        values = [valued(record) for record in records]
-        if not records:
+    def attempt_value(attempt: VideoGenerationAttempt) -> float | None:
+        value = (
+            attempt.actual_cost
+            if attempt.actual_cost is not None
+            else attempt.estimated_cost
+        )
+        return float(value) if value is not None else None
+
+    def total(
+        records: list[ProviderUsageRecord],
+        attempts: list[VideoGenerationAttempt] | None = None,
+    ) -> float | None:
+        attempts = attempts or []
+        values = [valued(record) for record in records] + [
+            attempt_value(attempt) for attempt in attempts
+        ]
+        if not records and not attempts:
             return 0.0
         if any(value is None for value in values):
             return None
@@ -331,9 +371,43 @@ def summarize_project_cost(
         by_model[record.model or "unknown"] += value
         if record.beat_id:
             by_beat[record.beat_id] += value
+    for attempt in run_attempts:
+        value = attempt_value(attempt)
+        if value is None:
+            continue
+        by_stage["VIDEO_GENERATION"] += value
+        by_provider[attempt.provider] += value
+        by_model[attempt.model] += value
+        if attempt.beat_id:
+            by_beat[attempt.beat_id] += value
+
+    confirmed_cost = sum(
+        float(record.actual_cost)
+        for record in run_records
+        if record.actual_cost is not None
+    ) + sum(
+        float(attempt.actual_cost)
+        for attempt in run_attempts
+        if attempt.actual_cost is not None
+    )
+    estimated_exposure = sum(
+        float(record.estimated_cost)
+        for record in run_records
+        if record.actual_cost is None and record.estimated_cost is not None
+    ) + sum(
+        float(attempt.estimated_cost)
+        for attempt in run_attempts
+        if attempt.actual_cost is None and attempt.estimated_cost is not None
+    )
+    unknown_exposure = sum(
+        record.actual_cost is None
+        and record.estimated_cost is None
+        and record.status not in {UsageStatus.CACHED.value, UsageStatus.SKIPPED.value}
+        for record in run_records
+    ) + sum(attempt_value(attempt) is None for attempt in run_attempts)
     return CostSummary(
-        run_cost=total(run_records),
-        historical_project_cost=total(all_records),
+        run_cost=total(run_records, run_attempts),
+        historical_project_cost=total(all_records, outstanding_attempts),
         qa_retry_cost=total([record for record in run_records if record.is_qa_retry]),
         currency=currency,
         cost_by_stage={key: round(value, 8) for key, value in by_stage.items()},
@@ -346,7 +420,11 @@ def summarize_project_cost(
             and record.status
             not in {UsageStatus.CACHED.value, UsageStatus.SKIPPED.value}
             for record in run_records
-        ),
+        )
+        + sum(attempt_value(attempt) is None for attempt in run_attempts),
+        confirmed_cost=round(confirmed_cost, 8),
+        estimated_exposure=round(estimated_exposure, 8),
+        unknown_exposure_count=unknown_exposure,
     )
 
 

@@ -260,6 +260,46 @@ def _apply_additive_schema_updates(engine: Engine) -> None:
                         "ADD COLUMN provider_execution_context JSON"
                     )
                 )
+    if "projects" in table_names:
+        project_columns = {
+            column["name"] for column in inspector.get_columns("projects")
+        }
+        video_cost_additions = {
+            "allow_unpriced_video_requests": "BOOLEAN NOT NULL DEFAULT 0",
+            "video_cost_exposure_amount": "NUMERIC(18, 8) NOT NULL DEFAULT 0",
+            "video_cost_exposure_currency": "VARCHAR(3)",
+            "video_unknown_exposure_count": "INTEGER NOT NULL DEFAULT 0",
+        }
+        with engine.begin() as connection:
+            for name, sql_type in video_cost_additions.items():
+                if name in project_columns:
+                    continue
+                connection.execute(
+                    text(f"ALTER TABLE projects ADD COLUMN {name} {sql_type}")
+                )
+            if "video_generation_attempts" in table_names:
+                connection.execute(
+                    text(
+                        "UPDATE projects SET "
+                        "video_cost_exposure_amount = COALESCE(("
+                        "SELECT SUM(COALESCE(v.actual_cost, v.estimated_cost)) "
+                        "FROM video_generation_attempts v "
+                        "WHERE v.project_id = projects.id "
+                        "AND v.submission_started_at IS NOT NULL), 0), "
+                        "video_unknown_exposure_count = ("
+                        "SELECT COUNT(*) FROM video_generation_attempts v "
+                        "WHERE v.project_id = projects.id "
+                        "AND v.submission_started_at IS NOT NULL "
+                        "AND v.actual_cost IS NULL AND v.estimated_cost IS NULL), "
+                        "video_cost_exposure_currency = ("
+                        "SELECT CASE WHEN COUNT(DISTINCT v.currency) = 1 "
+                        "THEN MIN(v.currency) ELSE NULL END "
+                        "FROM video_generation_attempts v "
+                        "WHERE v.project_id = projects.id "
+                        "AND v.submission_started_at IS NOT NULL "
+                        "AND v.currency IS NOT NULL)"
+                    )
+                )
     if "master_scene_assets" in table_names:
         master_columns = {
             column["name"] for column in inspector.get_columns("master_scene_assets")

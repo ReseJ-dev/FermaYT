@@ -608,6 +608,16 @@ async def video_attempt_status_route(
                 float(attempt.actual_cost) if attempt.actual_cost is not None else None
             ),
             "cost_certainty": attempt.cost_certainty,
+            "financial_state": (
+                "CONFIRMED_COST"
+                if attempt.actual_cost is not None
+                else (
+                    "ESTIMATED_EXPOSURE"
+                    if attempt.estimated_cost is not None
+                    else "UNKNOWN_EXPOSURE"
+                )
+            ),
+            "provider_usage_raw": attempt.usage_snapshot,
             "video_url": _stored_media_url(project_id, attempt.output_path),
             "error": attempt.error_message,
         }
@@ -1729,6 +1739,10 @@ def _update_project_from_form(
     form.setdefault("video_resolution", current.video_resolution)
     form.setdefault("video_clip_duration", str(current.video_clip_duration))
     form.setdefault("video_budget_amount", str(current.video_budget_amount or ""))
+    form.setdefault(
+        "allow_unpriced_video_requests",
+        "1" if current.allow_unpriced_video_requests else "0",
+    )
     project = update_project(
         session,
         project_id,
@@ -1820,6 +1834,9 @@ def _update_project_from_form(
         ),
         video_budget_amount=_optional_float(
             form.get("video_budget_amount"), "Video budget"
+        ),
+        allow_unpriced_video_requests=(
+            form.get("allow_unpriced_video_requests", "0") == "1"
         ),
         tts_provider=_choice(
             form, "tts_provider", {"qwen", "elevenlabs"}, "Провайдер озвучки"
