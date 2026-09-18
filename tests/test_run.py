@@ -22,20 +22,15 @@ def test_main_starts_local_server(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    calls: list[tuple[str, dict[str, object]]] = []
+    calls: list[str] = []
 
-    def fake_run(application: str, **kwargs: object) -> None:
-        calls.append((application, kwargs))
+    def fake_run_server() -> None:
+        calls.append("run_server")
 
     monkeypatch.setattr(run, "DATA_DIR", tmp_path / "data")
-    monkeypatch.setattr(run.uvicorn, "run", fake_run)
+    monkeypatch.setattr(run, "run_server", fake_run_server)
 
     run.main()
 
     assert (tmp_path / "data" / "projects").is_dir()
-    assert calls == [
-        (
-            "app.main:app",
-            {"host": "127.0.0.1", "port": 8000, "reload": False},
-        )
-    ]
+    assert calls == ["run_server"]

@@ -8,7 +8,11 @@ import pytest
 
 from app.media import timeline_renderer
 from app.media.probe import probe_media
-from app.media.timeline_renderer import mux_narration, render_timeline_entry
+from app.media.timeline_renderer import (
+    mux_narration,
+    render_timeline_entry,
+    render_video_timeline_entry,
+)
 from app.models.render import ProjectRenderConfig, RenderImageFit
 from app.models.timeline import NormalizedOverlay, NormalizedTransform
 
@@ -20,8 +24,17 @@ def source_image(tmp_path: Path) -> Path:
     path = tmp_path / "source.png"
     subprocess.run(
         [
-            "ffmpeg", "-loglevel", "error", "-y", "-f", "lavfi", "-i",
-            "color=c=0x335577:s=240x180", "-frames:v", "1", str(path),
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=0x335577:s=240x180",
+            "-frames:v",
+            "1",
+            str(path),
         ],
         check=True,
     )
@@ -32,11 +45,19 @@ def source_image(tmp_path: Path) -> Path:
     "transform",
     [
         None,
-        NormalizedTransform(type="ZOOM_IN", start_scale=1.0, end_scale=1.1, focus={"x": 0.5, "y": 0.5}),
-        NormalizedTransform(type="ZOOM_OUT", start_scale=1.1, end_scale=1.0, focus={"x": 0.5, "y": 0.5}),
-        NormalizedTransform(type="PAN", **{"from": {"x": 0.2, "y": 0.5}, "to": {"x": 0.8, "y": 0.5}}),
+        NormalizedTransform(
+            type="ZOOM_IN", start_scale=1.0, end_scale=1.1, focus={"x": 0.5, "y": 0.5}
+        ),
+        NormalizedTransform(
+            type="ZOOM_OUT", start_scale=1.1, end_scale=1.0, focus={"x": 0.5, "y": 0.5}
+        ),
+        NormalizedTransform(
+            type="PAN", **{"from": {"x": 0.2, "y": 0.5}, "to": {"x": 0.8, "y": 0.5}}
+        ),
         NormalizedTransform(type="CROP", crop=(0.1, 0.1, 0.9, 0.9)),
-        NormalizedTransform(type="FOCUS", start_scale=1.0, end_scale=1.08, focus={"x": 0.7, "y": 0.4}),
+        NormalizedTransform(
+            type="FOCUS", start_scale=1.0, end_scale=1.08, focus={"x": 0.7, "y": 0.4}
+        ),
     ],
     ids=["static", "zoom-in", "zoom-out", "pan", "crop", "focus"],
 )
@@ -65,8 +86,15 @@ def test_static_and_transform_segments_are_legal_exact_media(
 @pytest.mark.parametrize(
     "overlay_type",
     [
-        "ARROW", "ROUTE", "X_MARK", "CIRCLE", "HIGHLIGHT", "TEXT_LABEL",
-        "MEASUREMENT", "DISTANCE", "DEPTH",
+        "ARROW",
+        "ROUTE",
+        "X_MARK",
+        "CIRCLE",
+        "HIGHLIGHT",
+        "TEXT_LABEL",
+        "MEASUREMENT",
+        "DISTANCE",
+        "DEPTH",
     ],
 )
 def test_every_overlay_type_produces_legal_video(
@@ -105,7 +133,9 @@ def test_render_config_is_versioned_json_safe_and_rejects_odd_dimensions() -> No
         ProjectRenderConfig(width=319)
 
 
-def test_final_mux_applies_loudness_normalization(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_final_mux_applies_loudness_normalization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     commands: list[list[str]] = []
     monkeypatch.setattr(
         timeline_renderer,
@@ -149,3 +179,109 @@ def test_timeline_segments_use_crf_encoding(
     command = commands[0]
     assert command[command.index("-crf") + 1] == "20"
     assert command[command.index("-preset") + 1] == "medium"
+
+
+def test_subtle_focus_transform_changes_rendered_pixels_perceptibly(
+    tmp_path: Path,
+) -> None:
+    if shutil.which("ffmpeg") is None:
+        pytest.skip("FFmpeg is required")
+    source = tmp_path / "pattern.png"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=320x180",
+            "-frames:v",
+            "1",
+            str(source),
+        ],
+        check=True,
+    )
+    output = tmp_path / "subtle-focus.mp4"
+    render_timeline_entry(
+        source,
+        output,
+        frame_count=30,
+        config=ProjectRenderConfig(width=320, height=180, fps=10),
+        transform=NormalizedTransform(
+            type="FOCUS",
+            start_scale=1.0,
+            end_scale=1.05,
+            focus={"x": 0.68, "y": 0.34},
+        ),
+    )
+
+    frame_hashes = subprocess.run(
+        [
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-i",
+            str(output),
+            "-vf",
+            r"select=eq(n\,0)+eq(n\,29)",
+            "-f",
+            "framemd5",
+            "-",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    hashes = [
+        line.rsplit(",", 1)[-1].strip()
+        for line in frame_hashes.splitlines()
+        if line and not line.startswith("#")
+    ]
+
+    assert len(hashes) == 2
+    assert hashes[0] != hashes[1]
+
+
+def test_ai_video_is_normalized_and_provider_audio_is_removed(tmp_path: Path) -> None:
+    if shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
+        pytest.skip("FFmpeg and ffprobe are required")
+    source = tmp_path / "provider-video.mp4"
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=s=240x320:r=12:d=0.4",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=0.4",
+            "-shortest",
+            "-c:v",
+            "libx264",
+            "-c:a",
+            "aac",
+            str(source),
+        ],
+        check=True,
+    )
+    output = tmp_path / "normalized.mp4"
+
+    render_video_timeline_entry(
+        source,
+        output,
+        frame_count=10,
+        config=ProjectRenderConfig(width=320, height=180, fps=10),
+    )
+
+    metadata = probe_media(output)
+    assert metadata.has_video is True
+    assert metadata.has_audio is False
+    assert (metadata.width, metadata.height, metadata.fps) == (320, 180, 10)
+    assert metadata.duration == pytest.approx(1.0, abs=0.04)

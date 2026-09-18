@@ -59,7 +59,10 @@ from app.pipeline.visual_qa import (
 )
 from app.production_profiles import ProductionProfile
 from app.provider_capabilities import ImageProviderCapabilities
-from app.provider_diagnostics import diagnostic_from_exception
+from app.provider_diagnostics import (
+    diagnostic_from_exception,
+    find_structured_ai_provider_diagnostic,
+)
 from app.providers import (
     ImageProvider,
     get_image_provider,
@@ -72,6 +75,7 @@ from app.repositories import (
     get_beat_visual_qa_evaluation_by_revision,
     get_project,
     get_project_visual_plan_record,
+    get_recheckable_beat_visual_result,
     get_style_reference_asset,
     get_successful_beat_visual_result,
     get_visual_execution_plan,
@@ -304,7 +308,9 @@ class VisualBeatAssetExecutor:
                 provider_resolver=lambda name, config: provider,
                 production_profile=execution_plan.production_profile,
                 draft_paid_visual_ratio=(
-                    execution_plan.decision_input_snapshot.get("draft_policy", {}).get("ratio")
+                    execution_plan.decision_input_snapshot.get("draft_policy", {}).get(
+                        "ratio"
+                    )
                     if execution_plan.decision_input_snapshot.get("draft_policy")
                     else None
                 ),
@@ -349,7 +355,12 @@ class VisualBeatAssetExecutor:
             if result.visual_plan_id == context.execution_plan.visual_plan_id
         ]
         source = None
-        if operation is not VisualOperation.NEW_IMAGE:
+        has_earlier_accepted_state = any(
+            int(result.semantic_state_snapshot.get("beat_position", -1))
+            < decision.position
+            for result in accepted_results
+        )
+        if operation is not VisualOperation.NEW_IMAGE or has_earlier_accepted_state:
             source = select_source_asset(
                 context.plan,
                 beat,
@@ -398,7 +409,9 @@ class VisualBeatAssetExecutor:
             model=context.execution_plan.model,
         )
         prompt = base_assembly.assembled_prompt_before_provider_transform
-        transform = _build_transform(beat) if operation is VisualOperation.TRANSFORM else None
+        transform = (
+            _build_transform(beat) if operation is VisualOperation.TRANSFORM else None
+        )
         overlay = _build_overlay(beat) if operation is VisualOperation.OVERLAY else None
         semantic_state = _semantic_state_snapshot(
             beat,
@@ -493,28 +506,26 @@ class VisualBeatAssetExecutor:
         )
         if promoted is not None:
             return promoted
-        should_run_qa = operation in generated_operations and self.qa_service is not None
-        total_attempts = self.max_visual_qa_attempts if should_run_qa else 1
-        correction: str | None = None
-        rejected_candidates: list[tuple[BeatVisualResult, VisualQADecision]] = []
-
-        for qa_attempt in range(1, total_attempts + 1):
-            attempt = next_beat_visual_attempt(
+        should_run_qa = (
+            operation in generated_operations and self.qa_service is not None
+        )
+        recheckable = (
+            get_recheckable_beat_visual_result(
                 self.session,
                 execution_plan_id=context.execution_plan.id,
                 beat_id=beat.id,
                 generation_revision=generation_revision,
             )
-            if operation in generated_operations:
-                planned_output_path = str(
-                    ProjectMediaPaths(
-                        context.project.id,
-                        self.projects_root,
-                    ).visual_beat_path(beat.id, generation_revision, attempt)
-                )
-            else:
-                assert source is not None
-                planned_output_path = source.path
+            if should_run_qa
+            else None
+        )
+        if recheckable is not None and not await _verify_result_file(recheckable):
+            recheckable = None
+        total_attempts = self.max_visual_qa_attempts if should_run_qa else 1
+        correction: str | None = None
+        rejected_candidates: list[tuple[BeatVisualResult, VisualQADecision]] = []
+
+        for qa_attempt in range(1, total_attempts + 1):
             attempt_assembly = compile_prompt_assembly(
                 self.session,
                 project=context.project,
@@ -531,144 +542,178 @@ class VisualBeatAssetExecutor:
                 qa_correction=correction,
             )
             prompt_used = attempt_assembly.assembled_prompt_before_provider_transform
-            if operation in generated_operations and self.budget_guard is not None:
-                self.budget_guard.check_paid_call(
-                    pipeline_stage="VISUAL_GENERATION",
-                    provider=context.execution_plan.provider,
-                    model=context.execution_plan.model,
-                    operation=provider_operation_name(operation, bool(references)),
-                    unit_type=PricingUnit.PER_IMAGE,
-                    input_units=1,
-                    is_qa_retry=qa_attempt > 1,
-                    beat_id=beat.id,
-                    master_scene_id=beat.master_scene_id,
+            if qa_attempt == 1 and recheckable is not None:
+                result = recheckable
+                output_path = result.output_path
+                file_sha256 = result.file_sha256
+                assert output_path is not None and file_sha256 is not None
+                logger.info(
+                    "Retrying automated QA for existing generated candidate",
+                    extra={
+                        "project_id": context.project.id,
+                        "beat_id": beat.id,
+                        "beat_visual_result_id": result.id,
+                    },
                 )
-            result = create_beat_visual_result(
-                self.session,
-                project_id=context.project.id,
-                visual_plan_id=context.execution_plan.visual_plan_id,
-                visual_plan_revision=context.execution_plan.visual_plan_revision,
-                execution_plan_id=context.execution_plan.id,
-                beat_id=beat.id,
-                resolved_operation=operation.value,
-                source_result_id=source.result_id if source else None,
-                source_master_asset_id=(
-                    source.master_asset_id if source is not None else None
-                ),
-                source_path=source.path if source is not None else None,
-                output_path=planned_output_path,
-                file_sha256=None,
-                master_scene_id=beat.master_scene_id,
-                prompt_used=prompt_used,
-                prompt_assembly_snapshot=attempt_assembly.as_dict(),
-                provider=context.execution_plan.provider,
-                model=context.execution_plan.model,
-                production_profile=context.execution_plan.production_profile,
-                style_version=self.style_id,
-                reference_snapshot=reference_snapshot,
-                generation_status=BeatVisualGenerationStatus.PENDING.value,
-                qa_status=BeatVisualQAStatus.NOT_RUN.value,
-                is_accepted=False,
-                error=None,
-                transform_metadata=(
-                    transform.model_dump(mode="json")
-                    if transform is not None
-                    else None
-                ),
-                overlay_metadata=(
-                    overlay.model_dump(mode="json") if overlay is not None else None
-                ),
-                semantic_state_snapshot=semantic_state,
-                generation_revision=generation_revision,
-                attempt=attempt,
-            )
-            try:
+            else:
+                attempt = next_beat_visual_attempt(
+                    self.session,
+                    execution_plan_id=context.execution_plan.id,
+                    beat_id=beat.id,
+                    generation_revision=generation_revision,
+                )
                 if operation in generated_operations:
-                    request = ContinuityGenerationRequest(
-                        operation=operation,
-                        prompt=attempt_assembly.final_provider_prompt or "",
-                        master_scene_id=beat.master_scene_id,
-                        master_image_path=(
-                            master_asset.file_path
-                            if master_asset is not None
-                            else None
-                        ),
-                        style_version=self.style_id,
-                        references=references,
+                    planned_output_path = str(
+                        ProjectMediaPaths(
+                            context.project.id,
+                            self.projects_root,
+                        ).visual_beat_path(beat.id, generation_revision, attempt)
                     )
-                    output_path = await generate_continuity_image(
-                        request,
-                        planned_output_path,
-                        context.provider,
-                        downloader=self.downloader,
-                        prompt_is_final=True,
-                    )
-                    self._record_usage(
-                        context,
-                        beat_id=beat.id,
-                        operation=provider_operation_name(operation, bool(references)),
-                        revision=usage_revision(generation_revision, "image", attempt),
-                        status=UsageStatus.SUCCEEDED,
-                        is_qa_retry=qa_attempt > 1,
-                    )
-                    file_sha256 = await asyncio.to_thread(_sha256_file, output_path)
                 else:
                     assert source is not None
-                    output_path = planned_output_path
-                    file_sha256 = source.sha256
+                    planned_output_path = source.path
+                if operation in generated_operations and self.budget_guard is not None:
+                    self.budget_guard.check_paid_call(
+                        pipeline_stage="VISUAL_GENERATION",
+                        provider=context.execution_plan.provider,
+                        model=context.execution_plan.model,
+                        operation=provider_operation_name(operation, bool(references)),
+                        unit_type=PricingUnit.PER_IMAGE,
+                        input_units=1,
+                        is_qa_retry=qa_attempt > 1,
+                        beat_id=beat.id,
+                        master_scene_id=beat.master_scene_id,
+                    )
+                result = create_beat_visual_result(
+                    self.session,
+                    project_id=context.project.id,
+                    visual_plan_id=context.execution_plan.visual_plan_id,
+                    visual_plan_revision=context.execution_plan.visual_plan_revision,
+                    execution_plan_id=context.execution_plan.id,
+                    beat_id=beat.id,
+                    resolved_operation=operation.value,
+                    source_result_id=source.result_id if source else None,
+                    source_master_asset_id=(
+                        source.master_asset_id if source is not None else None
+                    ),
+                    source_path=source.path if source is not None else None,
+                    output_path=planned_output_path,
+                    file_sha256=None,
+                    master_scene_id=beat.master_scene_id,
+                    prompt_used=prompt_used,
+                    prompt_assembly_snapshot=attempt_assembly.as_dict(),
+                    provider=context.execution_plan.provider,
+                    model=context.execution_plan.model,
+                    production_profile=context.execution_plan.production_profile,
+                    style_version=self.style_id,
+                    reference_snapshot=reference_snapshot,
+                    generation_status=BeatVisualGenerationStatus.PENDING.value,
+                    qa_status=BeatVisualQAStatus.NOT_RUN.value,
+                    is_accepted=False,
+                    error=None,
+                    transform_metadata=(
+                        transform.model_dump(mode="json")
+                        if transform is not None
+                        else None
+                    ),
+                    overlay_metadata=(
+                        overlay.model_dump(mode="json") if overlay is not None else None
+                    ),
+                    semantic_state_snapshot=semantic_state,
+                    generation_revision=generation_revision,
+                    attempt=attempt,
+                )
+                try:
+                    if operation in generated_operations:
+                        request = ContinuityGenerationRequest(
+                            operation=operation,
+                            prompt=attempt_assembly.final_provider_prompt or "",
+                            master_scene_id=beat.master_scene_id,
+                            master_image_path=(
+                                master_asset.file_path
+                                if master_asset is not None
+                                else None
+                            ),
+                            style_version=self.style_id,
+                            references=references,
+                        )
+                        output_path = await generate_continuity_image(
+                            request,
+                            planned_output_path,
+                            context.provider,
+                            downloader=self.downloader,
+                            prompt_is_final=True,
+                        )
+                        self._record_usage(
+                            context,
+                            beat_id=beat.id,
+                            operation=provider_operation_name(
+                                operation, bool(references)
+                            ),
+                            revision=usage_revision(
+                                generation_revision, "image", attempt
+                            ),
+                            status=UsageStatus.SUCCEEDED,
+                            is_qa_retry=qa_attempt > 1,
+                        )
+                        file_sha256 = await asyncio.to_thread(_sha256_file, output_path)
+                    else:
+                        assert source is not None
+                        output_path = planned_output_path
+                        file_sha256 = source.sha256
+                        self._record_usage(
+                            context,
+                            beat_id=beat.id,
+                            operation=operation.value,
+                            revision=usage_revision(generation_revision, "free"),
+                            status=UsageStatus.SKIPPED,
+                        )
+                except Exception as exc:
+                    summary = f"Failed to execute visual beat {beat.id}"
+                    provider_operation = (
+                        "edit"
+                        if operation is VisualOperation.EDIT_EXISTING
+                        else "reference"
+                        if references
+                        else "generate"
+                    )
                     self._record_usage(
                         context,
                         beat_id=beat.id,
-                        operation=operation.value,
-                        revision=usage_revision(generation_revision, "free"),
-                        status=UsageStatus.SKIPPED,
+                        operation=provider_operation,
+                        revision=usage_revision(generation_revision, "image", attempt),
+                        status=UsageStatus.FAILED,
+                        is_qa_retry=qa_attempt > 1,
                     )
-            except Exception as exc:
-                summary = f"Failed to execute visual beat {beat.id}"
-                provider_operation = (
-                    "edit"
-                    if operation is VisualOperation.EDIT_EXISTING
-                    else "reference"
-                    if references
-                    else "generate"
-                )
-                self._record_usage(
-                    context,
-                    beat_id=beat.id,
-                    operation=provider_operation,
-                    revision=usage_revision(generation_revision, "image", attempt),
-                    status=UsageStatus.FAILED,
-                    is_qa_retry=qa_attempt > 1,
-                )
-                diagnostic = diagnostic_from_exception(
-                    exc,
-                    provider=context.execution_plan.provider,
-                    model=context.execution_plan.model,
-                    operation=provider_operation,
-                    request_stage="visual_beat_generation",
-                ).with_context(
-                    request_stage="visual_beat_generation",
-                    beat_id=beat.id,
-                )
-                mark_beat_visual_result_failed(
+                    diagnostic = diagnostic_from_exception(
+                        exc,
+                        provider=context.execution_plan.provider,
+                        model=context.execution_plan.model,
+                        operation=provider_operation,
+                        request_stage="visual_beat_generation",
+                    ).with_context(
+                        request_stage="visual_beat_generation",
+                        beat_id=beat.id,
+                    )
+                    mark_beat_visual_result_failed(
+                        self.session,
+                        result,
+                        error=_safe_error(exc),
+                    )
+                    logger.error("%s", diagnostic.format(summary))
+                    raise BeatVisualExecutionError(
+                        f"{summary}: {_safe_error(exc)}",
+                        diagnostic=diagnostic,
+                        user_summary=summary,
+                    ) from exc
+
+                result = mark_beat_visual_result_succeeded(
                     self.session,
                     result,
-                    error=_safe_error(exc),
+                    output_path=output_path,
+                    file_sha256=file_sha256,
+                    accept=not should_run_qa,
                 )
-                logger.error("%s", diagnostic.format(summary))
-                raise BeatVisualExecutionError(
-                    f"{summary}: {_safe_error(exc)}",
-                    diagnostic=diagnostic,
-                    user_summary=summary,
-                ) from exc
-
-            result = mark_beat_visual_result_succeeded(
-                self.session,
-                result,
-                output_path=output_path,
-                file_sha256=file_sha256,
-                accept=not should_run_qa,
-            )
             if not should_run_qa:
                 return result
 
@@ -714,7 +759,9 @@ class VisualBeatAssetExecutor:
                             beat_id=beat.id,
                             master_scene_id=beat.master_scene_id,
                         )
-                    qa_decision = await self.qa_service.evaluate(output_path, qa_context)
+                    qa_decision = await self.qa_service.evaluate(
+                        output_path, qa_context
+                    )
                     self._record_usage(
                         context,
                         beat_id=beat.id,
@@ -738,8 +785,15 @@ class VisualBeatAssetExecutor:
                         unit_type=PricingUnit.PER_REQUEST,
                         is_qa_retry=qa_attempt > 1,
                     )
+                    diagnostic = find_structured_ai_provider_diagnostic(exc)
+                    detail = (
+                        f"{diagnostic.provider} / {diagnostic.model or 'unknown'}"
+                        f" · {diagnostic.category}"
+                        if diagnostic is not None
+                        else "unknown provider error"
+                    )
                     warning = (
-                        f"Visual QA unavailable for beat {beat.id}; "
+                        f"Visual QA unavailable for beat {beat.id} — {detail}; "
                         "generated candidate rejected without automated QA"
                     )
                     logger.warning(
@@ -753,7 +807,8 @@ class VisualBeatAssetExecutor:
                     result.accepted_at = None
                     self.session.commit()
                     raise BeatVisualExecutionError(
-                        f"Visual QA unavailable for beat {beat.id}"
+                        f"Visual QA unavailable for beat {beat.id} — {detail}",
+                        diagnostic=diagnostic,
                     ) from exc
             else:
                 qa_decision = VisualQADecision.model_validate(
@@ -788,10 +843,7 @@ class VisualBeatAssetExecutor:
             item
             for item in rejected_candidates
             if not is_hard_qa_failure(item[1])
-            and (
-                item[1].severity is None
-                or item[1].severity.value == "minor"
-            )
+            and (item[1].severity is None or item[1].severity.value == "minor")
         ]
         if usable_candidates:
             best_result, best_decision = min(
@@ -838,12 +890,14 @@ class VisualBeatAssetExecutor:
         reference_snapshot: list[dict[str, Any]],
     ) -> BeatVisualResult | None:
         """Carry an exact Pilot result into a later compatible execution revision."""
-        for candidate in reversed(list_beat_visual_results(
-            self.session,
-            context.project.id,
-            beat_id=beat.id,
-            accepted_only=True,
-        )):
+        for candidate in reversed(
+            list_beat_visual_results(
+                self.session,
+                context.project.id,
+                beat_id=beat.id,
+                accepted_only=True,
+            )
+        ):
             qa_compatible = (
                 candidate.qa_status == BeatVisualQAStatus.NOT_RUN.value
                 if self.qa_service is None
@@ -949,8 +1003,7 @@ class VisualBeatAssetExecutor:
             VisualOperation.EDIT_EXISTING,
         }
         if (
-            context.execution_plan.production_profile
-            != ProductionProfile.FINAL.value
+            context.execution_plan.production_profile != ProductionProfile.FINAL.value
             or operation not in generated_operations
             or self.qa_service is None
         ):
@@ -1087,6 +1140,7 @@ class VisualBeatAssetExecutor:
             is_qa_retry=is_qa_retry,
         )
 
+
 def _build_qa_context(
     context: _ExecutionContext,
     beat: VisualBeat,
@@ -1119,9 +1173,15 @@ def _build_qa_context(
         item.description for item in context.plan.characters if item.id in character_ids
     )
     forbidden_mismatches = list(beat.must_not_show)
-    if any("miner" in value.lower() for value in (*required_entities, *required_attributes)):
+    if any(
+        "miner" in value.lower() for value in (*required_entities, *required_attributes)
+    ):
         forbidden_mismatches.extend(
-            ("generic civilians", "people without work clothing", "people without mining helmets")
+            (
+                "generic civilians",
+                "people without work clothing",
+                "people without mining helmets",
+            )
         )
     return VisualQAContext(
         visual_purpose=beat.visual_purpose,
@@ -1150,9 +1210,7 @@ def _build_qa_context(
         source_reference_path=(
             source_path if operation is VisualOperation.EDIT_EXISTING else None
         ),
-        information_added_beyond_narration=(
-            beat.information_added_beyond_narration
-        ),
+        information_added_beyond_narration=(beat.information_added_beyond_narration),
         required_entities=required_entities,
         required_attributes=required_attributes,
         required_environment=f"{location.description}; {location.spatial_layout}",
@@ -1242,6 +1300,9 @@ def build_visual_qa_execution_summary(
         "CONTINUITY",
         "LOCATION_DRIFT",
         "CHARACTER_DRIFT",
+        "LOCATION_IDENTITY_DRIFT",
+        "CHARACTER_IDENTITY_DRIFT",
+        "ENVIRONMENT_MISMATCH",
         "OBJECT_DRIFT",
         "EDIT_CHANGED_TOO_MUCH",
         "REFERENCE_NOT_RESPECTED",
@@ -1250,6 +1311,8 @@ def build_visual_qa_execution_summary(
         "STYLE_DRIFT",
         "STYLE_DRIFT_REALISM",
         "STYLE_DRIFT_DETAIL",
+        "STYLE_DETAIL_DRIFT",
+        "STYLE_SHADING_DRIFT",
         "STYLE_DRIFT_CHILDISH",
     }
     composition_categories = {
@@ -1258,6 +1321,7 @@ def build_visual_qa_execution_summary(
         "IMPORTANT_ACTION_TOO_SMALL",
         "EXCESSIVE_CLUTTER",
         "VIDEO_READABILITY",
+        "UNWANTED_FRAME_OR_MARGIN",
     }
     return VisualQAExecutionSummary(
         beats=len({item.beat_id for item in accepted}),

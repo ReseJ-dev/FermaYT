@@ -1,21 +1,23 @@
 {% extends "base.html" %}
 
 {% macro prompt_row(row) %}
-  <tr class="prompt-row" data-prompt-row data-target-type="{{ row.target_type }}" data-target-id="{{ row.target_id }}" data-mode="{{ row.prompt_mode or row.override_state }}" data-search="{{ row.target_id }} {{ row.narration or '' }} {{ row.summary or '' }}">
+  <tr id="visual-target-{{ row.target_type | lower }}-{{ row.target_id }}" class="prompt-row" data-prompt-row data-target-type="{{ row.target_type }}" data-target-id="{{ row.target_id }}" data-mode="{{ row.prompt_mode or row.override_state }}" data-search="{{ row.target_id }} {{ row.narration or '' }} {{ row.summary or '' }}">
+    <td>{% if row.selectable %}<input type="checkbox" data-select-beat value="{{ row.target_id }}" aria-label="Select {{ row.target_id }}">{% endif %}</td>
     <td><code>{{ row.target_id }}</code></td>
-    <td><span class="prompt-summary">{{ row.narration or row.summary or '—' }}</span>{% if row.narration and row.summary %}<small>{{ row.summary }}</small>{% endif %}</td>
+    <td>{% if row.time_range %}<span class="prompt-time">{{ '%.1f' | format(row.time_range.start) }}–{{ '%.1f' | format(row.time_range.end) }}s</span>{% endif %}<span class="prompt-summary">{{ row.narration or row.summary or '—' }}</span>{% if row.narration and row.summary %}<small>{{ row.summary }}</small>{% endif %}</td>
     <td><span class="operation-pill">{{ row.operation or '—' }}</span>{% if row.operation_detail %}<small>{{ row.operation_detail }}</small>{% endif %}</td>
     <td><span class="prompt-mode prompt-mode-{{ (row.prompt_mode or row.override_state) | lower }}" data-row-mode>{{ row.prompt_mode or row.override_state }}</span></td>
-    <td><span>{{ row.qa_status or row.generation_status or '—' }}</span></td>
+    <td><span>{{ row.qa_status or row.generation_status or '—' }}</span><small>{{ row.provider or '—' }}{% if row.model %} / {{ row.model }}{% endif %}</small></td>
+    <td>{% if row.video_preview_url %}<video class="storyboard-thumb table-thumb" src="{{ row.video_preview_url }}" muted controls preload="metadata"></video>{% elif row.accepted_preview_url %}<button class="storyboard-thumb table-thumb" type="button" data-inspect-prompt aria-label="Inspect {{ row.target_id }}"><img src="{{ row.accepted_preview_url }}" alt="Accepted candidate for {{ row.target_id }}" loading="lazy"></button>{% else %}<span class="preview-empty">—</span>{% endif %}</td>
     <td><button class="button button-secondary button-small" type="button" data-inspect-prompt>Inspect / Edit</button></td>
   </tr>
 {% endmacro %}
 
 {% block content %}
-  <div class="breadcrumbs"><a href="/">Проекты</a><span>/</span><a href="/projects/{{ project.id }}">{{ project.name }}</a><span>/</span><span>Visual Plan · Prompts</span></div>
+  <div class="breadcrumbs"><a href="/">Проекты</a><span>/</span><a href="/projects/{{ project.id }}">{{ project.name }}</a><span>/</span><span>Visual Sheet</span></div>
 
   <div class="page-heading prompt-sheet-heading">
-    <div><p class="eyebrow">Visual Plan</p><h1>Project Prompt Sheet</h1><p class="lead">{{ master_rows | length }} master scenes · {{ beat_rows | length }} visual beats</p></div>
+    <div><p class="eyebrow">Visual Plan</p><h1>Project Visual Sheet</h1><p class="lead">{{ master_rows | length }} master scenes · {{ beat_rows | length }} visual beats</p></div>
     <a class="button button-secondary" href="/projects/{{ project.id }}">Вернуться в проект</a>
   </div>
 
@@ -25,18 +27,36 @@
       <label>Режим<select data-prompt-filter><option value="ALL">ALL</option><option value="AUTO">AUTO ONLY</option><option value="OVERRIDE">OVERRIDES</option><option value="STALE">STALE</option><option value="REVIEW_REQUIRED">REVIEW REQUIRED</option><option value="NO_PROVIDER_CALL">NO PROVIDER CALL</option></select></label>
       <div class="prompt-sheet-count" data-prompt-count>{{ master_rows | length + beat_rows | length }} targets</div>
     </div>
+    <div class="visual-sheet-actions">
+      <label class="select-all-beats"><input type="checkbox" data-select-all-beats> Select all visible beats</label>
+      <button class="button button-primary" type="button" data-generate-selected disabled>Generate Selected · <span data-selected-count>0</span></button>
+      <span class="helper-text" data-selected-status>Untouched accepted assets remain valid.</span>
+    </div>
 
     {% if not master_rows and not beat_rows %}
       <div class="empty-state compact-empty"><h3>Visual Plan ещё не создан</h3><p>Запустите планирование видео. После этого master scenes и beats появятся здесь автоматически.</p></div>
     {% else %}
       <section class="prompt-group" aria-labelledby="prompt-masters-title">
         <div class="prompt-group-heading"><div><p class="eyebrow">Continuity first</p><h2 id="prompt-masters-title">MASTER SCENES</h2></div><span class="status-pill">{{ master_rows | length }}</span></div>
-        <div class="prompt-table-scroll"><table class="prompt-table"><thead><tr><th>ID</th><th>Semantic summary</th><th>Operation</th><th>Prompt mode</th><th>QA / generation</th><th></th></tr></thead><tbody>{% for row in master_rows %}{{ prompt_row(row) }}{% endfor %}</tbody></table></div>
+        <div class="prompt-table-scroll"><table class="prompt-table"><thead><tr><th></th><th>ID</th><th>Semantic summary</th><th>Operation</th><th>Prompt mode</th><th>Status / provider</th><th>Accepted</th><th></th></tr></thead><tbody>{% for row in master_rows %}{{ prompt_row(row) }}{% endfor %}</tbody></table></div>
       </section>
 
       <section class="prompt-group" aria-labelledby="prompt-beats-title">
-        <div class="prompt-group-heading"><div><p class="eyebrow">Timeline visuals</p><h2 id="prompt-beats-title">BEAT VISUALS</h2></div><span class="status-pill">{{ beat_rows | length }}</span></div>
-        <div class="prompt-table-scroll"><table class="prompt-table"><thead><tr><th>ID</th><th>Narration / semantic summary</th><th>Operation</th><th>Prompt mode</th><th>QA / generation</th><th></th></tr></thead><tbody>{% for row in beat_rows %}{{ prompt_row(row) }}{% endfor %}</tbody></table></div>
+        <div class="prompt-group-heading"><div><p class="eyebrow">Timeline visuals</p><h2 id="prompt-beats-title">ALL VISUAL BEATS</h2></div><span class="status-pill">{{ beat_rows | length }}</span></div>
+        <div class="prompt-table-scroll"><table class="prompt-table"><thead><tr><th></th><th>ID</th><th>Narration / semantic summary</th><th>Operation</th><th>Prompt mode</th><th>Status / provider</th><th>Accepted</th><th></th></tr></thead><tbody>{% for row in beat_rows %}{{ prompt_row(row) }}{% endfor %}</tbody></table></div>
+      </section>
+
+      <section class="prompt-group storyboard-section" aria-labelledby="storyboard-title">
+        <div class="prompt-group-heading"><div><p class="eyebrow">Continuity review</p><h2 id="storyboard-title">STORYBOARD</h2></div></div>
+        <div class="storyboard-strip">
+          {% for row in beat_rows %}
+            <button class="storyboard-card{% if not row.accepted_preview_url %} is-empty{% endif %}" type="button" data-storyboard-target data-target-type="BEAT" data-target-id="{{ row.target_id }}">
+              {% if row.accepted_preview_url %}<img src="{{ row.accepted_preview_url }}" alt="{{ row.target_id }}" loading="lazy">{% else %}<span>No frame</span>{% endif %}
+              <strong>{{ loop.index }} · {{ row.target_id }}</strong>
+              <small>{{ row.operation }}</small>
+            </button>
+          {% endfor %}
+        </div>
       </section>
     {% endif %}
 
@@ -49,6 +69,8 @@
     <div class="prompt-detail-shell">
       <div class="modal-heading"><div><p class="eyebrow" data-detail-type>TARGET</p><h2 data-detail-id>—</h2></div><button class="icon-button" type="button" data-close-dialog aria-label="Закрыть">×</button></div>
       <div class="prompt-detail-status" data-detail-status></div>
+      {% if project.video_generation_mode != 'OFF' %}<div class="visual-sheet-actions"><button class="button button-primary button-small" type="button" data-generate-video>Generate Video From Accepted Still</button><span class="helper-text">{{ project.video_provider }} / {{ project.video_model or 'provider default' }} · {{ project.video_clip_duration }}s · audio muted</span></div>{% endif %}
+      <div class="accepted-candidate" data-accepted-candidate hidden><img data-detail-accepted-image alt="Accepted candidate preview"><div><strong>ACCEPTED CANDIDATE</strong><small data-detail-provider-status>—</small></div></div>
       <div class="prompt-detail-grid">
         <section class="prompt-detail-main">
           <div class="prompt-field" data-narration-field><h3>NARRATION</h3><p data-detail-narration>—</p></div>
@@ -57,9 +79,9 @@
           <div class="prompt-field prompt-override-editor" data-provider-prompt-fields><div class="prompt-field-heading"><h3>MANUAL SCENE OVERRIDE</h3><span data-override-state>AUTO</span></div><textarea rows="6" data-override-input placeholder="Describe only the desired visual scene…"></textarea><small>Style, operation, references, semantics and QA remain automatic.</small><div class="prompt-editor-actions"><button class="button button-secondary button-small" type="button" data-edit-override>Edit Override</button><button class="button button-primary button-small" type="button" data-save-override>Save Override</button><button class="button button-secondary button-small" type="button" data-clear-override>Clear Override · Use Auto Prompt</button></div></div>
           <div class="prompt-field" data-provider-prompt-fields><h3>EFFECTIVE SCENE PROMPT</h3><pre data-detail-effective></pre></div>
           <div class="prompt-field"><h3>OPERATION</h3><p><strong data-detail-operation>—</strong></p><p data-detail-operation-instructions></p><p data-detail-operation-detail></p></div>
-          <div class="prompt-field"><h3>SOURCE ASSET</h3><p data-detail-source>—</p></div>
+          <div class="prompt-field"><h3>SOURCE / MASTER</h3><p>Source: <span data-detail-source>—</span></p><p>Master: <span data-detail-master>—</span></p><p>Time: <span data-detail-time>—</span></p></div>
           <div class="prompt-field"><h3>REFERENCES</h3><ul class="prompt-reference-list" data-detail-references></ul></div>
-          <div class="prompt-field"><h3>STYLE</h3><p><code data-detail-style>—</code></p></div>
+          <div class="prompt-field"><h3>PERMANENT STYLE CONTRACT</h3><p><code data-detail-style>—</code></p><pre data-detail-style-contract></pre></div>
         </section>
         <aside class="prompt-detail-preview">
           <div class="prompt-preview-controls"><label>Provider<select data-preview-provider><option value="seedream">Seedream</option><option value="qwen">Qwen Image</option><option value="zimage">Z-Image</option></select></label><label>Model<input data-preview-model></label><button class="button button-secondary button-small" type="button" data-refresh-preview>Refresh exact preview</button></div>

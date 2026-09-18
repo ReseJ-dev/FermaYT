@@ -55,13 +55,13 @@ def test_python_entrypoint_owns_and_cleans_up_pid_file(
     pid_file = tmp_path / "fermayt.pid"
     observed_pid = None
 
-    def fake_uvicorn_run(*args, **kwargs) -> None:
+    def fake_run_server() -> None:
         nonlocal observed_pid
         observed_pid = pid_file.read_text(encoding="utf-8").strip()
 
     monkeypatch.setattr(run, "DATA_DIR", tmp_path)
     monkeypatch.setattr(run, "PID_FILE", pid_file)
-    monkeypatch.setattr(run.uvicorn, "run", fake_uvicorn_run)
+    monkeypatch.setattr(run, "run_server", fake_run_server)
 
     run.main()
 
@@ -79,11 +79,10 @@ import run
 run.DATA_DIR = run.Path({str(tmp_path)!r})
 run.PID_FILE = run.Path({str(pid_file)!r})
 
-def fake_uvicorn_run(*args, **kwargs):
-    del args, kwargs
+def fake_run_server():
     threading.Thread(target=time.sleep, args=(30,)).start()
 
-run.uvicorn.run = fake_uvicorn_run
+run.run_server = fake_run_server
 run.cli_main()
 """
 
@@ -98,6 +97,36 @@ run.cli_main()
 
     assert completed.returncode == 0, completed.stderr
     assert not pid_file.exists()
+
+
+def test_owned_event_loop_does_not_join_cancelled_to_thread_worker(
+    tmp_path: Path,
+) -> None:
+    source = """
+import asyncio
+import os
+import time
+import run
+
+async def fake_server():
+    asyncio.create_task(asyncio.to_thread(time.sleep, 30))
+    await asyncio.sleep(0.05)
+    raise KeyboardInterrupt
+
+run._run_server_coroutine(fake_server())
+os._exit(0)
+"""
+
+    completed = subprocess.run(
+        [sys.executable, "-c", source],
+        cwd=PROJECT_ROOT,
+        capture_output=True,
+        text=True,
+        timeout=3,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_desktop_launcher_is_local_and_uses_terminal() -> None:

@@ -22,6 +22,11 @@ from app.models.visual_qa import (
     VisualQAProblemCategory,
     VisualQAResult,
 )
+from app.provider_diagnostics import (
+    StructuredAIProviderDiagnostic,
+    find_structured_ai_provider_diagnostic,
+    sanitize_provider_message,
+)
 from app.style_contracts import (
     DEFAULT_IMAGE_STYLE_ID,
     apply_image_style_contract,
@@ -30,7 +35,7 @@ from app.style_contracts import (
 
 logger = logging.getLogger(__name__)
 
-VISUAL_QA_PROMPT_VERSION = "visual_qa_v4"
+VISUAL_QA_PROMPT_VERSION = "visual_qa_v5"
 
 
 class VisualQAClient(Protocol):
@@ -148,13 +153,113 @@ class VisualQAService:
         try:
             raw_result = await self._client.evaluate(prompt, tuple(paths))
         except Exception as exc:
-            raise VisualQAError("Visual QA provider failed") from exc
-        try:
-            return VisualQADecision.model_validate(json.loads(raw_result))
-        except (json.JSONDecodeError, TypeError, ValidationError) as exc:
             raise VisualQAError(
-                "Visual QA provider returned an invalid structured result"
+                "Visual QA provider failed",
+                diagnostic=find_structured_ai_provider_diagnostic(exc),
             ) from exc
+        try:
+            payload = json.loads(raw_result)
+            if isinstance(payload, dict):
+                payload = _without_qwen_schema_echo(payload)
+                payload = _normalize_contradictory_qwen_pass(payload)
+            return VisualQADecision.model_validate(payload)
+        except (json.JSONDecodeError, TypeError, ValidationError) as exc:
+            diagnostic = StructuredAIProviderDiagnostic(
+                provider=self.provider,
+                model=self.model,
+                operation="visual_qa",
+                category="VISUAL_QA_INVALID_STRUCTURED_RESULT",
+                attempt=1,
+                max_attempts=1,
+                provider_error=sanitize_provider_message(str(exc)),
+                response_length=len(raw_result),
+            )
+            raise VisualQAError(
+                "Visual QA provider returned an invalid structured result",
+                diagnostic=diagnostic,
+            ) from exc
+
+
+_QWEN_SCHEMA_ECHO_KEYS = frozenset(
+    {
+        "$defs",
+        "$schema",
+        "title",
+        "description",
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+    }
+)
+
+
+def _without_qwen_schema_echo(payload: dict[str, object]) -> dict[str, object]:
+    """Remove JSON-Schema metadata while retaining strict decision fields."""
+    return {
+        key: value
+        for key, value in payload.items()
+        if key not in _QWEN_SCHEMA_ECHO_KEYS
+    }
+
+
+def _normalize_contradictory_qwen_pass(
+    payload: dict[str, object],
+) -> dict[str, object]:
+    """Fail safely when Qwen says PASS while simultaneously reporting defects."""
+    if payload.get("result") != VisualQAResult.PASS.value:
+        return payload
+    categories = payload.get("problem_categories")
+    reasons = payload.get("reasons")
+    correction = payload.get("correction_instruction")
+    has_categories = isinstance(categories, list) and bool(categories)
+    has_reasons = isinstance(reasons, list) and bool(reasons)
+    has_correction = isinstance(correction, str) and bool(correction.strip())
+    if not (has_categories or has_reasons or has_correction):
+        return payload
+
+    if not has_categories and not has_correction and payload.get("severity") is None:
+        # Qwen sometimes explains a clean PASS with positive observations.
+        # Explanatory prose is not a warning when no defect category, severity,
+        # or requested correction accompanies it.
+        normalized_pass = dict(payload)
+        normalized_pass["reasons"] = []
+        return normalized_pass
+
+    normalized = dict(payload)
+    category_values = (
+        [item for item in categories if isinstance(item, str)]
+        if isinstance(categories, list)
+        else []
+    )
+    reason_values = (
+        [item.strip() for item in reasons if isinstance(item, str) and item.strip()]
+        if isinstance(reasons, list)
+        else []
+    )
+    if not category_values:
+        category_values = [VisualQAProblemCategory.OTHER.value]
+    if not reason_values:
+        reason_values = ["The provider reported that the frame needs correction"]
+    normalized["problem_categories"] = category_values
+    normalized["reasons"] = reason_values
+
+    hard_values = {item.value for item in _HARD_FAILURE_CATEGORIES}
+    is_hard = normalized.get("severity") == "critical" or bool(
+        set(category_values) & hard_values
+    )
+    if is_hard or has_correction:
+        normalized["result"] = VisualQAResult.REGENERATE.value
+        normalized["severity"] = normalized.get("severity") or "major"
+        if not has_correction:
+            normalized["correction_instruction"] = (
+                "Correct the reported visual problems: " + "; ".join(reason_values)
+            )
+    else:
+        normalized["result"] = VisualQAResult.PASS_WITH_WARNING.value
+        normalized["severity"] = normalized.get("severity") or "minor"
+        normalized["correction_instruction"] = None
+    return normalized
 
 
 async def generate_with_visual_qa(
@@ -310,23 +415,23 @@ IMAGE ROLES:
 REQUIRED STORY INFORMATION:
 - visual purpose: {context.visual_purpose}
 - viewer should understand: {context.what_viewer_should_understand}
-- required objects: {', '.join(context.required_objects) or 'none'}
+- required objects: {", ".join(context.required_objects) or "none"}
 - important physical action: {context.important_physical_action}
 - location: {context.location_id}
 - expected physical state: {context.expected_physical_state}
 - intentional change from previous beat: {context.change_from_previous}
 - resolved visual operation: {context.resolved_operation}
-- visible characters: {', '.join(context.characters_visible) or 'none'}
-- character continuity definitions: {', '.join(context.character_definitions) or 'none'}
-- object continuity definitions: {', '.join(context.object_definitions) or 'none'}
+- visible characters: {", ".join(context.characters_visible) or "none"}
+- character continuity definitions: {", ".join(context.character_definitions) or "none"}
+- object continuity definitions: {", ".join(context.object_definitions) or "none"}
 - camera / composition: {context.camera_view}
-- provider-ready generation prompt: {context.generation_prompt or 'not supplied'}
+- provider-ready generation prompt: {context.generation_prompt or "not supplied"}
 - information added beyond narration: {information_added}
-- required entities: {', '.join(context.required_entities) or 'none'}
-- required identity attributes: {', '.join(context.required_attributes) or 'none'}
+- required entities: {", ".join(context.required_entities) or "none"}
+- required identity attributes: {", ".join(context.required_attributes) or "none"}
 - required environment: {context.required_environment or context.location_id}
 - required story state: {context.required_state or context.expected_physical_state}
-- forbidden major mismatches: {', '.join(context.forbidden_major_mismatches) or 'none'}
+- forbidden major mismatches: {", ".join(context.forbidden_major_mismatches) or "none"}
 
 CHECK STORY ACCURACY: required objects, visible physical action, and intended purpose.
 Explicitly verify every required entity, its story-critical role/identity attributes,
@@ -335,10 +440,25 @@ named roles such as miners: required work clothing and mining helmets must remai
 recognizable. Use MISSING_REQUIRED_ENTITY, WRONG_ENTITY_IDENTITY, WRONG_ENVIRONMENT,
 or WRONG_PHYSICAL_STATE for these hard failures.
 CHECK CONTINUITY: master location, recurring characters and objects; reject environment
-redesign. CHECK STYLE: reject realism, excess detail, polish, cinematic treatment,
-childishness, and unwanted textures. CHECK COMPOSITION: action prominence, clutter,
-scale of important objects, and overcrowding. CHECK VIDEO READABILITY: rapid
-understanding, needed simplification, and whether crop/framing should change.
+redesign. Compare recurring character helmet color, clothing colors, safety vest,
+body proportions, simple face design, and carried equipment. Use
+CHARACTER_IDENTITY_DRIFT when those identifiers change. Compare the master location's
+tunnel proportions, wall color family, ventilation pipes, supports, rail layout,
+lights, and palette. Use LOCATION_IDENTITY_DRIFT or ENVIRONMENT_MISMATCH when the
+required environment is replaced or redesigned. A previous frame from another
+location does not override the explicitly required current location or its master;
+do not reject a legitimate location transition described by the current requirements.
+CHECK STYLE: compare line thickness, character simplification, color flatness,
+shading level, detail ceiling, and handmade appearance against STYLE_REFERENCE.
+Use STYLE_DETAIL_DRIFT for excess or inconsistent detail and STYLE_SHADING_DRIFT for
+soft, dimensional, cinematic, or otherwise inconsistent shading. Generated content
+or previous frames never override STYLE_REFERENCE. CHECK COMPOSITION: action
+prominence, clutter, scale of important objects, and overcrowding. The illustrated
+environment must fill the full 16:9 image edge-to-edge. Use UNWANTED_FRAME_OR_MARGIN
+and REGENERATE for a large white external margin, drawn rectangular image frame,
+paper-like border, poster/panel boundary, or fake canvas edge unless the story
+explicitly requires it. CHECK VIDEO READABILITY: rapid understanding, needed
+simplification, and whether crop/framing should change.
 CHECK UNINTENDED TEXT: reject any visible prompt wording, pseudo-text, caption, section
 heading, operation name,
 technical label, watermark, or interface text unless readable story-world text is
@@ -381,14 +501,20 @@ _HARD_FAILURE_CATEGORIES = {
     VisualQAProblemCategory.WRONG_PHYSICAL_STATE,
     VisualQAProblemCategory.WRONG_CHARACTER,
     VisualQAProblemCategory.LOCATION_DRIFT,
+    VisualQAProblemCategory.CHARACTER_IDENTITY_DRIFT,
+    VisualQAProblemCategory.LOCATION_IDENTITY_DRIFT,
+    VisualQAProblemCategory.ENVIRONMENT_MISMATCH,
     VisualQAProblemCategory.STORY_ACCURACY,
     VisualQAProblemCategory.CONTINUITY,
     VisualQAProblemCategory.STYLE_DRIFT_REALISM,
+    VisualQAProblemCategory.STYLE_DETAIL_DRIFT,
+    VisualQAProblemCategory.STYLE_SHADING_DRIFT,
     VisualQAProblemCategory.STYLE_DRIFT,
     VisualQAProblemCategory.EDIT_CHANGED_TOO_MUCH,
     VisualQAProblemCategory.COMPOSITION_UNCLEAR,
     VisualQAProblemCategory.UNWANTED_TEXT,
     VisualQAProblemCategory.UNINTENDED_TEXT,
+    VisualQAProblemCategory.UNWANTED_FRAME_OR_MARGIN,
     VisualQAProblemCategory.VIDEO_READABILITY,
 }
 
@@ -449,9 +575,7 @@ async def _finish_best(
 ) -> VisualQAOutcome:
     best = min(candidates, key=lambda candidate: _candidate_penalty(candidate.decision))
     if is_hard_qa_failure(best.decision):
-        raise VisualQAError(
-            "Visual QA retries ended without a usable candidate"
-        )
+        raise VisualQAError("Visual QA retries ended without a usable candidate")
     await _copy_candidate(best.path, output_path)
     return VisualQAOutcome(
         output_path,
@@ -472,8 +596,7 @@ def _candidate_penalty(decision: VisualQADecision) -> int:
         VisualQAProblemCategory.STYLE_DRIFT: 3,
     }
     return sum(
-        category_weights.get(category, 2)
-        for category in decision.problem_categories
+        category_weights.get(category, 2) for category in decision.problem_categories
     )
 
 

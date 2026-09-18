@@ -139,6 +139,50 @@ class StyleReferenceError(RuntimeError):
 class VisualQAError(RuntimeError):
     """Raised when a vision model cannot return a safe structured QA decision."""
 
+    def __init__(
+        self,
+        message: str,
+        *,
+        diagnostic: object | None = None,
+        user_summary: str | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.safe_diagnostic = diagnostic
+        self.user_summary = user_summary or message
+
 
 class ImagePromptBuildError(ValueError):
     """Raised when semantic visual data cannot form a safe concise image prompt."""
+
+
+class VideoGenerationError(RuntimeError):
+    """Normalized safe error for asynchronous video generation."""
+
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        provider: str | None = None,
+        remote_task_id: str | None = None,
+        diagnostic: dict[str, object] | None = None,
+    ) -> None:
+        super().__init__(f"{code}: {message}")
+        self.code = code
+        self.user_summary = message
+        self.provider = provider
+        self.remote_task_id = remote_task_id
+        self.safe_diagnostic = diagnostic or {}
+
+
+VIDEO_AUTH_ERROR = "VIDEO_AUTH_ERROR"
+VIDEO_BAD_REQUEST = "VIDEO_BAD_REQUEST"
+VIDEO_RATE_LIMIT = "VIDEO_RATE_LIMIT"
+VIDEO_SUBMISSION_TIMEOUT_UNKNOWN = "VIDEO_SUBMISSION_TIMEOUT_UNKNOWN"
+VIDEO_TASK_FAILED = "VIDEO_TASK_FAILED"
+VIDEO_POLL_TIMEOUT = "VIDEO_POLL_TIMEOUT"
+VIDEO_DOWNLOAD_FAILED = "VIDEO_DOWNLOAD_FAILED"
+VIDEO_VALIDATION_FAILED = "VIDEO_VALIDATION_FAILED"
+VIDEO_BUDGET_EXCEEDED = "VIDEO_BUDGET_EXCEEDED"
+VIDEO_CAPABILITY_UNSUPPORTED = "VIDEO_CAPABILITY_UNSUPPORTED"
+VIDEO_PROVIDER_UNAVAILABLE = "VIDEO_PROVIDER_UNAVAILABLE"

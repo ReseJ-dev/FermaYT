@@ -31,6 +31,7 @@ from app.errors import (
     MediaProbeError,
     StructuredAIProviderError,
     TTSGenerationError,
+    VideoGenerationError,
 )
 from app.generation_scope import GenerationScope, GenerationScopeType
 from app.generators.image import (
@@ -47,7 +48,12 @@ from app.jobs import (
     GenerationJobType,
 )
 from app.media.probe import get_media_duration
-from app.persistence import PlanningProviderAttempt, Project, Scene
+from app.persistence import (
+    PlanningProviderAttempt,
+    Project,
+    Scene,
+    VideoGenerationAttempt,
+)
 from app.production_profiles import ProductionProfile
 from app.providers import get_image_provider, get_tts_provider
 from app.repositories import (
@@ -93,6 +99,12 @@ from app.services.prompt_assembly import (
     preview_generation_request,
     set_prompt_override,
 )
+from app.services.video_generation import (
+    generate_video_from_accepted_still,
+    resume_incomplete_video_attempts,
+)
+from app.services.visual_asset_execution import VisualBeatAssetExecutor
+from app.services.visual_operations import resolve_project_visual_operations
 from app.services.visual_planning import load_project_visual_plan_state
 from app.storage import ProjectMediaPaths
 
@@ -112,10 +124,30 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
         with SessionLocal() as session:
             load_pricing_config(session, PRICING_CONFIG_PATH)
     await job_manager.startup()
+    recovery_task = asyncio.create_task(_resume_remote_video_tasks())
     try:
         yield
     finally:
+        recovery_task.cancel()
+        try:
+            await recovery_task
+        except asyncio.CancelledError:
+            pass
         await job_manager.shutdown()
+
+
+async def _resume_remote_video_tasks() -> None:
+    """Resume known task IDs only; ambiguous submissions are intentionally skipped."""
+    try:
+        with SessionLocal() as session:
+            await resume_incomplete_video_attempts(
+                session,
+                projects_root=PROJECTS_ROOT,
+            )
+    except (VideoGenerationError, ValueError, OSError):
+        # Recovery must not prevent the local application from starting. Each
+        # attempt retains its durable state and can be resumed again safely.
+        return
 
 
 app = FastAPI(title="FermaYT", lifespan=lifespan)
@@ -302,7 +334,8 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
         style_preview_cards: list[dict[str, object]] = []
         if (
             latest_job is not None
-            and latest_job.generation_scope_type == GenerationScopeType.STYLE_PREVIEW.value
+            and latest_job.generation_scope_type
+            == GenerationScopeType.STYLE_PREVIEW.value
             and isinstance(latest_job.report, dict)
         ):
             result_ids = latest_job.report.get("preview_result_ids", [])
@@ -352,7 +385,9 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
                 "image_url": _stored_media_url(
                     project_id,
                     master_assets_by_id[definition.id].file_path,
-                ) if definition.id in master_assets_by_id else None,
+                )
+                if definition.id in master_assets_by_id
+                else None,
             }
             for definition in master_definitions
         ]
@@ -370,9 +405,7 @@ async def project_editor(request: Request, project_id: str) -> HTMLResponse:
         pilot_cost_estimates: dict[int, object] = {}
         style_preview_cost_estimate = None
         if plan_state is not None and plan_state.is_current:
-            style_preview_scope = GenerationScope(
-                GenerationScopeType.STYLE_PREVIEW
-            )
+            style_preview_scope = GenerationScope(GenerationScopeType.STYLE_PREVIEW)
             style_preview_cost_estimate = estimate_project_generation_cost(
                 session,
                 project_id,
@@ -434,6 +467,7 @@ async def project_prompt_sheet_page(
             rows = get_prompt_sheet(session, project_id)
         except ValueError:
             rows = []
+        rows = _with_prompt_media_urls(project_id, rows)
         masters = [
             row
             for row in rows
@@ -443,12 +477,9 @@ async def project_prompt_sheet_page(
         beats = [
             row
             for row in rows
-            if row["target_type"] == "BEAT"
-            and row.get("override_state") != "ORPHANED"
+            if row["target_type"] == "BEAT" and row.get("override_state") != "ORPHANED"
         ]
-        orphaned = [
-            row for row in rows if row.get("override_state") == "ORPHANED"
-        ]
+        orphaned = [row for row in rows if row.get("override_state") == "ORPHANED"]
         return templates.TemplateResponse(
             request=request,
             name="prompt_sheet.html",
@@ -487,9 +518,99 @@ async def project_prompt_sheet_route(project_id: str) -> dict[str, object]:
     """Return stable beat/master prompt targets and their override state."""
     try:
         with SessionLocal() as session:
-            return {"targets": get_prompt_sheet(session, project_id)}
+            return {
+                "targets": _with_prompt_media_urls(
+                    project_id, get_prompt_sheet(session, project_id)
+                )
+            }
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/projects/{project_id}/visual-sheet/beats/{beat_id}/generate-video")
+async def generate_visual_beat_video_route(
+    request: Request,
+    project_id: str,
+    beat_id: str,
+) -> dict[str, object]:
+    """Manually animate one accepted still; never fans out to other providers."""
+    payload = await _read_json_object(request)
+    prompt = payload.get("prompt")
+    normalized_prompt = (
+        prompt.strip() if isinstance(prompt, str) and prompt.strip() else None
+    )
+    with SessionLocal() as session:
+        project = session.get(Project, project_id)
+        if project is None:
+            raise HTTPException(status_code=404, detail="Project not found")
+        if project.video_generation_mode == "OFF":
+            raise HTTPException(status_code=409, detail="Video generation is OFF")
+
+    async def operation(job_id: str) -> None:
+        await job_manager.update_progress(job_id, 5, "Preparing paid video request")
+        with SessionLocal() as session:
+            asset = await generate_video_from_accepted_still(
+                session,
+                project_id,
+                beat_id,
+                prompt_override=normalized_prompt,
+                projects_root=PROJECTS_ROOT,
+                job_id=job_id,
+            )
+            attempt = asset.attempt
+            await job_manager.set_pipeline_result(
+                job_id,
+                final_render_id=None,
+                report={
+                    "video_asset_id": asset.id,
+                    "video_attempt_id": attempt.id,
+                    "remote_task_id": attempt.remote_task_id or "",
+                    "provider": asset.provider,
+                    "model": asset.model,
+                    "mute_audio": asset.mute_audio_default,
+                },
+            )
+            await job_manager.update_progress(job_id, 100, "AI video ready")
+
+    job = await job_manager.enqueue(
+        project_id,
+        GenerationJobType.GENERATE_VIDEO,
+        operation,
+    )
+    return _job_payload(job)
+
+
+@app.get("/api/projects/{project_id}/video-attempts/{attempt_id}")
+async def video_attempt_status_route(
+    project_id: str, attempt_id: str
+) -> dict[str, object]:
+    with SessionLocal() as session:
+        attempt = session.get(VideoGenerationAttempt, attempt_id)
+        if attempt is None or attempt.project_id != project_id:
+            raise HTTPException(status_code=404, detail="Video attempt not found")
+        return {
+            "id": attempt.id,
+            "beat_id": attempt.beat_id,
+            "provider": attempt.provider,
+            "model": attempt.model,
+            "operation": attempt.operation,
+            "remote_task_id": attempt.remote_task_id,
+            "status": attempt.status,
+            "elapsed_seconds": max(
+                0.0, (datetime.now(UTC) - attempt.created_at).total_seconds()
+            ),
+            "estimated_cost": (
+                float(attempt.estimated_cost)
+                if attempt.estimated_cost is not None
+                else None
+            ),
+            "actual_cost": (
+                float(attempt.actual_cost) if attempt.actual_cost is not None else None
+            ),
+            "cost_certainty": attempt.cost_certainty,
+            "video_url": _stored_media_url(project_id, attempt.output_path),
+            "error": attempt.error_message,
+        }
 
 
 @app.get("/api/projects/{project_id}/prompts/{target_type}/{target_id}")
@@ -501,12 +622,13 @@ async def project_prompt_detail_route(
     """Preview the structured request compiled by the production prompt path."""
     try:
         with SessionLocal() as session:
-            return get_prompt_detail(
+            detail = get_prompt_detail(
                 session,
                 project_id,
                 target_type=PromptTargetType(target_type.upper()),
                 target_id=target_id,
             )
+            return _with_prompt_detail_media_urls(project_id, detail)
     except (ValueError, KeyError) as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
@@ -532,16 +654,17 @@ async def set_project_prompt_override_route(
                 target_id=target_id,
                 scene_prompt_override=scene_prompt,
             )
+            detail = get_prompt_detail(
+                session,
+                project_id,
+                target_type=target_type.upper(),
+                target_id=target_id,
+            )
             return {
                 "override_id": override.id,
                 "revision": override.revision,
                 "enabled": override.enabled,
-                "prompt": get_prompt_detail(
-                    session,
-                    project_id,
-                    target_type=target_type.upper(),
-                    target_id=target_id,
-                ),
+                "prompt": _with_prompt_detail_media_urls(project_id, detail),
             }
     except (TypeError, ValueError, KeyError) as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -593,6 +716,72 @@ async def preview_project_prompt_route(
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.post("/api/projects/{project_id}/visual-sheet/generate-selected")
+async def generate_selected_visuals_route(
+    request: Request,
+    project_id: str,
+) -> dict[str, object]:
+    """Generate only explicitly selected stable beat IDs from the current plan."""
+    active = await job_manager.get_active_project_job(project_id)
+    if active is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="Another project generation job is already running",
+        )
+    try:
+        payload = await request.json()
+        raw_ids = payload.get("beat_ids")
+        if not isinstance(raw_ids, list) or not raw_ids:
+            raise ValueError("Select at least one visual beat")
+        if len(raw_ids) > 100 or any(not isinstance(item, str) for item in raw_ids):
+            raise ValueError("beat_ids must contain between 1 and 100 stable IDs")
+        requested_ids = list(
+            dict.fromkeys(item.strip() for item in raw_ids if item.strip())
+        )
+        if not requested_ids:
+            raise ValueError("Select at least one visual beat")
+        with SessionLocal() as session:
+            state = load_project_visual_plan_state(session, project_id)
+            if state is None or not state.is_current:
+                raise ValueError("Current VisualPlan is unavailable; replan first")
+            story_order = [beat.id for beat in state.plan.visual_beats]
+            unknown = sorted(set(requested_ids).difference(story_order))
+            if unknown:
+                raise ValueError("Unknown visual beat IDs: " + ", ".join(unknown))
+            selected_ids = [item for item in story_order if item in requested_ids]
+            dependencies = build_production_pipeline_dependencies(
+                session,
+                project_id,
+                secret_store,
+                projects_root=PROJECTS_ROOT,
+                require_tts=False,
+                require_planning=False,
+            )
+    except (SecretStoreError, StructuredAIProviderError, TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=422, detail=_safe_validation_message(exc)
+        ) from exc
+
+    async def operation(job_id: str) -> None:
+        await asyncio.to_thread(
+            _run_selected_visuals_worker,
+            job_id,
+            project_id,
+            tuple(selected_ids),
+            dependencies,
+        )
+
+    job = await job_manager.enqueue(
+        project_id,
+        GenerationJobType.GENERATE_ASSETS,
+        operation,
+        production_profile=ProductionProfile.FINAL.value,
+        generation_scope_type="SELECTED_BEATS",
+        generation_scope_value=float(len(selected_ids)),
+    )
+    return _job_payload(job)
+
+
 @app.post("/api/projects/{project_id}/generate-video")
 async def generate_project_video_route(
     request: Request,
@@ -607,7 +796,10 @@ async def generate_project_video_route(
     planning_retry_anyway = form.get("planning_retry_anyway") == "1"
     latest_job = await job_manager.get_latest_project_job(project_id)
     planning_run_id: str | None = None
-    if latest_job is not None and latest_job.status is GenerationJobStatus.PAUSED_PLANNING:
+    if (
+        latest_job is not None
+        and latest_job.status is GenerationJobStatus.PAUSED_PLANNING
+    ):
         with SessionLocal() as session:
             uncertain = latest_uncertain_planning_attempt(session, project_id)
         if uncertain is not None:
@@ -784,10 +976,13 @@ async def upload_master_scene(
                 status_code=409,
                 detail="Сначала создайте актуальный VisualPlan проекта.",
             )
-        staging = ProjectMediaPaths(
-            project_id,
-            PROJECTS_ROOT,
-        ).uploads_dir / f"{uuid4()}.png"
+        staging = (
+            ProjectMediaPaths(
+                project_id,
+                PROJECTS_ROOT,
+            ).uploads_dir
+            / f"{uuid4()}.png"
+        )
         try:
             await asyncio.to_thread(staging.write_bytes, body)
             asset = register_uploaded_master_scene(
@@ -1253,6 +1448,16 @@ async def _read_optional_form(request: Request) -> dict[str, str]:
     return await _read_form(request)
 
 
+async def _read_json_object(request: Request) -> dict[str, object]:
+    try:
+        payload = await request.json()
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="Invalid JSON body") from exc
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+    return payload
+
+
 def _required(form: dict[str, str], field: str, label: str) -> str:
     value = form.get(field, "").strip()
     if not value:
@@ -1429,6 +1634,45 @@ def _stored_media_url(project_id: str, stored_path: str | None) -> str | None:
     return f"/media/{quote(project_id)}/{encoded_path}"
 
 
+def _with_prompt_media_urls(
+    project_id: str,
+    rows: list[dict[str, object]],
+) -> list[dict[str, object]]:
+    """Expose only verified project-local media URLs to the Visual Sheet."""
+    for row in rows:
+        stored_path = row.get("accepted_asset_path")
+        row["accepted_preview_url"] = _stored_media_url(
+            project_id,
+            stored_path if isinstance(stored_path, str) else None,
+        )
+        video_path = row.get("video_asset_path")
+        row["video_preview_url"] = _stored_media_url(
+            project_id, video_path if isinstance(video_path, str) else None
+        )
+    return rows
+
+
+def _with_prompt_detail_media_urls(
+    project_id: str,
+    detail: dict[str, object],
+) -> dict[str, object]:
+    generated_asset = detail.get("generated_asset")
+    if isinstance(generated_asset, str):
+        detail["accepted_preview_url"] = _stored_media_url(project_id, generated_asset)
+    attempts = detail.get("attempts")
+    if isinstance(attempts, list):
+        for attempt in attempts:
+            if not isinstance(attempt, dict):
+                continue
+            asset = attempt.get("generated_asset")
+            attempt["preview_url"] = _stored_media_url(
+                project_id, asset if isinstance(asset, str) else None
+            )
+            if attempt.get("accepted") and attempt.get("preview_url"):
+                detail["accepted_preview_url"] = attempt["preview_url"]
+    return detail
+
+
 def _update_project_from_form(
     session: Session,
     project_id: str,
@@ -1464,14 +1708,14 @@ def _update_project_from_form(
         "generation_budget_warning_threshold",
         str(current.generation_budget_warning_threshold),
     )
-    form.setdefault(
-        "planning_budget_amount", str(current.planning_budget_amount or "")
-    )
+    form.setdefault("planning_budget_amount", str(current.planning_budget_amount or ""))
     form.setdefault(
         "planning_max_paid_requests", str(current.planning_max_paid_requests)
     )
     form.setdefault("planning_max_input_tokens", str(current.planning_max_input_tokens))
-    form.setdefault("planning_max_output_tokens", str(current.planning_max_output_tokens))
+    form.setdefault(
+        "planning_max_output_tokens", str(current.planning_max_output_tokens)
+    )
     form.setdefault(
         "planning_max_total_estimated_tokens",
         str(current.planning_max_total_estimated_tokens),
@@ -1479,6 +1723,12 @@ def _update_project_from_form(
     form.setdefault("draft_paid_visual_ratio", str(current.draft_paid_visual_ratio))
     form.setdefault("draft_width", str(current.draft_width))
     form.setdefault("draft_height", str(current.draft_height))
+    form.setdefault("video_generation_mode", current.video_generation_mode)
+    form.setdefault("video_provider", current.video_provider)
+    form.setdefault("video_model", current.video_model or "")
+    form.setdefault("video_resolution", current.video_resolution)
+    form.setdefault("video_clip_duration", str(current.video_clip_duration))
+    form.setdefault("video_budget_amount", str(current.video_budget_amount or ""))
     project = update_project(
         session,
         project_id,
@@ -1549,6 +1799,28 @@ def _update_project_from_form(
             "Провайдер изображений",
         ),
         image_model=form.get("image_model", "").strip() or None,
+        video_generation_mode=_choice(
+            form,
+            "video_generation_mode",
+            {"OFF", "MANUAL", "AUTO_LATER"},
+            "Режим генерации видео",
+        ),
+        video_provider=_choice(
+            form, "video_provider", {"vidu", "wan", "seedance"}, "Video provider"
+        ),
+        video_model=form.get("video_model", "").strip() or None,
+        video_resolution=_choice(
+            form,
+            "video_resolution",
+            {"480p", "540p", "720p", "1080p", "480P", "720P", "1080P"},
+            "Video resolution",
+        ),
+        video_clip_duration=int(
+            _required(form, "video_clip_duration", "Video duration")
+        ),
+        video_budget_amount=_optional_float(
+            form.get("video_budget_amount"), "Video budget"
+        ),
         tts_provider=_choice(
             form, "tts_provider", {"qwen", "elevenlabs"}, "Провайдер озвучки"
         ),
@@ -1624,6 +1896,89 @@ def _run_pipeline_worker(
     asyncio.run(runner())
 
 
+def _run_selected_visuals_worker(
+    job_id: str,
+    project_id: str,
+    beat_ids: tuple[str, ...],
+    dependencies: object,
+) -> None:
+    """Run the production visual executor for a stable, explicit beat subset."""
+
+    async def runner() -> None:
+        with SessionLocal() as session:
+            project = get_project(session, project_id)
+            state = load_project_visual_plan_state(session, project_id)
+            if project is None or state is None or not state.is_current:
+                raise ValueError("Current VisualPlan is unavailable; replan first")
+            ordered_ids = [
+                beat.id for beat in state.plan.visual_beats if beat.id in beat_ids
+            ]
+            if len(ordered_ids) != len(beat_ids):
+                raise ValueError(
+                    "Selected beats no longer match the current VisualPlan"
+                )
+
+            resolver = dependencies.image_provider_resolver
+            execution = resolve_project_visual_operations(
+                session,
+                project_id,
+                provider_resolver=resolver,
+                production_profile=ProductionProfile.FINAL,
+            )
+            budget_guard = ProjectBudgetGuard(session, project_id)
+            estimate = estimate_project_generation_cost(
+                session,
+                project_id,
+                production_profile=ProductionProfile.FINAL.value,
+                beat_ids=frozenset(ordered_ids),
+            )
+            budget_guard.check_preflight(estimate)
+            executor = VisualBeatAssetExecutor(
+                session,
+                provider_resolver=resolver,
+                downloader=dependencies.downloader,
+                projects_root=dependencies.projects_root,
+                style_id=project.style_id,
+                qa_service=dependencies.visual_qa_service,
+                job_id=job_id,
+                budget_guard=budget_guard,
+                required_beat_ids=frozenset(ordered_ids),
+            )
+            result_ids: list[str] = []
+            for index, beat_id in enumerate(ordered_ids, start=1):
+                if job_manager.cancellation_event(job_id).is_set():
+                    raise asyncio.CancelledError
+                progress = round((index - 1) / len(ordered_ids) * 100)
+                await job_manager.update_pipeline_state(
+                    job_id,
+                    stage="GENERATING_VISUALS",
+                    progress=progress,
+                    stage_progress=progress,
+                    message=f"Selected visual {index} of {len(ordered_ids)}",
+                    current_beat=index,
+                    total_beats=len(ordered_ids),
+                )
+                result = await executor.execute_beat(project_id, execution.id, beat_id)
+                result_ids.append(result.id)
+            await job_manager.set_pipeline_result(
+                job_id,
+                final_render_id=None,
+                report={
+                    "project_id": project_id,
+                    "selected_beat_ids": ordered_ids,
+                    "result_ids": result_ids,
+                    "accepted": sum(
+                        bool(get_beat_visual_result(session, result_id).is_accepted)
+                        for result_id in result_ids
+                        if get_beat_visual_result(session, result_id) is not None
+                    ),
+                    "mode": "SELECTED_VISUALS",
+                },
+            )
+
+    asyncio.run(runner())
+
+
 def _job_payload(job: GenerationJob) -> dict[str, object]:
     diagnostic = (
         job.report.get("failure")
@@ -1646,9 +2001,7 @@ def _job_payload(job: GenerationJob) -> dict[str, object]:
             )
         )
         planning_run_id = (
-            current_job_attempts[-1].planning_run_id
-            if current_job_attempts
-            else job.id
+            current_job_attempts[-1].planning_run_id if current_job_attempts else job.id
         )
         planning_attempts = list(
             session.scalars(
@@ -1659,9 +2012,7 @@ def _job_payload(job: GenerationJob) -> dict[str, object]:
         )
         project = session.get(Project, job.project_id)
         planning_budget = (
-            planning_budget_snapshot(
-                session, job.project_id, planning_run_id
-            )
+            planning_budget_snapshot(session, job.project_id, planning_run_id)
             if project is not None
             else None
         )
@@ -1776,7 +2127,10 @@ def _planning_progress_payload(
     active = attempts[-1] if attempts else None
     now = datetime.now(UTC)
     state: str | None = None
-    if job.status is GenerationJobStatus.PAUSED_BUDGET and job.failed_stage == "PLANNING":
+    if (
+        job.status is GenerationJobStatus.PAUSED_BUDGET
+        and job.failed_stage == "PLANNING"
+    ):
         state = "PAUSED_BUDGET"
     elif job.status is GenerationJobStatus.PAUSED_PLANNING:
         state = "PAUSED_AFTER_TIMEOUT"
@@ -1824,12 +2178,12 @@ def _planning_progress_payload(
             "label": scope_label,
         },
         "provider": {
-            "name": active.provider if active is not None else (
-                project.planning_provider if project is not None else None
-            ),
-            "model": active.model if active is not None else (
-                project.planning_model if project is not None else None
-            ),
+            "name": active.provider
+            if active is not None
+            else (project.planning_provider if project is not None else None),
+            "model": active.model
+            if active is not None
+            else (project.planning_model if project is not None else None),
         },
         "request": {
             "number": active.attempt_number if active is not None else None,
@@ -1867,17 +2221,18 @@ def _planning_progress_payload(
                 if active is not None and active.actual_cost is not None
                 else None
             ),
-            "currency": active.currency if active is not None else (
-                project.generation_budget_currency if project is not None else None
-            ),
+            "currency": active.currency
+            if active is not None
+            else (project.generation_budget_currency if project is not None else None),
             "certainty": active.cost_certainty if active is not None else None,
             "budget": budget,
         },
         "repair": {
             "reason": repair_reason,
             "attempt": (
-                active.attempt_number if active is not None
-                and active.attempt_kind == "REPAIR" else None
+                active.attempt_number
+                if active is not None and active.attempt_kind == "REPAIR"
+                else None
             ),
             "maximum": (
                 project.planning_max_paid_requests if project is not None else 2
@@ -1886,8 +2241,7 @@ def _planning_progress_payload(
         "timeout": {
             "paused": timeout,
             "billing_unknown": bool(
-                timeout
-                or (active is not None and active.billing_status == "UNKNOWN")
+                timeout or (active is not None and active.billing_status == "UNKNOWN")
             ),
             "automatic_retry_stopped": timeout,
             "message": (

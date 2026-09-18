@@ -99,6 +99,10 @@ class KimiVisualPlanningClient:
             reasoning_effort=(
                 self.reasoning_effort if self.model == "kimi-k3" else None
             ),
+            # K2.6 enables thinking by default. Structured planning needs the
+            # bounded completion budget for the final JSON rather than hidden
+            # reasoning that can exhaust it before content is emitted.
+            thinking=({"type": "disabled"} if self.model == "kimi-k2.6" else None),
             on_metadata=self._capture_metadata,
         )
 
@@ -147,9 +151,7 @@ class KimiVisualPlanningClient:
         try:
             body = response.json()
             available = {
-                item.get("id")
-                for item in body["data"]
-                if isinstance(item, dict)
+                item.get("id") for item in body["data"] if isinstance(item, dict)
             }
         except (KeyError, TypeError, ValueError) as exc:
             raise self._preflight_error("PLANNING_INVALID_JSON") from exc
@@ -159,7 +161,7 @@ class KimiVisualPlanningClient:
     def _models_endpoint(self) -> str:
         suffix = "/chat/completions"
         return (
-            f"{self.endpoint[:-len(suffix)]}/models"
+            f"{self.endpoint[: -len(suffix)]}/models"
             if self.endpoint.endswith(suffix)
             else "https://api.moonshot.ai/v1/models"
         )

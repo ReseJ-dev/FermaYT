@@ -185,6 +185,86 @@ def test_same_scene_with_physical_change_uses_supported_edit() -> None:
     assert "physical state changed" in decision.reasons
 
 
+def test_same_character_and_location_with_small_state_change_uses_continuity_edit(
+) -> None:
+    plan = _plan(VisualOperation.NEW_IMAGE)
+    plan.visual_beats[1].physical_state = (
+        "The same miner pauses beside the intact ladder and listens into the tunnel"
+    )
+
+    decision = VisualOperationDecisionEngine().decide(
+        plan,
+        1,
+        capabilities=VisualProviderCapabilities(
+            reference_generation=True,
+            image_editing=True,
+        ),
+        available_visuals={
+            "shaft_master": "/media/master.png",
+            "beat_1": "/media/beat-1.png",
+        },
+    )
+
+    assert decision.operation is VisualOperation.EDIT_EXISTING
+    assert "physical state changed" in decision.reasons
+    assert "/media/beat-1.png" in decision.source_image_paths
+
+
+def test_explicit_location_transition_still_uses_new_image() -> None:
+    payload = _plan(VisualOperation.NEW_IMAGE).model_dump(mode="json")
+    payload["locations"].append(
+        {
+            "id": "old_vent",
+            "name": "Old ventilation passage",
+            "description": "A narrow abandoned side passage",
+            "spatial_layout": "Low timber supports lead away from the main shaft",
+        }
+    )
+    payload["recurring_environments"].append(
+        {
+            "id": "old_vent_environment",
+            "location_id": "old_vent",
+            "continuity_requirements": "Keep the low timber passage recognizable",
+        }
+    )
+    payload["possible_master_scenes"].append(
+        {
+            "id": "old_vent_master",
+            "location_id": "old_vent",
+            "description": "Wide abandoned ventilation passage",
+            "environment_geometry": "Low passage with timber supports",
+            "recurring_object_positions": "Vent pipe follows the left wall",
+            "color_palette": "Muted brown timber and gray rock",
+            "basic_composition": "Passage recedes from foreground to darkness",
+            "characters_visible": ["miners"],
+            "important_objects": [],
+        }
+    )
+    second = payload["visual_beats"][1]
+    second["location_id"] = "old_vent"
+    second["master_scene_id"] = "old_vent_master"
+    second["physical_state"] = "The miner enters the old ventilation passage"
+    second["change_from_previous_beat"] = "The story moves into a different passage"
+    plan = VisualPlan.model_validate(payload)
+
+    decision = VisualOperationDecisionEngine().decide(
+        plan,
+        1,
+        capabilities=VisualProviderCapabilities(
+            reference_generation=True,
+            image_editing=True,
+        ),
+        available_visuals={
+            "shaft_master": "/media/shaft.png",
+            "old_vent_master": "/media/vent.png",
+            "beat_1": "/media/beat-1.png",
+        },
+    )
+
+    assert decision.operation is VisualOperation.NEW_IMAGE
+    assert "new location or first establishment" in decision.reasons
+
+
 def test_unsupported_edit_falls_back_to_reference_generation() -> None:
     decision = VisualOperationDecisionEngine().decide(
         _plan(VisualOperation.EDIT_EXISTING, progressive_change=_state_change()),

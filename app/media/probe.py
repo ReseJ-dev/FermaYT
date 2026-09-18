@@ -20,6 +20,8 @@ class MediaProbeResult:
     width: int | None
     height: int | None
     fps: float | None
+    codec: str | None = None
+    frame_count: int | None = None
 
 
 def probe_media(path: str | Path) -> MediaProbeResult:
@@ -28,8 +30,14 @@ def probe_media(path: str | Path) -> MediaProbeResult:
     if not media_path.is_file() or media_path.stat().st_size <= 0:
         raise MediaProbeError(f"Media file does not exist or is empty: {media_path}")
     command = [
-        "ffprobe", "-v", "error", "-show_streams", "-show_format",
-        "-of", "json", str(media_path),
+        "ffprobe",
+        "-v",
+        "error",
+        "-show_streams",
+        "-show_format",
+        "-of",
+        "json",
+        str(media_path),
     ]
     try:
         result = subprocess.run(command, capture_output=True, text=True, check=False)
@@ -57,7 +65,11 @@ def probe_media(path: str | Path) -> MediaProbeResult:
         )
     if duration <= 0:
         raise MediaProbeError("ffprobe returned a non-positive duration")
-    fps = _parse_rate(video.get("avg_frame_rate") or video.get("r_frame_rate")) if video else None
+    fps = (
+        _parse_rate(video.get("avg_frame_rate") or video.get("r_frame_rate"))
+        if video
+        else None
+    )
     return MediaProbeResult(
         duration=duration,
         has_video=video is not None,
@@ -65,6 +77,10 @@ def probe_media(path: str | Path) -> MediaProbeResult:
         width=int(video["width"]) if video and video.get("width") else None,
         height=int(video["height"]) if video and video.get("height") else None,
         fps=fps,
+        codec=(
+            str(video.get("codec_name")) if video and video.get("codec_name") else None
+        ),
+        frame_count=_positive_int(video.get("nb_frames")) if video else None,
     )
 
 
@@ -113,3 +129,11 @@ def _parse_rate(value: object) -> float | None:
     except (ValueError, ZeroDivisionError):
         return None
     return rate if math.isfinite(rate) and rate > 0 else None
+
+
+def _positive_int(value: object) -> int | None:
+    try:
+        number = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return number if number > 0 else None

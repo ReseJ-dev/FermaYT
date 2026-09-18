@@ -61,35 +61,37 @@ class ImagePromptBuilder:
         reference_section = self._reference_section(references)
         if reference_section is not None:
             sections.append(reference_section)
-        sections.extend([
-            (
-                "LOCATION CONTINUITY",
-                self._location_content(location, master),
-            ),
-            (
-                "CHARACTER CONTINUITY",
-                self._character_content(plan, beat),
-            ),
-            (
-                "OBJECT CONTINUITY",
-                self._object_content(plan, beat, master),
-            ),
-            (
-                "CURRENT CAMERA / COMPOSITION",
-                self._camera_content(beat),
-            ),
-            ("CURRENT PHYSICAL STATE", self._physical_state_content(beat)),
-            ("WHAT CHANGED", self._change_content(beat)),
-            (
-                "VISUAL FOCUS",
+        sections.extend(
+            [
                 (
-                    f"Make {beat.visual_focus or beat.what_viewer_should_understand} "
-                    f"the first noticeable element. Clearly depict "
-                    f"{beat.what_viewer_should_understand}. The frame should "
-                    f"{beat.visual_purpose}."
+                    "LOCATION CONTINUITY",
+                    self._location_content(location, master),
                 ),
-            ),
-        ])
+                (
+                    "CHARACTER CONTINUITY",
+                    self._character_content(plan, beat),
+                ),
+                (
+                    "OBJECT CONTINUITY",
+                    self._object_content(plan, beat, master),
+                ),
+                (
+                    "CURRENT CAMERA / COMPOSITION",
+                    self._camera_content(beat),
+                ),
+                ("CURRENT PHYSICAL STATE", self._physical_state_content(beat)),
+                ("WHAT CHANGED", self._change_content(beat)),
+                (
+                    "VISUAL FOCUS",
+                    (
+                        f"Make {beat.visual_focus or beat.what_viewer_should_understand} "
+                        f"the first noticeable element. Clearly depict "
+                        f"{beat.what_viewer_should_understand}. The frame should "
+                        f"{beat.visual_purpose}."
+                    ),
+                ),
+            ]
+        )
         if project_style_prompt is not None and project_style_prompt.strip():
             sections.insert(
                 1,
@@ -154,6 +156,12 @@ class ImagePromptBuilder:
                     f"environment geometry: {master.environment_geometry}",
                     f"recurring object positions: {master.recurring_object_positions}",
                 )
+            )
+        characters = self._character_content(plan, beat)
+        if beat.characters_visible:
+            keep.append(
+                "recurring character identity, including helmet and clothing colors, "
+                f"body proportions, simple face design, and equipment: {characters}"
             )
         change = beat.change_from_previous_beat
         if beat.progressive_change is not None:
@@ -233,7 +241,8 @@ class ImagePromptBuilder:
             return "No recurring characters visible; do not introduce extra people."
         return "; ".join(
             f"{by_id[character_id].name} appears as "
-            f"{by_id[character_id].description}"
+            f"{by_id[character_id].description}; preserve the same helmet, clothing "
+            "colors, safety gear, body proportions, simple face design, and equipment"
             for character_id in beat.characters_visible
         )
 
@@ -249,9 +258,7 @@ class ImagePromptBuilder:
             for object_id in beat.important_objects
         ]
         if master is not None:
-            objects.append(
-                f"Stable positions: {master.recurring_object_positions}"
-            )
+            objects.append(f"Stable positions: {master.recurring_object_positions}")
         return "; ".join(objects) or "No recurring story object is required."
 
     @staticmethod
@@ -319,8 +326,7 @@ def _fit_semantic_sections(
         return rendered
 
     fixed_length = len(prefix) + sum(
-        len(f"\n\n{_PROVIDER_SECTION_LEADS[heading]} ")
-        for heading, _ in entries
+        len(f"\n\n{_PROVIDER_SECTION_LEADS[heading]} ") for heading, _ in entries
     )
     content_budget = maximum - fixed_length
     minimum_per_section = 24
@@ -334,9 +340,7 @@ def _fit_semantic_sections(
     remaining = content_budget - sum(allocations)
     while remaining > 0:
         active = [
-            index
-            for index, length in enumerate(lengths)
-            if allocations[index] < length
+            index for index, length in enumerate(lengths) if allocations[index] < length
         ]
         if not active:
             break

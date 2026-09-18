@@ -124,6 +124,10 @@ ROUGH_EXPLAINER_V1: Final = ImageStyleContract(
         "slightly imperfect perspective",
         "slightly awkward handmade proportions",
         "extremely simplified machinery and architecture",
+        (
+            "the illustrated environment fills the entire 16:9 canvas edge-to-edge, "
+            "and the scene continues naturally to all image boundaries"
+        ),
     ),
     prohibited=(
         "photorealism or realistic materials",
@@ -238,7 +242,9 @@ def get_image_style_contract(style_id: str) -> ImageStyleContract:
     try:
         return IMAGE_STYLE_CONTRACTS[normalized_id]
     except KeyError as exc:
-        raise StyleContractError(f"Unknown image style contract: {normalized_id}") from exc
+        raise StyleContractError(
+            f"Unknown image style contract: {normalized_id}"
+        ) from exc
 
 
 def apply_image_style_contract(
@@ -398,12 +404,8 @@ def _normalized_alias(alias: str) -> tuple[str, ...]:
 def _tokenize(value: str) -> tuple[str, ...]:
     normalized = _expand_negative_sections(value)
     normalized = normalized.lower().replace("’", "'").replace("‘", "'")
-    normalized = _HARD_CLAUSE_BOUNDARY.sub(
-        f" {_HARD_BOUNDARY_TOKEN} ", normalized
-    )
-    normalized = _SOFT_CLAUSE_BOUNDARY.sub(
-        f" {_CLAUSE_BOUNDARY_TOKEN} ", normalized
-    )
+    normalized = _HARD_CLAUSE_BOUNDARY.sub(f" {_HARD_BOUNDARY_TOKEN} ", normalized)
+    normalized = _SOFT_CLAUSE_BOUNDARY.sub(f" {_CLAUSE_BOUNDARY_TOKEN} ", normalized)
     return tuple(match.group() for match in _TOKEN.finditer(normalized))
 
 
@@ -426,9 +428,7 @@ def _expand_negative_sections(value: str) -> str:
         if negative_section and bullet_match is not None:
             lines.append(f"avoid {bullet_match.group(1)}")
             continue
-        if stripped and (
-            _SECTION_HEADER.fullmatch(stripped) or bullet_match is None
-        ):
+        if stripped and (_SECTION_HEADER.fullmatch(stripped) or bullet_match is None):
             negative_section = False
         lines.append(line)
     return "\n".join(lines)
@@ -459,10 +459,14 @@ def _match_alias_end(
     for expected in alias[1:]:
         position += 1
         while position < len(tokens) and tokens[position] != expected:
-            if tokens[position] in {
-                _CLAUSE_BOUNDARY_TOKEN,
-                _HARD_BOUNDARY_TOKEN,
-            } or remaining_gap == 0:
+            if (
+                tokens[position]
+                in {
+                    _CLAUSE_BOUNDARY_TOKEN,
+                    _HARD_BOUNDARY_TOKEN,
+                }
+                or remaining_gap == 0
+            ):
                 return None
             remaining_gap -= 1
             position += 1
@@ -517,6 +521,5 @@ def _is_governed_by_negative_instruction(
     if scope_start is None:
         return False
     return not any(
-        token in _POSITIVE_INSTRUCTION_RESETS
-        for token in prefix[scope_start + 1 :]
+        token in _POSITIVE_INSTRUCTION_RESETS for token in prefix[scope_start + 1 :]
     )

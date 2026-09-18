@@ -110,9 +110,8 @@ class VisualOperationDecisionEngine:
             selected = self._fallback(selected, context)
 
         # Explicit fallback contracts take precedence over score-based guesses.
-        if (
-            beat.preferred_visual_operation is VisualOperation.EDIT_EXISTING
-            and (not capabilities.image_editing or not references)
+        if beat.preferred_visual_operation is VisualOperation.EDIT_EXISTING and (
+            not capabilities.image_editing or not references
         ):
             fallback_from = VisualOperation.EDIT_EXISTING
             selected = (
@@ -121,8 +120,7 @@ class VisualOperationDecisionEngine:
                 else VisualOperation.NEW_IMAGE
             )
         elif (
-            beat.preferred_visual_operation
-            is VisualOperation.REFERENCE_GENERATION
+            beat.preferred_visual_operation is VisualOperation.REFERENCE_GENERATION
             and (not capabilities.reference_generation or not references)
         ):
             fallback_from = VisualOperation.REFERENCE_GENERATION
@@ -155,7 +153,9 @@ class VisualOperationDecisionEngine:
         capabilities: VisualProviderCapabilities,
         evidence: VisualDecisionEvidence,
     ) -> _DecisionContext:
-        same_location = previous is not None and beat.location_id == previous.location_id
+        same_location = (
+            previous is not None and beat.location_id == previous.location_id
+        )
         character_continuity = _jaccard(
             beat.characters_visible,
             previous.characters_visible if previous else (),
@@ -177,8 +177,21 @@ class VisualOperationDecisionEngine:
         physical_state_changed = (
             evidence.physical_state_changed
             if evidence.physical_state_changed is not None
-            else beat.progressive_change is not None
-            or beat.preferred_visual_operation is VisualOperation.EDIT_EXISTING
+            else (
+                beat.progressive_change is not None
+                or beat.preferred_visual_operation is VisualOperation.EDIT_EXISTING
+                or (
+                    previous is not None
+                    and same_location
+                    and beat.preferred_visual_operation
+                    in {
+                        VisualOperation.NEW_IMAGE,
+                        VisualOperation.REFERENCE_GENERATION,
+                    }
+                    and beat.physical_state.casefold()
+                    != previous.physical_state.casefold()
+                )
+            )
         )
         camera_changed = previous is not None and (
             beat.camera_framing != previous.camera_framing
@@ -188,8 +201,7 @@ class VisualOperationDecisionEngine:
         substantially_different = (
             evidence.substantially_different_composition
             if evidence.substantially_different_composition is not None
-            else not same_location
-            or (camera_changed and visual_similarity < 0.45)
+            else not same_location or (camera_changed and visual_similarity < 0.45)
         )
         overlay_sufficient = (
             evidence.overlay_sufficient
@@ -200,9 +212,7 @@ class VisualOperationDecisionEngine:
         improves_understanding = (
             evidence.new_image_improves_understanding
             if evidence.new_image_improves_understanding is not None
-            else previous is None
-            or not same_location
-            or substantially_different
+            else previous is None or not same_location or substantially_different
         )
         return _DecisionContext(
             beat=beat,
@@ -227,18 +237,28 @@ class VisualOperationDecisionEngine:
 
         # LLM guidance is useful evidence, but it cannot bypass capability validation.
         scores[beat.preferred_visual_operation] += 1.25
-        self._reason(context, beat.preferred_visual_operation, "Visual Director guidance")
+        self._reason(
+            context, beat.preferred_visual_operation, "Visual Director guidance"
+        )
 
         if context.previous is None or not context.same_location:
             scores[VisualOperation.NEW_IMAGE] += 5
-            self._reason(context, VisualOperation.NEW_IMAGE, "new location or first establishment")
+            self._reason(
+                context,
+                VisualOperation.NEW_IMAGE,
+                "new location or first establishment",
+            )
         if context.substantially_different_composition:
             scores[VisualOperation.NEW_IMAGE] += 2
             scores[VisualOperation.REFERENCE_GENERATION] += 2
             scores[VisualOperation.REUSE] -= 3
             scores[VisualOperation.TRANSFORM] -= 3
             scores[VisualOperation.OVERLAY] -= 2
-            self._reason(context, VisualOperation.NEW_IMAGE, "substantially different composition")
+            self._reason(
+                context,
+                VisualOperation.NEW_IMAGE,
+                "substantially different composition",
+            )
             self._reason(
                 context,
                 VisualOperation.REFERENCE_GENERATION,
@@ -262,7 +282,11 @@ class VisualOperationDecisionEngine:
 
         if context.references:
             scores[VisualOperation.REFERENCE_GENERATION] += 2.5
-            self._reason(context, VisualOperation.REFERENCE_GENERATION, "reference image available")
+            self._reason(
+                context,
+                VisualOperation.REFERENCE_GENERATION,
+                "reference image available",
+            )
         if context.same_location:
             scores[VisualOperation.EDIT_EXISTING] += 2
             scores[VisualOperation.REUSE] += 1.5
@@ -278,17 +302,31 @@ class VisualOperationDecisionEngine:
             scores[VisualOperation.EDIT_EXISTING] += 5
             scores[VisualOperation.REUSE] -= 5
             scores[VisualOperation.TRANSFORM] -= 3
-            self._reason(context, VisualOperation.EDIT_EXISTING, "physical state changed")
+            self._reason(
+                context, VisualOperation.EDIT_EXISTING, "physical state changed"
+            )
         else:
             scores[VisualOperation.REUSE] += 3
-            self._reason(context, VisualOperation.REUSE, "physical state did not materially change")
+            self._reason(
+                context,
+                VisualOperation.REUSE,
+                "physical state did not materially change",
+            )
 
         if context.camera_changed and not context.physical_state_changed:
             scores[VisualOperation.TRANSFORM] += 4
-            self._reason(context, VisualOperation.TRANSFORM, "camera changes but scene state does not")
+            self._reason(
+                context,
+                VisualOperation.TRANSFORM,
+                "camera changes but scene state does not",
+            )
         if context.overlay_sufficient and not context.physical_state_changed:
             scores[VisualOperation.OVERLAY] += 6
-            self._reason(context, VisualOperation.OVERLAY, "new information fits a programmatic overlay")
+            self._reason(
+                context,
+                VisualOperation.OVERLAY,
+                "new information fits a programmatic overlay",
+            )
 
         if beat.camera_framing is ShotFraming.WIDE and context.previous is None:
             scores[VisualOperation.NEW_IMAGE] += 1
@@ -433,9 +471,7 @@ class VisualOperationDecisionEngine:
             ):
                 reasons.append("provider does not support reference generation")
             elif not context.references:
-                reasons.append(
-                    f"no usable source visual for {fallback_from.value}"
-                )
+                reasons.append(f"no usable source visual for {fallback_from.value}")
             else:
                 reasons.append(f"fallback from {fallback_from.value}")
         return list(dict.fromkeys(reasons)) or ["highest validated continuity score"]

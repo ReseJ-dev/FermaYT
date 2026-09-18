@@ -50,6 +50,7 @@ def init_database(engine: Engine) -> None:
     _recover_interrupted_planning_attempts(engine)
     _recover_interrupted_beat_visual_results(engine)
     _recover_interrupted_video_renders(engine)
+    _recover_interrupted_video_submissions(engine)
 
 
 def _apply_additive_schema_updates(engine: Engine) -> None:
@@ -83,6 +84,12 @@ def _apply_additive_schema_updates(engine: Engine) -> None:
             "draft_height": "INTEGER NOT NULL DEFAULT 720",
             "pilot_video_path": "TEXT",
             "pilot_rendered_at": "DATETIME",
+            "video_generation_mode": "VARCHAR(20) NOT NULL DEFAULT 'OFF'",
+            "video_provider": "VARCHAR(50) NOT NULL DEFAULT 'vidu'",
+            "video_model": "VARCHAR(255)",
+            "video_resolution": "VARCHAR(20) NOT NULL DEFAULT '720p'",
+            "video_clip_duration": "INTEGER NOT NULL DEFAULT 5",
+            "video_budget_amount": "NUMERIC(18, 8)",
         }
         missing_project_columns = {
             name: sql_type
@@ -107,14 +114,15 @@ def _apply_additive_schema_updates(engine: Engine) -> None:
         with engine.begin() as connection:
             for name, sql_type in execution_additions.items():
                 if name not in execution_columns:
-                    connection.execute(text(
-                        f"ALTER TABLE project_visual_execution_plans "
-                        f"ADD COLUMN {name} {sql_type}"
-                    ))
+                    connection.execute(
+                        text(
+                            f"ALTER TABLE project_visual_execution_plans "
+                            f"ADD COLUMN {name} {sql_type}"
+                        )
+                    )
     if "beat_visual_results" in table_names:
         beat_profile_columns = {
-            column["name"]
-            for column in inspector.get_columns("beat_visual_results")
+            column["name"] for column in inspector.get_columns("beat_visual_results")
         }
         beat_additions = {
             "production_profile": "VARCHAR(16) NOT NULL DEFAULT 'FINAL'",
@@ -125,14 +133,15 @@ def _apply_additive_schema_updates(engine: Engine) -> None:
             with engine.begin() as connection:
                 for name, sql_type in beat_additions.items():
                     if name not in beat_profile_columns:
-                        connection.execute(text(
-                            "ALTER TABLE beat_visual_results ADD COLUMN "
-                            f"{name} {sql_type}"
-                        ))
+                        connection.execute(
+                            text(
+                                "ALTER TABLE beat_visual_results ADD COLUMN "
+                                f"{name} {sql_type}"
+                            )
+                        )
     if "project_video_renders" in table_names:
         render_columns = {
-            column["name"]
-            for column in inspector.get_columns("project_video_renders")
+            column["name"] for column in inspector.get_columns("project_video_renders")
         }
         render_additions = {
             "production_profile": "VARCHAR(16) NOT NULL DEFAULT 'FINAL'",
@@ -143,9 +152,11 @@ def _apply_additive_schema_updates(engine: Engine) -> None:
             for name, sql_type in render_additions.items():
                 if name in render_columns:
                     continue
-                connection.execute(text(
-                    f"ALTER TABLE project_video_renders ADD COLUMN {name} {sql_type}"
-                ))
+                connection.execute(
+                    text(
+                        f"ALTER TABLE project_video_renders ADD COLUMN {name} {sql_type}"
+                    )
+                )
     if "project_timelines" in table_names:
         timeline_columns = {
             column["name"] for column in inspector.get_columns("project_timelines")
@@ -160,13 +171,34 @@ def _apply_additive_schema_updates(engine: Engine) -> None:
         with engine.begin() as connection:
             for name, sql_type in timeline_additions.items():
                 if name not in timeline_columns:
-                    connection.execute(text(
-                        f"ALTER TABLE project_timelines ADD COLUMN {name} {sql_type}"
-                    ))
+                    connection.execute(
+                        text(
+                            f"ALTER TABLE project_timelines ADD COLUMN {name} {sql_type}"
+                        )
+                    )
+    if "timeline_entries" in table_names:
+        entry_columns = {
+            column["name"] for column in inspector.get_columns("timeline_entries")
+        }
+        entry_additions = {
+            "asset_type": "VARCHAR(16) NOT NULL DEFAULT 'STILL'",
+            "video_asset_id": "VARCHAR(36)",
+            "clip_start": "FLOAT",
+            "clip_end": "FLOAT",
+            "mute_audio": "BOOLEAN NOT NULL DEFAULT 1",
+            "fit_metadata": "JSON",
+        }
+        with engine.begin() as connection:
+            for name, sql_type in entry_additions.items():
+                if name not in entry_columns:
+                    connection.execute(
+                        text(
+                            f"ALTER TABLE timeline_entries ADD COLUMN {name} {sql_type}"
+                        )
+                    )
     if "project_visual_plans" in table_names:
         columns = {
-            column["name"]
-            for column in inspector.get_columns("project_visual_plans")
+            column["name"] for column in inspector.get_columns("project_visual_plans")
         }
         plan_additions = {
             "story_text_hash": "VARCHAR(64)",
@@ -187,7 +219,9 @@ def _apply_additive_schema_updates(engine: Engine) -> None:
                 if name in columns:
                     continue
                 connection.execute(
-                    text(f"ALTER TABLE project_visual_plans ADD COLUMN {name} {sql_type}")
+                    text(
+                        f"ALTER TABLE project_visual_plans ADD COLUMN {name} {sql_type}"
+                    )
                 )
     if "planning_provider_attempts" in table_names:
         attempt_columns = {
@@ -207,20 +241,24 @@ def _apply_additive_schema_updates(engine: Engine) -> None:
             for name, sql_type in attempt_additions.items():
                 if name in attempt_columns:
                     continue
-                connection.execute(text(
-                    "ALTER TABLE planning_provider_attempts "
-                    f"ADD COLUMN {name} {sql_type}"
-                ))
+                connection.execute(
+                    text(
+                        "ALTER TABLE planning_provider_attempts "
+                        f"ADD COLUMN {name} {sql_type}"
+                    )
+                )
     if "master_scene_assets" in table_names:
         master_columns = {
             column["name"] for column in inspector.get_columns("master_scene_assets")
         }
         if "prompt_assembly_snapshot" not in master_columns:
             with engine.begin() as connection:
-                connection.execute(text(
-                    "ALTER TABLE master_scene_assets "
-                    "ADD COLUMN prompt_assembly_snapshot JSON"
-                ))
+                connection.execute(
+                    text(
+                        "ALTER TABLE master_scene_assets "
+                        "ADD COLUMN prompt_assembly_snapshot JSON"
+                    )
+                )
 
     if "beat_visual_results" not in table_names:
         return
@@ -254,8 +292,7 @@ def _apply_additive_schema_updates(engine: Engine) -> None:
             for name, sql_type in missing:
                 connection.execute(
                     text(
-                        f"ALTER TABLE beat_visual_results "
-                        f"ADD COLUMN {name} {sql_type}"
+                        f"ALTER TABLE beat_visual_results ADD COLUMN {name} {sql_type}"
                     )
                 )
 
@@ -272,6 +309,24 @@ def _recover_interrupted_beat_visual_results(engine: Engine) -> None:
                 "error = 'Beat execution interrupted by application restart', "
                 "is_accepted = 0, updated_at = CURRENT_TIMESTAMP "
                 "WHERE generation_status = 'PENDING'"
+            )
+        )
+
+
+def _recover_interrupted_video_submissions(engine: Engine) -> None:
+    """Never turn an interrupted possibly-paid POST into an automatic resubmit."""
+    if "video_generation_attempts" not in inspect(engine).get_table_names():
+        return
+    with engine.begin() as connection:
+        connection.execute(
+            text(
+                "UPDATE video_generation_attempts "
+                "SET status = 'SUBMISSION_STATUS_UNKNOWN', "
+                "cost_certainty = 'UNKNOWN', "
+                "error_code = 'VIDEO_SUBMISSION_TIMEOUT_UNKNOWN', "
+                "error_message = 'Application stopped during remote task submission', "
+                "updated_at = CURRENT_TIMESTAMP "
+                "WHERE status = 'PENDING_SUBMISSION' AND submission_started_at IS NOT NULL"
             )
         )
 

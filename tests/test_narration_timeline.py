@@ -50,6 +50,8 @@ from app.services.narration_alignment import (
 )
 from app.services.project_render import build_render_manifest, render_project_video
 from app.services.timeline import (
+    TimelinePacingConfig,
+    analyze_visual_progression,
     build_project_timeline,
     build_timeline_quality_report,
     format_timeline_debug,
@@ -679,7 +681,7 @@ def test_timeline_fails_when_final_narration_has_no_valid_visual(
         build_project_timeline(session, project.id, execution.id, narration.id)
 
 
-def test_long_unchanged_static_visual_triggers_pacing_guard(
+def test_long_unchanged_static_visual_persists_strong_quality_warning(
     session: Session,
     tmp_path: Path,
 ) -> None:
@@ -694,8 +696,132 @@ def test_long_unchanged_static_visual_triggers_pacing_guard(
         )
     )
 
-    with pytest.raises(ValueError, match="unchanged static visual exceeds 12 seconds"):
-        build_project_timeline(session, project.id, execution.id, narration.id)
+    timeline = build_project_timeline(
+        session,
+        project.id,
+        execution.id,
+        narration.id,
+        pacing_config=TimelinePacingConfig(automatic_motion_enabled=False),
+    )
+
+    assert any(
+        warning.startswith("STATIC_VISUAL_HOLD_TOO_LONG severity=STRONG_WARNING")
+        for warning in timeline.warnings
+    )
+
+
+def test_long_stills_receive_deterministic_non_billable_motion(
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    project, execution, results = _setup_graph(session, tmp_path)
+    narration = asyncio.run(
+        generate_project_narration(
+            session,
+            project.id,
+            provider_resolver=_resolver_with_calls([]),
+            duration_probe=lambda path: 72.0,
+            projects_root=tmp_path / "projects",
+        )
+    )
+
+    timeline = build_project_timeline(session, project.id, execution.id, narration.id)
+    first = timeline.entries[0]
+    report = build_timeline_quality_report(timeline)
+
+    assert first.end_time - first.start_time > 4
+    assert first.transform_metadata == {
+        "type": "FOCUS",
+        "start_scale": 1.0,
+        "end_scale": 1.05,
+        "focus": {"x": 0.5, "y": 0.5},
+    }
+    assert report.effective_screen_states > len(timeline.entries)
+    assert report.longest_unchanged_hold <= 4
+    assert len(results) == len(timeline.entries)
+
+
+def test_short_beats_do_not_receive_pointless_default_motion(
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    project, execution, _ = _setup_graph(session, tmp_path)
+    narration = asyncio.run(
+        generate_project_narration(
+            session,
+            project.id,
+            provider_resolver=_resolver_with_calls([]),
+            duration_probe=lambda path: 8.0,
+            projects_root=tmp_path / "projects",
+        )
+    )
+
+    timeline = build_project_timeline(session, project.id, execution.id, narration.id)
+
+    assert timeline.entries[0].transform_metadata is None
+
+
+def test_explicit_intentional_static_hold_is_allowed_without_default_motion(
+    session: Session,
+    tmp_path: Path,
+) -> None:
+    project, execution, _ = _setup_graph(session, tmp_path)
+    payload = json.loads(json.dumps(execution.visual_plan.plan_json))
+    payload["visual_beats"][0]["framing_reason"] = (
+        "intentional static hold to communicate complete stillness"
+    )
+    execution.visual_plan.plan_json = payload
+    execution.visual_plan_revision = _hash(payload)
+    session.commit()
+    narration = asyncio.run(
+        generate_project_narration(
+            session,
+            project.id,
+            provider_resolver=_resolver_with_calls([]),
+            duration_probe=lambda path: 72.0,
+            projects_root=tmp_path / "projects",
+        )
+    )
+
+    timeline = build_project_timeline(session, project.id, execution.id, narration.id)
+
+    assert timeline.entries[0].end_time - timeline.entries[0].start_time > 4
+    assert timeline.entries[0].transform_metadata is None
+    assert not any(
+        warning.startswith("STATIC_VISUAL_HOLD_TOO_LONG") and "beat_1" in warning
+        for warning in timeline.warnings
+    )
+
+
+def test_overlay_is_counted_as_an_effective_screen_state_change() -> None:
+    entries = [
+        {
+            "beat_id": "wide",
+            "asset_path": "same.png",
+            "start_time": 0.0,
+            "end_time": 2.0,
+            "transform_metadata": None,
+            "overlay_metadata": None,
+        },
+        {
+            "beat_id": "highlight",
+            "asset_path": "same.png",
+            "start_time": 2.0,
+            "end_time": 4.0,
+            "transform_metadata": None,
+            "overlay_metadata": {
+                "type": "HIGHLIGHT",
+                "semantic_anchor": "ventilation pipe",
+                "instruction": "Highlight the ventilation pipe",
+                "appear_offset": 0.4,
+            },
+        },
+    ]
+
+    analysis = analyze_visual_progression(entries, 4.0)
+
+    assert analysis.effective_screen_states == 2
+    assert analysis.longest_unchanged_hold == 2.4
 
 
 def test_new_accepted_visual_and_tts_change_make_timeline_stale(

@@ -9,7 +9,7 @@
       <h1>{{ project.name }}</h1>
       <p class="lead">{{ scene_cards | length }} сцен · {{ project.width }}×{{ project.height }} · {{ project.fps }} FPS</p>
     </div>
-    <div class="compact-actions"><a class="button button-secondary" href="/projects/{{ project.id }}/prompts">Visual Plan → Prompts</a><span class="status-pill">{{ 'COMPLETED' if final_video_url else ('PILOT READY' if pilot_video_url else ('DRAFT READY' if draft_video_url else (latest_job.status.value | upper if latest_job else 'NEW'))) }}</span></div>
+    <div class="compact-actions"><a class="button button-secondary" href="/projects/{{ project.id }}/prompts">Visual Sheet</a><span class="status-pill">{{ 'COMPLETED' if final_video_url else ('PILOT READY' if pilot_video_url else ('DRAFT READY' if draft_video_url else (latest_job.status.value | upper if latest_job else 'NEW'))) }}</span></div>
   </div>
 
   <div class="workspace-layout">
@@ -84,6 +84,18 @@
                 <label>Модель<input id="tts-model" name="tts_model" value="{{ project.tts_model or '' }}" placeholder="qwen3-tts-flash"></label>
                 <label><span id="tts-voice-label">Голос</span><input id="tts-voice" name="tts_voice" required value="{{ project.tts_voice }}"><small id="tts-voice-help"></small></label>
                 <label id="tts-language-field">Язык<input name="tts_language" required value="{{ project.tts_language }}"></label>
+              </section>
+              <section class="provider-selection-card">
+                <div class="provider-selection-heading"><span class="provider-step">03</span><div><h3>AI video clips</h3><p>Optional manual animation of accepted still frames. Narration remains the only final audio.</p></div></div>
+                <label>Mode<select name="video_generation_mode"><option value="OFF" {% if project.video_generation_mode == 'OFF' %}selected{% endif %}>OFF</option><option value="MANUAL" {% if project.video_generation_mode == 'MANUAL' %}selected{% endif %}>MANUAL</option><option value="AUTO_LATER" {% if project.video_generation_mode == 'AUTO_LATER' %}selected{% endif %}>AUTO-LATER</option></select></label>
+                <label>Provider<select name="video_provider"><option value="vidu" {% if project.video_provider == 'vidu' %}selected{% endif %}>Vidu</option><option value="wan" {% if project.video_provider == 'wan' %}selected{% endif %}>Alibaba Wan</option><option value="seedance" {% if project.video_provider == 'seedance' %}selected{% endif %}>BytePlus Seedance</option></select></label>
+                <label>Model<input name="video_model" value="{{ project.video_model or '' }}" placeholder="viduq3-turbo"></label>
+                <div class="form-grid two-columns">
+                  <label>Resolution<select name="video_resolution">{% for resolution in ['480p', '540p', '720p', '1080p'] %}<option value="{{ resolution }}" {% if project.video_resolution | lower == resolution %}selected{% endif %}>{{ resolution }}</option>{% endfor %}</select></label>
+                  <label>Clip duration<input name="video_clip_duration" type="number" min="1" max="30" value="{{ project.video_clip_duration }}"></label>
+                  <label>Video budget<input name="video_budget_amount" type="number" min="0.000001" step="0.000001" value="{{ project.video_budget_amount or '' }}" placeholder="Optional"></label>
+                </div>
+                <small>Generated clip audio is persisted as metadata but always muted in the FermaYT timeline.</small>
               </section>
             </div>
 

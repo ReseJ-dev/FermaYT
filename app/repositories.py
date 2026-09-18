@@ -141,6 +141,7 @@ def succeed_video_render(
     session.refresh(record)
     return record
 
+
 PROJECT_UPDATE_FIELDS = frozenset(
     {
         "name",
@@ -160,6 +161,12 @@ PROJECT_UPDATE_FIELDS = frozenset(
         "style_id",
         "image_provider",
         "image_model",
+        "video_generation_mode",
+        "video_provider",
+        "video_model",
+        "video_resolution",
+        "video_clip_duration",
+        "video_budget_amount",
         "tts_provider",
         "tts_model",
         "tts_voice",
@@ -242,6 +249,12 @@ def create_project(
     style_id: str = "rough_explainer_v1",
     image_provider: str = "seedream",
     image_model: str | None = None,
+    video_generation_mode: str = "OFF",
+    video_provider: str = "vidu",
+    video_model: str | None = None,
+    video_resolution: str = "720p",
+    video_clip_duration: int = 5,
+    video_budget_amount: float | None = None,
     tts_provider: str = "qwen",
     tts_model: str | None = None,
     tts_voice: str = "Cherry",
@@ -286,6 +299,12 @@ def create_project(
         style_id=style_id,
         image_provider=image_provider,
         image_model=image_model,
+        video_generation_mode=video_generation_mode,
+        video_provider=video_provider,
+        video_model=video_model,
+        video_resolution=video_resolution,
+        video_clip_duration=video_clip_duration,
+        video_budget_amount=video_budget_amount,
         tts_provider=tts_provider,
         tts_model=tts_model,
         tts_voice=tts_voice,
@@ -333,7 +352,9 @@ def update_project(
         return None
     _validate_update_fields(changes, PROJECT_UPDATE_FIELDS)
     _validate_project_budget(
-        bool(changes.get("generation_budget_enabled", project.generation_budget_enabled)),
+        bool(
+            changes.get("generation_budget_enabled", project.generation_budget_enabled)
+        ),
         changes.get("generation_budget_amount", project.generation_budget_amount),
     )
     for field, value in changes.items():
@@ -408,9 +429,7 @@ def save_project_visual_plan_record(
     if project is None:
         raise ValueError(f"Project not found: {project_id}")
 
-    record = get_project_visual_plan_record(
-        session, project_id, scope_key=scope_key
-    )
+    record = get_project_visual_plan_record(session, project_id, scope_key=scope_key)
     if record is None:
         record = ProjectVisualPlan(
             project=project,
@@ -598,6 +617,29 @@ def get_successful_beat_visual_result(
     return session.scalar(statement)
 
 
+def get_recheckable_beat_visual_result(
+    session: Session,
+    *,
+    execution_plan_id: str,
+    beat_id: str,
+    generation_revision: str,
+) -> BeatVisualResult | None:
+    """Return a generated candidate blocked only by unavailable automated QA."""
+    statement = (
+        select(BeatVisualResult)
+        .where(
+            BeatVisualResult.execution_plan_id == execution_plan_id,
+            BeatVisualResult.beat_id == beat_id,
+            BeatVisualResult.generation_revision == generation_revision,
+            BeatVisualResult.generation_status == "SUCCEEDED",
+            BeatVisualResult.qa_status == "ERROR",
+            BeatVisualResult.is_accepted.is_(False),
+        )
+        .order_by(BeatVisualResult.attempt.desc())
+    )
+    return session.scalar(statement)
+
+
 def next_beat_visual_attempt(
     session: Session,
     *,
@@ -708,9 +750,7 @@ def apply_automated_visual_qa_decision(
     result.qa_status = decision.result.value
     result.qa_result = decision.result.value
     result.qa_scores = decision.scores.model_dump(mode="json")
-    result.qa_problem_categories = [
-        item.value for item in decision.problem_categories
-    ]
+    result.qa_problem_categories = [item.value for item in decision.problem_categories]
     result.qa_reasons = list(decision.reasons)
     result.qa_correction_instruction = decision.correction_instruction
     result.qa_provider = provider

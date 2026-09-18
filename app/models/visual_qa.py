@@ -21,8 +21,13 @@ class VisualQAProblemCategory(str, Enum):
     CHARACTER_DRIFT = "CHARACTER_DRIFT"
     LOCATION_DRIFT = "LOCATION_DRIFT"
     OBJECT_DRIFT = "OBJECT_DRIFT"
+    CHARACTER_IDENTITY_DRIFT = "CHARACTER_IDENTITY_DRIFT"
+    LOCATION_IDENTITY_DRIFT = "LOCATION_IDENTITY_DRIFT"
+    ENVIRONMENT_MISMATCH = "ENVIRONMENT_MISMATCH"
     STYLE_DRIFT_REALISM = "STYLE_DRIFT_REALISM"
     STYLE_DRIFT_DETAIL = "STYLE_DRIFT_DETAIL"
+    STYLE_DETAIL_DRIFT = "STYLE_DETAIL_DRIFT"
+    STYLE_SHADING_DRIFT = "STYLE_SHADING_DRIFT"
     STYLE_DRIFT_CHILDISH = "STYLE_DRIFT_CHILDISH"
     EDIT_CHANGED_TOO_MUCH = "EDIT_CHANGED_TOO_MUCH"
     COMPOSITION_UNCLEAR = "COMPOSITION_UNCLEAR"
@@ -32,6 +37,7 @@ class VisualQAProblemCategory(str, Enum):
     UNINTENDED_TEXT = "UNINTENDED_TEXT"
     WRONG_CAMERA = "WRONG_CAMERA"
     REFERENCE_NOT_RESPECTED = "REFERENCE_NOT_RESPECTED"
+    UNWANTED_FRAME_OR_MARGIN = "UNWANTED_FRAME_OR_MARGIN"
     OTHER = "OTHER"
 
     # Kept for backward compatibility with the Stage 1 QA prompt and records.
@@ -108,15 +114,21 @@ class VisualQADecision(BaseModel):
                 VisualQAProblemCategory.WRONG_PHYSICAL_STATE,
                 VisualQAProblemCategory.WRONG_CHARACTER,
                 VisualQAProblemCategory.LOCATION_DRIFT,
+                VisualQAProblemCategory.CHARACTER_IDENTITY_DRIFT,
+                VisualQAProblemCategory.LOCATION_IDENTITY_DRIFT,
+                VisualQAProblemCategory.ENVIRONMENT_MISMATCH,
                 VisualQAProblemCategory.STORY_ACCURACY,
                 VisualQAProblemCategory.CONTINUITY,
                 VisualQAProblemCategory.STYLE_DRIFT_REALISM,
+                VisualQAProblemCategory.STYLE_DETAIL_DRIFT,
+                VisualQAProblemCategory.STYLE_SHADING_DRIFT,
                 VisualQAProblemCategory.STYLE_DRIFT,
                 VisualQAProblemCategory.EDIT_CHANGED_TOO_MUCH,
                 VisualQAProblemCategory.COMPOSITION_UNCLEAR,
                 VisualQAProblemCategory.VIDEO_READABILITY,
                 VisualQAProblemCategory.UNWANTED_TEXT,
                 VisualQAProblemCategory.UNINTENDED_TEXT,
+                VisualQAProblemCategory.UNWANTED_FRAME_OR_MARGIN,
             }
             if set(self.problem_categories) & hard_categories:
                 raise ValueError("hard failures cannot PASS_WITH_WARNING")

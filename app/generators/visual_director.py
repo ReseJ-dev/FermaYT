@@ -140,12 +140,9 @@ class VisualDirector:
                 VisualPlanPacingError,
             ) as exc:
                 last_diagnostic = _validation_diagnostic(exc)
-                can_repair = (
-                    repair_attempt < self.max_repair_attempts
-                    and (
-                        self._attempt_controller is None
-                        or self._attempt_controller.can_dispatch
-                    )
+                can_repair = repair_attempt < self.max_repair_attempts and (
+                    self._attempt_controller is None
+                    or self._attempt_controller.can_dispatch
                 )
                 if self._attempt_controller is not None:
                     self._attempt_controller.mark_validation(
@@ -481,13 +478,13 @@ def _master_scene_repair_context(
     allowed_lines = "\n".join(f"- {value}" for value in allowed)
     provided = json.dumps(issue.get("provided_master_scene_id"), ensure_ascii=False)
     return f"""MASTER SCENE REFERENCE VIOLATION:
-Affected beat id: {issue.get('beat_id')}
+Affected beat id: {issue.get("beat_id")}
 Recurring environment id(s):
 {environment_lines}
 Currently supplied master_scene_id: {provided}
 Allowed master_scene_id values:
 {allowed_lines}
-Exact invariant: {issue.get('invariant')}
+Exact invariant: {issue.get("invariant")}
 The beat must reference one of the allowed master scenes above."""
 
 
@@ -602,6 +599,13 @@ beats, preserve the correct master_scene_id unless the plan explicitly transitio
 another mastered scene. A recurring environment without a master scene does not force
 a master_scene_id. Descendants may change story state such as water, damage, people,
 objects or lighting while preserving the recognizable environment.
+Reuse one stable location_id for every beat in the same physical place. Create a new
+location_id only when the narration genuinely moves to a different sub-location, and
+make that transition explicit in the beat's physical state and change description.
+For every recurring character, make its canonical description visually specific and
+stable: include helmet color, clothing colors, safety vest or gear, simplified body
+proportions, face design, and persistent equipment when relevant. Reuse that exact
+character ID and identity across beats.
 
 DIRECTING RULES:
 1. SHOT PROGRESSION. Use WIDE, MEDIUM, CLOSE, DETAIL and CUTAWAY_DIAGRAM in a
@@ -631,6 +635,12 @@ information beyond the narration instead of merely illustrating its wording.
 11. BEAT GRANULARITY. Start a new semantic visual beat when narration introduces a
 new object, location, physical state, obstacle, route, important resource, causal
 mechanism, comparison, or decision. Do not create beats for filler wording.
+Also start a semantic beat when viewer focus changes, important new physical
+information appears, geography needs clarification, or cause and effect need separate
+visual treatment. A semantic beat does not require a newly generated image: prefer
+REUSE, TRANSFORM, OVERLAY, crop/reframe, or detail focus when an established asset can
+communicate the change. If the story genuinely requires a long completely motionless
+frame, include the exact phrase "intentional static hold" in framing_reason.
 {pacing_instruction}
 
 Prefer an established scene that evolves over unrelated replacement images. Target

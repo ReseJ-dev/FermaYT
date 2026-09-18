@@ -17,7 +17,11 @@ from app.asset_roles import RENDERABLE_VISUAL_ASSET_ROLES
 from app.errors import MediaProbeError, ProjectTimelineRenderError
 from app.media.concat import concat_scene_videos
 from app.media.probe import MediaProbeResult, probe_media
-from app.media.timeline_renderer import mux_narration, render_timeline_entry
+from app.media.timeline_renderer import (
+    mux_narration,
+    render_timeline_entry,
+    render_video_timeline_entry,
+)
 from app.models.render import ProjectRenderConfig, RenderTransition
 from app.models.timeline import NormalizedOverlay, NormalizedTransform
 from app.persistence import (
@@ -56,7 +60,9 @@ def render_project_video(
     profile = ProductionProfile(production_profile)
     revision = _render_revision(timeline, render_config, profile)
     reusable = get_successful_video_render(session, revision)
-    if reusable is not None and _successful_output_is_valid(reusable, render_config, timeline.duration):
+    if reusable is not None and _successful_output_is_valid(
+        reusable, render_config, timeline.duration
+    ):
         try:
             _validate_render_inputs(session, timeline, render_config)
         except Exception as exc:
@@ -73,9 +79,7 @@ def render_project_video(
             )
             raise ProjectTimelineRenderError(safe) from exc
         return reusable
-    record = _create_render_attempt(
-        session, timeline, render_config, revision, profile
-    )
+    record = _create_render_attempt(session, timeline, render_config, revision, profile)
     current_entry: TimelineEntry | None = None
     stage = "VALIDATION"
     try:
@@ -87,7 +91,9 @@ def render_project_video(
         previous_asset: str | None = None
         carried_transform: NormalizedTransform | None = None
         reused_clips = 0
-        for entry, (_, _, frame_count) in zip(timeline.entries, frame_ranges, strict=True):
+        for entry, (_, _, frame_count) in zip(
+            timeline.entries, frame_ranges, strict=True
+        ):
             current_entry = entry
             stage = "ENTRY_RENDER"
             own_transform = _parse_transform(entry)
@@ -95,18 +101,30 @@ def render_project_video(
                 carried_transform = None
             effective_transform = own_transform or carried_transform
             overlay = _parse_overlay(entry)
-            clip_path = cache_dir / f"{entry.position:04d}-{entry.id}-{frame_count}f.mp4"
+            clip_path = (
+                cache_dir / f"{entry.position:04d}-{entry.id}-{frame_count}f.mp4"
+            )
             if _clip_is_valid(clip_path, frame_count, render_config):
                 reused_clips += 1
             else:
-                render_timeline_entry(
-                    entry.asset_path,
-                    clip_path,
-                    frame_count=frame_count,
-                    config=render_config,
-                    transform=effective_transform,
-                    overlay=overlay,
-                )
+                if entry.asset_type == "VIDEO":
+                    render_video_timeline_entry(
+                        entry.asset_path,
+                        clip_path,
+                        frame_count=frame_count,
+                        config=render_config,
+                        clip_start=entry.clip_start or 0.0,
+                        clip_end=entry.clip_end,
+                    )
+                else:
+                    render_timeline_entry(
+                        entry.asset_path,
+                        clip_path,
+                        frame_count=frame_count,
+                        config=render_config,
+                        transform=effective_transform,
+                        overlay=overlay,
+                    )
                 _require_clip(clip_path, frame_count, render_config)
             clip_paths.append(clip_path)
             previous_asset = entry.asset_path
@@ -147,7 +165,9 @@ def render_project_video(
                 "entry_count": len(timeline.entries),
                 "total_frames": total_frames,
                 "reused_intermediate_clips": reused_clips,
-                "manifest": build_render_manifest(timeline, render_config, frame_ranges),
+                "manifest": build_render_manifest(
+                    timeline, render_config, frame_ranges
+                ),
             },
             production_profile=profile.value,
             generation_scope_type=timeline.generation_scope_type,
@@ -192,8 +212,12 @@ def build_render_manifest(
         "total_frames": ranges[-1][1],
         "operation_counts": dict(sorted(operation_counts.items())),
         "static_entries": static_count,
-        "transform_entries": sum(entry.transform_metadata is not None for entry in timeline.entries),
-        "overlay_entries": sum(entry.overlay_metadata is not None for entry in timeline.entries),
+        "transform_entries": sum(
+            entry.transform_metadata is not None for entry in timeline.entries
+        ),
+        "overlay_entries": sum(
+            entry.overlay_metadata is not None for entry in timeline.entries
+        ),
         "generated_or_edited_entries": sum(
             entry.operation in {"NEW_IMAGE", "REFERENCE_GENERATION", "EDIT_EXISTING"}
             for entry in timeline.entries
@@ -216,7 +240,9 @@ def build_render_manifest(
     }
 
 
-def format_render_manifest(manifest: dict[str, Any], output_path: str | None = None) -> str:
+def format_render_manifest(
+    manifest: dict[str, Any], output_path: str | None = None
+) -> str:
     """Format a compact human-readable account of deterministic render work."""
     config = manifest["config"]
     transitions = manifest["transition_counts"]
@@ -238,7 +264,9 @@ def format_render_manifest(manifest: dict[str, Any], output_path: str | None = N
     return "\n".join(lines)
 
 
-def _validate_render_inputs(session: Session, timeline: ProjectTimeline, config: ProjectRenderConfig) -> None:
+def _validate_render_inputs(
+    session: Session, timeline: ProjectTimeline, config: ProjectRenderConfig
+) -> None:
     if config.default_transition is not RenderTransition.CUT:
         raise ValueError("CROSSFADE rendering is not implemented; use CUT")
     if not timeline_is_current(session, timeline):
@@ -251,12 +279,23 @@ def _validate_render_inputs(session: Session, timeline: ProjectTimeline, config:
         if entry.position != position:
             raise ValueError(f"Timeline entry order is invalid at beat {entry.beat_id}")
         if abs(entry.start_time - previous_end) > tolerance:
-            raise ValueError(f"Timeline has a gap or overlap before beat {entry.beat_id}")
-        if entry.end_time <= entry.start_time or entry.end_time > timeline.duration + tolerance:
+            raise ValueError(
+                f"Timeline has a gap or overlap before beat {entry.beat_id}"
+            )
+        if (
+            entry.end_time <= entry.start_time
+            or entry.end_time > timeline.duration + tolerance
+        ):
             raise ValueError(f"Timeline bounds are invalid for beat {entry.beat_id}")
         result = session.get(BeatVisualResult, entry.beat_visual_result_id)
-        if result is None or result.generation_status != "SUCCEEDED" or not result.is_accepted:
-            raise ValueError(f"Beat {entry.beat_id} has no accepted successful visual result")
+        if (
+            result is None
+            or result.generation_status != "SUCCEEDED"
+            or not result.is_accepted
+        ):
+            raise ValueError(
+                f"Beat {entry.beat_id} has no accepted successful visual result"
+            )
         if result.asset_role not in RENDERABLE_VISUAL_ASSET_ROLES:
             raise ValueError(
                 f"Beat {entry.beat_id} uses non-renderable asset role "
@@ -264,19 +303,37 @@ def _validate_render_inputs(session: Session, timeline: ProjectTimeline, config:
             )
         if result.beat_id != entry.beat_id:
             raise ValueError(f"Timeline result does not belong to beat {entry.beat_id}")
-        if result.output_path != entry.asset_path:
+        if result.output_path != entry.asset_path and entry.asset_type != "VIDEO":
             raise ValueError(f"Timeline asset path does not match beat {entry.beat_id}")
-        if result.resolved_operation in {
-            "NEW_IMAGE", "REFERENCE_GENERATION", "EDIT_EXISTING"
-        } and result.production_profile != ProductionProfile.DRAFT.value and (
-            result.qa_status not in {"PASS", "PASS_WITH_WARNING"}
-            or result.qa_warning is not None
+        if entry.asset_type == "VIDEO":
+            from app.persistence import GeneratedVideoAsset
+
+            video_asset = session.get(GeneratedVideoAsset, entry.video_asset_id)
+            if (
+                video_asset is None
+                or video_asset.beat_id != entry.beat_id
+                or video_asset.file_path != entry.asset_path
+                or not entry.mute_audio
+            ):
+                raise ValueError(f"Beat {entry.beat_id} has an invalid video asset")
+        elif entry.asset_type != "STILL":
+            raise ValueError(f"Beat {entry.beat_id} has unknown timeline asset type")
+        if (
+            result.resolved_operation
+            in {"NEW_IMAGE", "REFERENCE_GENERATION", "EDIT_EXISTING"}
+            and result.production_profile != ProductionProfile.DRAFT.value
+            and (
+                result.qa_status not in {"PASS", "PASS_WITH_WARNING"}
+                or result.qa_warning is not None
+            )
         ):
             raise ValueError(f"Beat {entry.beat_id} generated visual did not pass QA")
         _parse_transform(entry)
         _parse_overlay(entry)
         if entry.transition_metadata not in (None, {}, {"type": "CUT"}):
-            raise ValueError(f"Unsupported transition metadata for beat {entry.beat_id}")
+            raise ValueError(
+                f"Unsupported transition metadata for beat {entry.beat_id}"
+            )
         previous_end = entry.end_time
     if abs(previous_end - timeline.duration) > tolerance:
         raise ValueError("Timeline does not end at narration duration")
@@ -314,18 +371,31 @@ def _allocate_frames(timeline: ProjectTimeline, fps: int) -> list[tuple[int, int
     for index in range(len(timeline.entries)):
         start, end = boundaries[index], boundaries[index + 1]
         if end <= start:
-            raise ValueError(f"Beat {timeline.entries[index].beat_id} is shorter than one output frame")
+            raise ValueError(
+                f"Beat {timeline.entries[index].beat_id} is shorter than one output frame"
+            )
         ranges.append((start, end, end - start))
     return ranges
 
 
 def _parse_transform(entry: TimelineEntry) -> NormalizedTransform | None:
-    return NormalizedTransform.model_validate(entry.transform_metadata) if entry.transform_metadata else None
+    return (
+        NormalizedTransform.model_validate(entry.transform_metadata)
+        if entry.transform_metadata
+        else None
+    )
 
 
 def _parse_overlay(entry: TimelineEntry) -> NormalizedOverlay | None:
-    overlay = NormalizedOverlay.model_validate(entry.overlay_metadata) if entry.overlay_metadata else None
-    if overlay is not None and overlay.appear_offset >= entry.end_time - entry.start_time:
+    overlay = (
+        NormalizedOverlay.model_validate(entry.overlay_metadata)
+        if entry.overlay_metadata
+        else None
+    )
+    if (
+        overlay is not None
+        and overlay.appear_offset >= entry.end_time - entry.start_time
+    ):
         raise ValueError(f"Overlay appears after beat {entry.beat_id} ends")
     return overlay
 
@@ -349,7 +419,9 @@ def _clip_is_valid(path: Path, frames: int, config: ProjectRenderConfig) -> bool
     return True
 
 
-def _require_clip(path: Path, frames: int, config: ProjectRenderConfig) -> MediaProbeResult:
+def _require_clip(
+    path: Path, frames: int, config: ProjectRenderConfig
+) -> MediaProbeResult:
     metadata = probe_media(path)
     expected = frames / config.fps
     if metadata.has_audio or not metadata.has_video:
@@ -363,7 +435,9 @@ def _require_clip(path: Path, frames: int, config: ProjectRenderConfig) -> Media
     return metadata
 
 
-def _require_final_output(path: Path, frames: int, config: ProjectRenderConfig) -> MediaProbeResult:
+def _require_final_output(
+    path: Path, frames: int, config: ProjectRenderConfig
+) -> MediaProbeResult:
     metadata = probe_media(path)
     expected = frames / config.fps
     if not metadata.has_video or not metadata.has_audio:
@@ -377,7 +451,9 @@ def _require_final_output(path: Path, frames: int, config: ProjectRenderConfig) 
     return metadata
 
 
-def _successful_output_is_valid(record: ProjectVideoRender, config: ProjectRenderConfig, duration: float) -> bool:
+def _successful_output_is_valid(
+    record: ProjectVideoRender, config: ProjectRenderConfig, duration: float
+) -> bool:
     if record.output_path is None or record.output_sha256 is None:
         return False
     path = Path(record.output_path)
@@ -418,6 +494,8 @@ def _sha256(path: str | Path) -> str:
 
 
 def _safe_error(exc: Exception, entry: TimelineEntry | None, stage: str) -> str:
-    detail = re.sub(r"(?i)(bearer|api[_ -]?key|authorization)[^\s,;]*", r"\1 [redacted]", str(exc))
+    detail = re.sub(
+        r"(?i)(bearer|api[_ -]?key|authorization)[^\s,;]*", r"\1 [redacted]", str(exc)
+    )
     prefix = f"Beat {entry.position + 1} ({entry.beat_id}), " if entry else ""
     return f"{prefix}{stage}: {detail}"[:1500]

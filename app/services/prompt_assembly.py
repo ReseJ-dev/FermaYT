@@ -21,10 +21,13 @@ from app.generators.style_reference import build_reference_role_instruction
 from app.models.visual_plan import MasterScene, VisualBeat, VisualOperation, VisualPlan
 from app.persistence import (
     BeatVisualResult,
+    GeneratedVideoAsset,
     MasterSceneAsset,
     MasterSceneGenerationAttempt,
     Project,
+    ProjectNarrationAlignment,
     ProjectVisualPlan,
+    VideoGenerationAttempt,
     VisualPromptOverride,
 )
 from app.pipeline.visual_operation_engine import VisualOperationDecisionEngine
@@ -99,6 +102,7 @@ class PromptAssembly:
     qa_correction: str | None
     assembled_prompt_before_provider_transform: str | None
     provider_transformations: list[dict[str, object]]
+    provider_compaction_report: dict[str, object] | None
     final_provider_prompt: str | None
     provider: str
     model: str | None
@@ -154,9 +158,7 @@ def semantic_fingerprint(
     target_type: PromptTargetType | str,
     target_id: str,
 ) -> str:
-    return _stable_hash(
-        semantic_requirement_for_target(plan, target_type, target_id)
-    )
+    return _stable_hash(semantic_requirement_for_target(plan, target_type, target_id))
 
 
 def resolve_prompt_override(
@@ -310,9 +312,7 @@ def compile_prompt_assembly(
     )
     plan_id = plan_record.id if plan_record is not None else "unpersisted"
     active_override = (
-        resolution.override
-        if resolution.state is PromptOverrideState.ACTIVE
-        else None
+        resolution.override if resolution.state is PromptOverrideState.ACTIVE else None
     )
     operation_instructions = _operation_instructions(operation)
     reference_snapshot = [_reference_snapshot(item) for item in references]
@@ -332,7 +332,9 @@ def compile_prompt_assembly(
             manual_scene_override=None,
             override_state=resolution.state.value,
             override_id=resolution.override.id if resolution.override else None,
-            override_revision=(resolution.override.revision if resolution.override else None),
+            override_revision=(
+                resolution.override.revision if resolution.override else None
+            ),
             effective_scene_prompt=None,
             operation=operation.value,
             operation_instructions=operation_instructions,
@@ -342,6 +344,7 @@ def compile_prompt_assembly(
             qa_correction=None,
             assembled_prompt_before_provider_transform=None,
             provider_transformations=[],
+            provider_compaction_report=None,
             final_provider_prompt=None,
             provider=provider_id,
             model=provider_model,
@@ -366,9 +369,38 @@ def compile_prompt_assembly(
     if qa_correction is not None:
         assembled = apply_visual_qa_correction(assembled, qa_correction, style_id)
     provider_ready = prepare_image_prompt_for_provider(assembled, style_id)
-    final_prompt, transformations = normalize_image_prompt_for_provider(
-        provider_ready, provider_id
-    )
+    compaction_report: dict[str, object] | None = None
+    if provider_id == "zimage":
+        from app.services.zimage_prompt_compiler import compile_zimage_semantic_prompt
+
+        target = (
+            _beat(plan, target_id)
+            if target_type is PromptTargetType.BEAT
+            else _master(plan, target_id)
+        )
+        compilation = compile_zimage_semantic_prompt(
+            plan,
+            target=target,
+            operation=operation,
+            manual_scene_override=manual,
+            qa_correction=qa_correction,
+            style_id=style_id,
+        )
+        final_prompt = compilation.prompt
+        compaction_report = compilation.report
+        transformations = [
+            {
+                "type": "ZIMAGE_LIMIT_NORMALIZATION",
+                "strategy": "STRUCTURED_SEMANTIC_COMPILATION",
+                "before_length": len(provider_ready),
+                "after_length": len(final_prompt),
+                **compilation.report,
+            }
+        ]
+    else:
+        final_prompt, transformations = normalize_image_prompt_for_provider(
+            provider_ready, provider_id
+        )
     if provider_ready != assembled:
         transformations.insert(
             0,
@@ -399,6 +431,7 @@ def compile_prompt_assembly(
         qa_correction=qa_correction,
         assembled_prompt_before_provider_transform=assembled,
         provider_transformations=transformations,
+        provider_compaction_report=compaction_report,
         final_provider_prompt=final_prompt,
         provider=provider_id,
         model=provider_model,
@@ -544,6 +577,8 @@ def get_prompt_detail(
             "summary": beat.what_viewer_should_understand,
             "source_visual_id": beat.source_visual_id,
             "source_asset": latest.source_path if latest is not None else None,
+            "master_scene_id": beat.master_scene_id,
+            "time_range": _beat_time_range(session, plan_record, target_id),
             "operation_detail": _operation_detail(beat),
         }
     else:
@@ -588,6 +623,8 @@ def get_prompt_detail(
             "summary": master.description,
             "source_visual_id": None,
             "source_asset": asset.file_path if asset is not None else None,
+            "master_scene_id": master.id,
+            "time_range": None,
             "operation_detail": None,
         }
     return detail
@@ -601,6 +638,28 @@ def get_prompt_sheet(session: Session, project_id: str) -> list[dict[str, Any]]:
     capabilities = _preview_capabilities(project, None, None)
     rows: list[dict[str, Any]] = []
     current_keys: set[tuple[str, str]] = set()
+    latest_alignment = session.scalar(
+        select(ProjectNarrationAlignment)
+        .where(
+            ProjectNarrationAlignment.project_id == project_id,
+            ProjectNarrationAlignment.visual_plan_id == plan_record.id,
+            ProjectNarrationAlignment.visual_plan_revision
+            == visual_plan_revision(plan),
+        )
+        .order_by(ProjectNarrationAlignment.created_at.desc())
+        .limit(1)
+    )
+    timings = (
+        {
+            timing.beat_id: {
+                "start": timing.audio_start,
+                "end": timing.audio_end,
+            }
+            for timing in latest_alignment.beat_timings
+        }
+        if latest_alignment is not None
+        else {}
+    )
     for target_type, targets in (
         (PromptTargetType.MASTER_SCENE, plan.possible_master_scenes),
         (PromptTargetType.BEAT, plan.visual_beats),
@@ -616,7 +675,16 @@ def get_prompt_sheet(session: Session, project_id: str) -> list[dict[str, Any]]:
                 target_id=target.id,
             )
             operation = (
-                VisualOperation.NEW_IMAGE.value
+                (
+                    VisualOperation.REFERENCE_GENERATION.value
+                    if _preview_master_references(
+                        session,
+                        project,
+                        provider=None,
+                        model=None,
+                    )
+                    else VisualOperation.NEW_IMAGE.value
+                )
                 if target_type is PromptTargetType.MASTER_SCENE
                 else _preview_resolved_operation(plan, target, capabilities).value
             )
@@ -628,6 +696,76 @@ def get_prompt_sheet(session: Session, project_id: str) -> list[dict[str, Any]]:
                         BeatVisualResult.beat_id == target.id,
                     )
                     .order_by(BeatVisualResult.created_at.desc())
+                    .limit(1)
+                )
+                if target_type is PromptTargetType.BEAT
+                else None
+            )
+            accepted_result = (
+                session.scalar(
+                    select(BeatVisualResult)
+                    .where(
+                        BeatVisualResult.project_id == project_id,
+                        BeatVisualResult.beat_id == target.id,
+                        BeatVisualResult.is_accepted.is_(True),
+                    )
+                    .order_by(BeatVisualResult.created_at.desc())
+                    .limit(1)
+                )
+                if target_type is PromptTargetType.BEAT
+                else None
+            )
+            master_asset = (
+                session.scalar(
+                    select(MasterSceneAsset).where(
+                        MasterSceneAsset.project_id == project_id,
+                        MasterSceneAsset.master_scene_id == target.id,
+                    )
+                )
+                if target_type is PromptTargetType.MASTER_SCENE
+                else None
+            )
+            latest_master_attempt = (
+                session.scalar(
+                    select(MasterSceneGenerationAttempt)
+                    .where(
+                        MasterSceneGenerationAttempt.project_id == project_id,
+                        MasterSceneGenerationAttempt.master_scene_id == target.id,
+                    )
+                    .order_by(MasterSceneGenerationAttempt.created_at.desc())
+                    .limit(1)
+                )
+                if target_type is PromptTargetType.MASTER_SCENE
+                else None
+            )
+            latest_video_asset = (
+                session.scalar(
+                    select(GeneratedVideoAsset)
+                    .join(VideoGenerationAttempt)
+                    .where(
+                        GeneratedVideoAsset.project_id == project_id,
+                        GeneratedVideoAsset.beat_id == target.id,
+                        VideoGenerationAttempt.accepted_image_result_id
+                        == (
+                            accepted_result.id
+                            if accepted_result is not None
+                            else "__missing_accepted_result__"
+                        ),
+                    )
+                    .order_by(GeneratedVideoAsset.created_at.desc())
+                    .limit(1)
+                )
+                if target_type is PromptTargetType.BEAT
+                else None
+            )
+            latest_video_attempt = (
+                session.scalar(
+                    select(VideoGenerationAttempt)
+                    .where(
+                        VideoGenerationAttempt.project_id == project_id,
+                        VideoGenerationAttempt.beat_id == target.id,
+                    )
+                    .order_by(VideoGenerationAttempt.created_at.desc())
                     .limit(1)
                 )
                 if target_type is PromptTargetType.BEAT
@@ -653,7 +791,9 @@ def get_prompt_sheet(session: Session, project_id: str) -> list[dict[str, Any]]:
                         if resolution.state is PromptOverrideState.ACTIVE
                         else resolution.state.value
                     ),
-                    "override_id": resolution.override.id if resolution.override else None,
+                    "override_id": resolution.override.id
+                    if resolution.override
+                    else None,
                     "operation": operation,
                     "summary": (
                         target.description
@@ -670,15 +810,93 @@ def get_prompt_sheet(session: Session, project_id: str) -> list[dict[str, Any]]:
                         if target_type is PromptTargetType.MASTER_SCENE
                         else target.source_visual_id
                     ),
+                    "master_scene_id": (
+                        target.id
+                        if target_type is PromptTargetType.MASTER_SCENE
+                        else target.master_scene_id
+                    ),
+                    "time_range": (
+                        None
+                        if target_type is PromptTargetType.MASTER_SCENE
+                        else timings.get(target.id)
+                    ),
+                    "selectable": target_type is PromptTargetType.BEAT,
+                    "accepted_asset_path": (
+                        master_asset.file_path
+                        if master_asset is not None
+                        else (
+                            accepted_result.output_path
+                            if accepted_result is not None
+                            else None
+                        )
+                    ),
+                    "source_asset": (
+                        latest_result.source_path if latest_result else None
+                    ),
+                    "provider": (
+                        latest_result.provider
+                        if latest_result is not None
+                        else master_asset.provider
+                        if master_asset is not None
+                        else project.image_provider
+                    ),
+                    "model": (
+                        latest_result.model
+                        if latest_result is not None
+                        else master_asset.model
+                        if master_asset is not None
+                        else project.image_model
+                    ),
                     "operation_detail": (
                         None
                         if target_type is PromptTargetType.MASTER_SCENE
                         else _operation_detail(target)
                     ),
                     "generation_status": (
-                        latest_result.generation_status if latest_result else None
+                        latest_result.generation_status
+                        if latest_result
+                        else latest_master_attempt.generation_status
+                        if latest_master_attempt
+                        else "SUCCEEDED"
+                        if master_asset is not None
+                        else None
                     ),
-                    "qa_status": latest_result.qa_status if latest_result else None,
+                    "qa_status": (
+                        latest_result.qa_status
+                        if latest_result
+                        else latest_master_attempt.qa_result
+                        if latest_master_attempt
+                        else None
+                    ),
+                    "video_asset_path": (
+                        latest_video_asset.file_path if latest_video_asset else None
+                    ),
+                    "video_asset_id": (
+                        latest_video_asset.id if latest_video_asset else None
+                    ),
+                    "video_attempt": (
+                        {
+                            "id": latest_video_attempt.id,
+                            "provider": latest_video_attempt.provider,
+                            "model": latest_video_attempt.model,
+                            "operation": latest_video_attempt.operation,
+                            "remote_task_id": latest_video_attempt.remote_task_id,
+                            "status": latest_video_attempt.status,
+                            "estimated_cost": (
+                                float(latest_video_attempt.estimated_cost)
+                                if latest_video_attempt.estimated_cost is not None
+                                else None
+                            ),
+                            "actual_cost": (
+                                float(latest_video_attempt.actual_cost)
+                                if latest_video_attempt.actual_cost is not None
+                                else None
+                            ),
+                            "cost_certainty": latest_video_attempt.cost_certainty,
+                        }
+                        if latest_video_attempt
+                        else None
+                    ),
                 }
             )
     overrides = list(
@@ -702,6 +920,34 @@ def get_prompt_sheet(session: Session, project_id: str) -> list[dict[str, Any]]:
                 }
             )
     return rows
+
+
+def _beat_time_range(
+    session: Session,
+    plan_record: ProjectVisualPlan,
+    beat_id: str,
+) -> dict[str, float] | None:
+    """Return timing only when it belongs to this exact VisualPlan revision."""
+    alignment = session.scalar(
+        select(ProjectNarrationAlignment)
+        .where(
+            ProjectNarrationAlignment.project_id == plan_record.project_id,
+            ProjectNarrationAlignment.visual_plan_id == plan_record.id,
+            ProjectNarrationAlignment.visual_plan_revision
+            == visual_plan_revision(VisualPlan.model_validate(plan_record.plan_json)),
+        )
+        .order_by(ProjectNarrationAlignment.created_at.desc())
+        .limit(1)
+    )
+    if alignment is None:
+        return None
+    timing = next(
+        (item for item in alignment.beat_timings if item.beat_id == beat_id),
+        None,
+    )
+    if timing is None:
+        return None
+    return {"start": timing.audio_start, "end": timing.audio_end}
 
 
 def _preview_master_references(
@@ -776,10 +1022,14 @@ def _preview_beat_references(
             source=source,
         )
     ]
-    if master_asset is None and beat.master_scene_id is not None and operation is not VisualOperation.NEW_IMAGE:
+    if master_asset is None and beat.master_scene_id is not None:
         selected.append(_planned_reference(f"master:{beat.master_scene_id}"))
     planned_source = None
-    if source is None and beat.source_visual_id is not None and operation is not VisualOperation.NEW_IMAGE:
+    if (
+        source is None
+        and beat.source_visual_id is not None
+        and operation is not VisualOperation.NEW_IMAGE
+    ):
         planned_source = _planned_reference(f"beat:{beat.source_visual_id}")
         selected.append(planned_source)
     unique = list({item.sha256: item for item in selected}.values())
@@ -821,7 +1071,9 @@ def _preview_resolved_operation(
     capabilities: ImageProviderCapabilities,
 ) -> VisualOperation:
     beat_index = next(
-        index for index, candidate in enumerate(plan.visual_beats) if candidate.id == beat.id
+        index
+        for index, candidate in enumerate(plan.visual_beats)
+        if candidate.id == beat.id
     )
     available_visuals = {
         master.id: f"planned://master/{master.id}"
@@ -833,12 +1085,16 @@ def _preview_resolved_operation(
             for candidate in plan.visual_beats[:beat_index]
         }
     )
-    return VisualOperationDecisionEngine().decide(
-        plan,
-        beat_index,
-        capabilities=capabilities,
-        available_visuals=available_visuals,
-    ).operation
+    return (
+        VisualOperationDecisionEngine()
+        .decide(
+            plan,
+            beat_index,
+            capabilities=capabilities,
+            available_visuals=available_visuals,
+        )
+        .operation
+    )
 
 
 def _operation_detail(beat: VisualBeat) -> str | None:
@@ -1028,5 +1284,7 @@ def _master(plan: VisualPlan, target_id: str) -> MasterScene:
 
 
 def _stable_hash(value: object) -> str:
-    payload = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    payload = json.dumps(
+        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    )
     return hashlib.sha256(payload.encode()).hexdigest()

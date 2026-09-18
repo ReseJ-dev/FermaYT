@@ -47,7 +47,7 @@ from app.repositories import (
 from app.services.narration import generate_project_narration
 from app.services.narration_alignment import align_project_visual_beats
 from app.services.project_render import render_project_video
-from app.services.timeline import build_project_timeline
+from app.services.timeline import build_project_timeline, build_timeline_quality_report
 from app.services.visual_asset_execution import (
     VisualBeatAssetExecutor,
     build_visual_qa_execution_summary,
@@ -137,6 +137,7 @@ class ProjectPipelineReport:
     projected_final_cost: dict[str, Any] | None
     generation_scope: dict[str, str | float | int | None]
     semantic_visual_beats: int
+    timeline_quality: dict[str, Any]
 
     def as_dict(self) -> dict[str, object]:
         return asdict(self)
@@ -211,6 +212,7 @@ async def run_project_video_pipeline(
             total_beats,
             failed_beat,
         )
+
     await emit(
         ProjectPipelineStage.VALIDATING, 2, 0, "Проверка проекта", None, None, None
     )
@@ -578,11 +580,16 @@ async def run_project_video_pipeline(
         generation_scope=scope,
         selected_beat_ids=selected_beat_ids,
     )
+    timeline_quality = build_timeline_quality_report(timeline)
     await emit(
         ProjectPipelineStage.BUILDING_TIMELINE,
         86,
         100,
-        f"Timeline entries: {len(timeline.entries)}",
+        (
+            f"Timeline: {timeline_quality.effective_screen_states} screen states; "
+            f"longest unchanged hold {timeline_quality.longest_unchanged_hold:.2f}s; "
+            f"{timeline_quality.paid_generations_per_minute:.2f} paid visuals/min"
+        ),
         None,
         total_beats,
         None,
@@ -724,6 +731,7 @@ async def run_project_video_pipeline(
         projected_final_cost=projected_final,
         generation_scope=scope.snapshot(),
         semantic_visual_beats=semantic_total_beats,
+        timeline_quality=asdict(timeline_quality),
     )
     await emit(
         ProjectPipelineStage.COMPLETED,

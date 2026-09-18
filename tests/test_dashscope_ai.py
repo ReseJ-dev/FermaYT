@@ -79,6 +79,36 @@ def test_visual_qa_client_embeds_candidate_and_references(
     assert content[0]["image_url"]["url"].startswith("data:image/png;base64,")
 
 
+def test_visual_qa_transport_is_never_automatically_retried(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "candidate.png"
+    image.write_bytes(b"image")
+    calls = 0
+    async_client = httpx.AsyncClient
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal calls
+        calls += 1
+        return httpx.Response(500, request=request)
+
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: async_client(transport=httpx.MockTransport(handler), **kwargs),
+    )
+
+    with pytest.raises(StructuredAIProviderError):
+        asyncio.run(
+            DashScopeVisualQAClient(api_key="private-key").evaluate(
+                "judge frame", (str(image),)
+            )
+        )
+
+    assert calls == 1
+
+
 @pytest.mark.parametrize("mode", ["timeout", "http", "invalid-json", "shape"])
 def test_structured_provider_fails_safely(
     monkeypatch: pytest.MonkeyPatch,
@@ -242,6 +272,10 @@ def test_planning_does_not_retry_auth_failure(
         (
             {"choices": [{"finish_reason": "stop", "message": {"content": ""}}]},
             "PLANNING_EMPTY_RESPONSE",
+        ),
+        (
+            {"choices": [{"finish_reason": "length", "message": {"content": ""}}]},
+            "PLANNING_TRUNCATED_OUTPUT",
         ),
         (
             {"choices": [{"finish_reason": "length", "message": {"content": '{"a":'}}]},

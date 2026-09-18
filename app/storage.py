@@ -25,6 +25,7 @@ class ProjectMediaPaths:
             self.audio_dir,
             self.scenes_dir,
             self.uploads_dir,
+            self.generated_videos_dir,
             self.output_dir,
         ):
             directory.mkdir(parents=True, exist_ok=True)
@@ -56,6 +57,10 @@ class ProjectMediaPaths:
     @property
     def uploads_dir(self) -> Path:
         return self.project_dir / "uploads"
+
+    @property
+    def generated_videos_dir(self) -> Path:
+        return self.project_dir / "generated_videos"
 
     @property
     def output_dir(self) -> Path:
@@ -108,6 +113,10 @@ class ProjectMediaPaths:
     def scene_video_path(self, scene_id: str) -> Path:
         scene_name = _safe_component(scene_id, "scene_id")
         return self.scenes_dir / f"{scene_name}.mp4"
+
+    def generated_video_path(self, attempt_id: str) -> Path:
+        attempt = _safe_component(attempt_id, "attempt_id")
+        return self.generated_videos_dir / f"{attempt}.mp4"
 
     def uploaded_image_path(self, extension: str = ".png") -> Path:
         if not _SAFE_EXTENSION.fullmatch(extension):

@@ -58,7 +58,11 @@ def select_source_asset(
             continue
         state = result.semantic_state_snapshot
         position = int(state.get("beat_position", -1))
-        if position >= current_position or not result.output_path or not result.file_sha256:
+        if (
+            position >= current_position
+            or not result.output_path
+            or not result.file_sha256
+        ):
             continue
         if (
             not Path(result.output_path).is_file()
@@ -167,9 +171,7 @@ def select_visual_references(
                 reason="permanent project style and detail ceiling",
             )
         )
-    if master_asset is not None and (
-        operation is not VisualOperation.NEW_IMAGE or master_asset.provider == "user"
-    ):
+    if master_asset is not None:
         candidates.append(
             SelectedVisualReference(
                 reference=ImageReference(
@@ -182,7 +184,7 @@ def select_visual_references(
                 reason="preserve recurring environment geometry",
             )
         )
-    if operation is not VisualOperation.NEW_IMAGE and source is not None:
+    if source is not None:
         candidates.append(
             SelectedVisualReference(
                 reference=ImageReference(
@@ -270,11 +272,14 @@ def _score_result_source(
     if previous_state and previous_state.lower() in candidate_physical_state.lower():
         score += 8
         reasons.append("closest prior progressive state")
-    score += 5 * SequenceMatcher(
-        None,
-        candidate_physical_state.lower(),
-        beat.physical_state.lower(),
-    ).ratio()
+    score += (
+        5
+        * SequenceMatcher(
+            None,
+            candidate_physical_state.lower(),
+            beat.physical_state.lower(),
+        ).ratio()
+    )
     if resolved_operation == VisualOperation.EDIT_EXISTING.value:
         score += 2
     return score, reasons or ["highest semantic continuity score"]

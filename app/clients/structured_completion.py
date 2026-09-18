@@ -86,13 +86,22 @@ async def complete_json_chat(
                 response.raise_for_status()
         except httpx.TimeoutException as exc:
             diagnostic = _diagnostic(
-                provider, model, operation, "PLANNING_TIMEOUT", attempt,
-                max_attempts, timeout_seconds=timeout,
+                provider,
+                model,
+                operation,
+                "PLANNING_TIMEOUT",
+                attempt,
+                max_attempts,
+                timeout_seconds=timeout,
                 retry_exhausted=attempt >= max_attempts,
             )
-            if await _retry_if_transient(diagnostic, attempt, max_attempts, retry_base_delay):
+            if await _retry_if_transient(
+                diagnostic, attempt, max_attempts, retry_base_delay
+            ):
                 continue
-            raise _provider_error(diagnostic, "Structured provider request timed out") from exc
+            raise _provider_error(
+                diagnostic, "Structured provider request timed out"
+            ) from exc
         except httpx.HTTPStatusError as exc:
             status = exc.response.status_code
             diagnostic = _diagnostic(
@@ -129,9 +138,13 @@ async def complete_json_chat(
                 provider_error=type(exc).__name__,
                 retry_exhausted=attempt >= max_attempts,
             )
-            if await _retry_if_transient(diagnostic, attempt, max_attempts, retry_base_delay):
+            if await _retry_if_transient(
+                diagnostic, attempt, max_attempts, retry_base_delay
+            ):
                 continue
-            raise _provider_error(diagnostic, "Structured provider request failed") from exc
+            raise _provider_error(
+                diagnostic, "Structured provider request failed"
+            ) from exc
 
         content, metadata = _parse_response(
             response,
@@ -156,7 +169,12 @@ def missing_key_error(
     environment_name: str,
 ) -> StructuredAIProviderError:
     diagnostic = _diagnostic(
-        provider, model, operation, "PLANNING_AUTH_ERROR", 0, 1,
+        provider,
+        model,
+        operation,
+        "PLANNING_AUTH_ERROR",
+        0,
+        1,
         provider_error=f"{environment_name} is not configured",
     )
     return _provider_error(diagnostic, f"{environment_name} is not configured")
@@ -177,11 +195,19 @@ def _parse_response(
     except ValueError as exc:
         preview = _safe_preview(response.text)
         diagnostic = _diagnostic(
-            provider, model, operation, "PLANNING_INVALID_JSON", attempt,
-            max_attempts, request_id=request_id,
-            response_length=len(response.content), response_preview=preview,
+            provider,
+            model,
+            operation,
+            "PLANNING_INVALID_JSON",
+            attempt,
+            max_attempts,
+            request_id=request_id,
+            response_length=len(response.content),
+            response_preview=preview,
         )
-        raise _provider_error(diagnostic, "Structured provider returned malformed response JSON") from exc
+        raise _provider_error(
+            diagnostic, "Structured provider returned malformed response JSON"
+        ) from exc
 
     try:
         choice = body["choices"][0]
@@ -190,20 +216,38 @@ def _parse_response(
         finish_reason = choice.get("finish_reason")
     except (KeyError, IndexError, TypeError) as exc:
         diagnostic = _diagnostic(
-            provider, model, operation,
-            "PLANNING_STRUCTURED_JSON_INCOMPATIBILITY", attempt, max_attempts,
-            provider_error=safe_provider_response(response), request_id=request_id,
+            provider,
+            model,
+            operation,
+            "PLANNING_STRUCTURED_JSON_INCOMPATIBILITY",
+            attempt,
+            max_attempts,
+            provider_error=safe_provider_response(response),
+            request_id=request_id,
             response_length=len(response.content),
         )
-        raise _provider_error(diagnostic, "Structured provider response has an incompatible shape") from exc
+        raise _provider_error(
+            diagnostic, "Structured provider response has an incompatible shape"
+        ) from exc
 
     if not isinstance(content, str) or not content.strip():
+        truncated = finish_reason in {"length", "max_tokens", "max_output_tokens"}
         diagnostic = _diagnostic(
-            provider, model, operation, "PLANNING_EMPTY_RESPONSE", attempt,
-            max_attempts, request_id=request_id,
+            provider,
+            model,
+            operation,
+            "PLANNING_TRUNCATED_OUTPUT" if truncated else "PLANNING_EMPTY_RESPONSE",
+            attempt,
+            max_attempts,
+            request_id=request_id,
             finish_reason=finish_reason if isinstance(finish_reason, str) else None,
         )
-        raise _provider_error(diagnostic, "Structured provider returned empty content")
+        summary = (
+            "Structured provider exhausted its output limit before emitting content"
+            if truncated
+            else "Structured provider returned empty content"
+        )
+        raise _provider_error(diagnostic, summary)
 
     normalized = content.strip()
     try:

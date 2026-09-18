@@ -451,6 +451,10 @@ document.addEventListener("DOMContentLoaded", () => {
     const modelInput = promptDialog.querySelector("[data-preview-model]");
     const overrideInput = promptDialog.querySelector("[data-override-input]");
     const feedback = promptDialog.querySelector("[data-prompt-feedback]");
+    const generateSelected = promptSheet.querySelector("[data-generate-selected]");
+    const selectedCount = promptSheet.querySelector("[data-selected-count]");
+    const selectedStatus = promptSheet.querySelector("[data-selected-status]");
+    const selectAll = promptSheet.querySelector("[data-select-all-beats]");
     let activeTarget = null;
     let activeDetail = null;
 
@@ -519,6 +523,7 @@ document.addEventListener("DOMContentLoaded", () => {
       setText("[data-detail-operation]", detail.operation || "—");
       setText("[data-detail-operation-instructions]", detail.operation_instructions || "—");
       setText("[data-detail-style]", detail.style_contract_version || "—");
+      setText("[data-detail-style-contract]", detail.style_contract_snapshot || "—");
       setText("[data-detail-qa-correction]", detail.qa_correction || "—");
       setText("[data-detail-final]", detail.final_provider_prompt || "NO IMAGE PROVIDER CALL");
       const transformations = promptDialog.querySelector("[data-detail-transformations]");
@@ -543,6 +548,9 @@ document.addEventListener("DOMContentLoaded", () => {
       setText("[data-detail-id]", detail.target_id || activeTarget?.id || "—");
       setText("[data-detail-narration]", detail.target_metadata?.narration || "—");
       setText("[data-detail-source]", detail.target_metadata?.source_asset || detail.target_metadata?.source_visual_id || "—");
+      setText("[data-detail-master]", detail.target_metadata?.master_scene_id || "—");
+      const time = detail.target_metadata?.time_range;
+      setText("[data-detail-time]", time ? `${Number(time.start).toFixed(1)}–${Number(time.end).toFixed(1)}s` : "—");
       setText("[data-detail-operation-detail]", detail.target_metadata?.operation_detail || "");
       renderKeyValues(promptDialog.querySelector("[data-detail-semantics]"), detail.semantic_requirement);
       renderHistory(detail.attempts || []);
@@ -558,6 +566,11 @@ document.addEventListener("DOMContentLoaded", () => {
       }
       if (providerSelect instanceof HTMLSelectElement) providerSelect.value = detail.provider || promptSheet.dataset.provider || "seedream";
       if (modelInput instanceof HTMLInputElement) modelInput.value = detail.model || promptSheet.dataset.model || "";
+      const accepted = promptDialog.querySelector("[data-accepted-candidate]");
+      const acceptedImage = promptDialog.querySelector("[data-detail-accepted-image]");
+      if (accepted instanceof HTMLElement) accepted.hidden = !detail.accepted_preview_url;
+      if (acceptedImage instanceof HTMLImageElement && detail.accepted_preview_url) acceptedImage.src = detail.accepted_preview_url;
+      setText("[data-detail-provider-status]", `${detail.provider || "—"}${detail.model ? ` / ${detail.model}` : ""}`);
     };
     const loadDetail = async () => {
       if (!activeTarget) return;
@@ -582,14 +595,64 @@ document.addEventListener("DOMContentLoaded", () => {
     };
     search?.addEventListener("input", updateRows);
     filter?.addEventListener("change", updateRows);
+    const openTarget = async (row) => {
+      if (!(row instanceof HTMLElement)) return;
+      activeTarget = {type: row.dataset.targetType || "", id: row.dataset.targetId || "", row};
+      promptDialog.showModal();
+      try { await loadDetail(); } catch (error) { if (feedback) feedback.textContent = error.message; }
+    };
     promptSheet.querySelectorAll("[data-inspect-prompt]").forEach((button) => {
-      button.addEventListener("click", async () => {
-        const row = button.closest("[data-prompt-row]");
-        if (!(row instanceof HTMLElement)) return;
-        activeTarget = {type: row.dataset.targetType || "", id: row.dataset.targetId || "", row};
-        promptDialog.showModal();
-        try { await loadDetail(); } catch (error) { if (feedback) feedback.textContent = error.message; }
+      button.addEventListener("click", () => openTarget(button.closest("[data-prompt-row]")));
+    });
+    promptSheet.querySelectorAll("[data-storyboard-target]").forEach((button) => {
+      button.addEventListener("click", () => {
+        const row = [...promptSheet.querySelectorAll("[data-prompt-row]")].find((candidate) => candidate.dataset.targetType === button.dataset.targetType && candidate.dataset.targetId === button.dataset.targetId);
+        openTarget(row);
       });
+    });
+    const updateSelected = () => {
+      const total = promptSheet.querySelectorAll("[data-select-beat]:checked").length;
+      if (selectedCount) selectedCount.textContent = String(total);
+      if (generateSelected instanceof HTMLButtonElement) generateSelected.disabled = total === 0;
+    };
+    promptSheet.querySelectorAll("[data-select-beat]").forEach((checkbox) => checkbox.addEventListener("change", updateSelected));
+    selectAll?.addEventListener("change", () => {
+      promptSheet.querySelectorAll("[data-prompt-row]").forEach((row) => {
+        const checkbox = row.querySelector("[data-select-beat]");
+        if (checkbox instanceof HTMLInputElement && !row.hidden) checkbox.checked = selectAll.checked;
+      });
+      updateSelected();
+    });
+    generateSelected?.addEventListener("click", async () => {
+      const beatIds = [...promptSheet.querySelectorAll("[data-select-beat]:checked")].map((item) => item.value);
+      if (!beatIds.length) return;
+      generateSelected.disabled = true;
+      if (selectedStatus) selectedStatus.textContent = "Starting selected visual generation…";
+      const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/visual-sheet/generate-selected`, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({beat_ids: beatIds}),
+      });
+      const payload = await response.json();
+      if (!response.ok) {
+        if (selectedStatus) selectedStatus.textContent = payload.detail || "Unable to generate selected visuals";
+        updateSelected();
+        return;
+      }
+      const poll = async () => {
+        const jobResponse = await fetch(`/api/jobs/${encodeURIComponent(payload.id)}`);
+        const job = await jobResponse.json();
+        if (selectedStatus) selectedStatus.textContent = `${job.message || job.current_stage || "Generating"} · ${job.progress || 0}%`;
+        if (["queued", "running"].includes(job.status)) {
+          window.setTimeout(poll, 1000);
+        } else if (job.status === "completed") {
+          window.location.reload();
+        } else {
+          if (selectedStatus) selectedStatus.textContent = job.error || `Generation ${job.status}`;
+          updateSelected();
+        }
+      };
+      window.setTimeout(poll, 500);
     });
     promptDialog.querySelector("[data-refresh-preview]")?.addEventListener("click", async () => {
       if (!activeTarget) return;
@@ -602,6 +665,45 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!response.ok) { if (feedback) feedback.textContent = payload.detail || "Preview failed"; return; }
       renderAssembly(payload, {full: false});
       if (feedback) feedback.textContent = "Exact preview refreshed.";
+    });
+    promptDialog.querySelector("[data-generate-video]")?.addEventListener("click", async (event) => {
+      if (!activeTarget || activeTarget.type !== "BEAT") {
+        if (feedback) feedback.textContent = "Video can only be generated for a visual beat.";
+        return;
+      }
+      const button = event.currentTarget;
+      if (button instanceof HTMLButtonElement) button.disabled = true;
+      if (feedback) feedback.textContent = "Submitting one paid video task and waiting on its persisted task ID…";
+      try {
+        const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}/visual-sheet/beats/${encodeURIComponent(activeTarget.id)}/generate-video`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({}),
+        });
+        const payload = await response.json();
+        if (!response.ok) {
+          const detail = payload.detail;
+          throw new Error(typeof detail === "object" ? `${detail.code}: ${detail.message}` : detail || "Video generation failed");
+        }
+        if (feedback) feedback.textContent = "Video task queued. The paid provider task ID will be persisted before polling.";
+        const poll = async () => {
+          const jobResponse = await fetch(`/api/jobs/${encodeURIComponent(payload.id)}`);
+          const job = await jobResponse.json();
+          if (["queued", "running"].includes(job.status)) {
+            if (feedback) feedback.textContent = job.message || "Waiting for the video provider…";
+            window.setTimeout(poll, 1000);
+          } else if (job.status === "completed") {
+            window.location.reload();
+          } else {
+            if (feedback) feedback.textContent = job.error || `Video generation ${job.status}`;
+            if (button instanceof HTMLButtonElement) button.disabled = false;
+          }
+        };
+        window.setTimeout(poll, 500);
+      } catch (error) {
+        if (feedback) feedback.textContent = error.message;
+        if (button instanceof HTMLButtonElement) button.disabled = false;
+      }
     });
     promptDialog.querySelector("[data-edit-override]")?.addEventListener("click", () => {
       if (overrideInput instanceof HTMLTextAreaElement) {

@@ -32,8 +32,14 @@ def render_timeline_entry(
     destination.parent.mkdir(parents=True, exist_ok=True)
     filter_graph = _entry_filter(config, frame_count, transform)
     command = [
-        "ffmpeg", "-y", "-loop", "1", "-framerate", str(config.fps),
-        "-i", str(source),
+        "ffmpeg",
+        "-y",
+        "-loop",
+        "1",
+        "-framerate",
+        str(config.fps),
+        "-i",
+        str(source),
     ]
     overlay_path: Path | None = None
     if overlay is not None:
@@ -42,7 +48,9 @@ def render_timeline_entry(
             build_overlay_svg(overlay, config, overlay_style or OverlayStyleConfig()),
             encoding="utf-8",
         )
-        command.extend(["-loop", "1", "-framerate", str(config.fps), "-i", str(overlay_path)])
+        command.extend(
+            ["-loop", "1", "-framerate", str(config.fps), "-i", str(overlay_path)]
+        )
         filter_graph += (
             f"[base];[1:v]format=rgba[annotation];[base][annotation]overlay=0:0:"
             f"enable='gte(t,{overlay.appear_offset:.6f})'[out]"
@@ -53,15 +61,25 @@ def render_timeline_entry(
         map_label = "[out]"
     command.extend(
         [
-            "-filter_complex", filter_graph,
-            "-map", map_label,
-            "-frames:v", str(frame_count),
-            "-r", str(config.fps),
-            "-an", "-c:v", config.video_codec,
-            "-crf", str(config.video_crf),
-            "-preset", config.video_preset,
-            "-pix_fmt", config.pixel_format,
-            "-movflags", "+faststart",
+            "-filter_complex",
+            filter_graph,
+            "-map",
+            map_label,
+            "-frames:v",
+            str(frame_count),
+            "-r",
+            str(config.fps),
+            "-an",
+            "-c:v",
+            config.video_codec,
+            "-crf",
+            str(config.video_crf),
+            "-preset",
+            config.video_preset,
+            "-pix_fmt",
+            config.pixel_format,
+            "-movflags",
+            "+faststart",
             str(destination),
         ]
     )
@@ -70,6 +88,72 @@ def render_timeline_entry(
     finally:
         if overlay_path is not None:
             overlay_path.unlink(missing_ok=True)
+    return str(destination)
+
+
+def render_video_timeline_entry(
+    video_path: str | Path,
+    output_path: str | Path,
+    *,
+    frame_count: int,
+    config: ProjectRenderConfig,
+    clip_start: float = 0.0,
+    clip_end: float | None = None,
+) -> str:
+    """Normalize a provider MP4 to an exact silent canonical timeline segment.
+
+    Long clips are trimmed. Short clips hold their last frame; motion is never
+    time-stretched. Provider audio is always discarded here.
+    """
+    source = Path(video_path)
+    if not source.is_file():
+        raise VideoRenderError(f"Timeline video does not exist: {source}")
+    if frame_count < 1 or clip_start < 0:
+        raise VideoRenderError("Timeline video bounds are invalid")
+    destination = Path(output_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    duration = frame_count / config.fps
+    width, height = config.width, config.height
+    if config.image_fit_mode is RenderImageFit.COVER:
+        fit = (
+            f"scale={width}:{height}:force_original_aspect_ratio=increase,"
+            f"crop={width}:{height}"
+        )
+    else:
+        color = config.background_color.lstrip("#")
+        fit = (
+            f"scale={width}:{height}:force_original_aspect_ratio=decrease,"
+            f"pad={width}:{height}:(ow-iw)/2:(oh-ih)/2:color=0x{color}"
+        )
+    command = ["ffmpeg", "-y", "-ss", f"{clip_start:.6f}"]
+    if clip_end is not None:
+        command.extend(["-t", f"{max(clip_end - clip_start, 0.001):.6f}"])
+    command.extend(["-i", str(source)])
+    command.extend(
+        [
+            "-vf",
+            (
+                f"{fit},setsar=1,fps={config.fps},"
+                f"tpad=stop_mode=clone:stop_duration={duration:.6f},"
+                f"trim=duration={duration:.9f},setpts=N/({config.fps}*TB)"
+            ),
+            "-frames:v",
+            str(frame_count),
+            "-an",
+            "-c:v",
+            config.video_codec,
+            "-crf",
+            str(config.video_crf),
+            "-preset",
+            config.video_preset,
+            "-pix_fmt",
+            config.pixel_format,
+            "-movflags",
+            "+faststart",
+            str(destination),
+        ]
+    )
+    _run_ffmpeg(command, "AI video timeline normalization")
     return str(destination)
 
 
@@ -86,15 +170,32 @@ def mux_narration(
     destination.parent.mkdir(parents=True, exist_ok=True)
     duration = frame_count / config.fps
     command = [
-        "ffmpeg", "-y", "-i", str(video_path), "-i", str(narration_path),
-        "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
-        "-af", (
+        "ffmpeg",
+        "-y",
+        "-i",
+        str(video_path),
+        "-i",
+        str(narration_path),
+        "-map",
+        "0:v:0",
+        "-map",
+        "1:a:0",
+        "-c:v",
+        "copy",
+        "-af",
+        (
             f"loudnorm=I={config.audio_loudness_lufs:g}:"
             f"TP={config.audio_true_peak_db:g}:LRA={config.audio_loudness_range:g}"
         ),
-        "-c:a", config.audio_codec, "-b:a", config.audio_bitrate,
-        "-t", f"{duration:.9f}",
-        "-movflags", "+faststart", str(destination),
+        "-c:a",
+        config.audio_codec,
+        "-b:a",
+        config.audio_bitrate,
+        "-t",
+        f"{duration:.9f}",
+        "-movflags",
+        "+faststart",
+        str(destination),
     ]
     _run_ffmpeg(command, "narration mux")
     return str(destination)
@@ -131,23 +232,25 @@ def build_overlay_svg(
     elif kind == "X_MARK":
         x, y = center
         size = min(width, height) * 0.08
-        shape = f'<path d="M{x-size},{y-size} L{x+size},{y+size} M{x+size},{y-size} L{x-size},{y+size}" {common}/>'
+        shape = f'<path d="M{x - size},{y - size} L{x + size},{y + size} M{x + size},{y - size} L{x - size},{y + size}" {common}/>'
     elif kind == "CIRCLE":
-        shape = f'<ellipse cx="{center[0]}" cy="{center[1]}" rx="{width*0.12}" ry="{height*0.1}" {common}/>'
+        shape = f'<ellipse cx="{center[0]}" cy="{center[1]}" rx="{width * 0.12}" ry="{height * 0.1}" {common}/>'
     elif kind == "HIGHLIGHT":
-        shape = f'<rect x="{center[0]-width*0.13}" y="{center[1]-height*0.09}" width="{width*0.26}" height="{height*0.18}" rx="12" fill="{style.fill_color}" fill-opacity="{style.opacity}" stroke="{stroke}" stroke-width="{style.stroke_width}"/>'
+        shape = f'<rect x="{center[0] - width * 0.13}" y="{center[1] - height * 0.09}" width="{width * 0.26}" height="{height * 0.18}" rx="12" fill="{style.fill_color}" fill-opacity="{style.opacity}" stroke="{stroke}" stroke-width="{style.stroke_width}"/>'
     else:
         label = html.escape(overlay.semantic_anchor[:60])
         x, y = center
-        box_width = min(width * 0.64, max(width * 0.18, len(label) * style.font_size * 0.58))
+        box_width = min(
+            width * 0.64, max(width * 0.18, len(label) * style.font_size * 0.58)
+        )
         shape = (
-            f'<rect x="{x-box_width/2}" y="{y-style.font_size}" width="{box_width}" height="{style.font_size*1.6}" rx="10" fill="#111111" fill-opacity="0.78"/>'
-            f'<text x="{x}" y="{y+style.font_size*0.18}" text-anchor="middle" fill="{style.text_color}" font-family="sans-serif" font-size="{style.font_size}">{label}</text>'
+            f'<rect x="{x - box_width / 2}" y="{y - style.font_size}" width="{box_width}" height="{style.font_size * 1.6}" rx="10" fill="#111111" fill-opacity="0.78"/>'
+            f'<text x="{x}" y="{y + style.font_size * 0.18}" text-anchor="middle" fill="{style.text_color}" font-family="sans-serif" font-size="{style.font_size}">{label}</text>'
         )
     return (
         f'<svg xmlns="http://www.w3.org/2000/svg" width="{width}" height="{height}" viewBox="0 0 {width} {height}">'
         f'<defs><marker id="arrow" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto"><path d="M0,0 L12,6 L0,12 z" fill="{stroke}"/></marker></defs>'
-        f'{shape}</svg>'
+        f"{shape}</svg>"
     )
 
 
@@ -167,7 +270,7 @@ def _entry_filter(
         denominator = max(frame_count - 1, 1)
         if transform.type.value == "CROP" and transform.crop is not None:
             left, top, right, bottom = transform.crop
-            chain += f",crop=iw*{right-left:.8f}:ih*{bottom-top:.8f}:iw*{left:.8f}:ih*{top:.8f},scale={width}:{height}"
+            chain += f",crop=iw*{right - left:.8f}:ih*{bottom - top:.8f}:iw*{left:.8f}:ih*{top:.8f},scale={width}:{height}"
         elif transform.type.value == "PAN":
             assert transform.from_point is not None and transform.to is not None
             scale = min(config.max_motion_scale, 1.08)
@@ -182,17 +285,24 @@ def _entry_filter(
             end = min(transform.end_scale or start, config.max_motion_scale)
             focus = transform.focus
             fx, fy = (focus.x, focus.y) if focus else (0.5, 0.5)
-            zoom = f"{start:.8f}+({end-start:.8f})*on/{denominator}"
+            zoom = f"{start:.8f}+({end - start:.8f})*on/{denominator}"
             x = f"(iw-iw/zoom)*{fx:.8f}"
             y = f"(ih-ih/zoom)*{fy:.8f}"
-            chain += f",zoompan=z='{zoom}':x='{x}':y='{y}':d=1:s={width}x{height}:fps={fps}"
+            chain += (
+                f",zoompan=z='{zoom}':x='{x}':y='{y}':d=1:s={width}x{height}:fps={fps}"
+            )
     return f"{chain},trim=end_frame={frame_count},setpts=N/({fps}*TB)"
 
 
-def _point(point: object, width: int, height: int, margin: float, fallback: tuple[float, float]) -> tuple[float, float]:
+def _point(
+    point: object, width: int, height: int, margin: float, fallback: tuple[float, float]
+) -> tuple[float, float]:
     x = getattr(point, "x", fallback[0]) if point is not None else fallback[0]
     y = getattr(point, "y", fallback[1]) if point is not None else fallback[1]
-    return (max(margin, min(width - margin, x * width)), max(margin, min(height - margin, y * height)))
+    return (
+        max(margin, min(width - margin, x * width)),
+        max(margin, min(height - margin, y * height)),
+    )
 
 
 def _run_ffmpeg(command: list[str], stage: str) -> None:

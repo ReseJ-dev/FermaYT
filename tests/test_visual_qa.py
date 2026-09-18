@@ -8,8 +8,12 @@ from pathlib import Path
 import pytest
 from pydantic import ValidationError
 
-from app.errors import VisualQAError
-from app.models.visual_qa import VisualQADecision, VisualQAResult
+from app.errors import StructuredAIProviderError, VisualQAError
+from app.models.visual_qa import (
+    VisualQADecision,
+    VisualQAProblemCategory,
+    VisualQAResult,
+)
 from app.pipeline.visual_qa import (
     VisualQAContext,
     VisualQAService,
@@ -17,6 +21,10 @@ from app.pipeline.visual_qa import (
     build_visual_qa_request,
     generate_with_visual_qa,
     is_hard_qa_failure,
+)
+from app.provider_diagnostics import (
+    StructuredAIProviderDiagnostic,
+    find_structured_ai_provider_diagnostic,
 )
 
 
@@ -86,6 +94,51 @@ def test_pass_with_warning_cannot_accept_a_hard_story_failure() -> None:
         )
 
 
+@pytest.mark.parametrize(
+    "category",
+    [
+        "STYLE_DETAIL_DRIFT",
+        "STYLE_SHADING_DRIFT",
+        "CHARACTER_IDENTITY_DRIFT",
+        "LOCATION_IDENTITY_DRIFT",
+        "UNWANTED_FRAME_OR_MARGIN",
+        "ENVIRONMENT_MISMATCH",
+    ],
+)
+def test_visual_unity_failures_are_hard_regeneration_categories(
+    category: str,
+) -> None:
+    decision = _regenerate(
+        [category],
+        "The candidate breaks the established visual continuity",
+        "Preserve the approved style and established identities",
+    )
+
+    assert is_hard_qa_failure(decision) is True
+
+
+def test_changed_recurring_character_clothing_cannot_pass_with_warning() -> None:
+    with pytest.raises(ValidationError, match="hard failures"):
+        VisualQADecision(
+            result="PASS_WITH_WARNING",
+            problem_categories=["CHARACTER_IDENTITY_DRIFT"],
+            reasons=["The recurring miner has completely different clothing"],
+            correction_instruction=None,
+            severity="minor",
+        )
+
+
+def test_qa_prompt_rejects_generated_frame_or_white_canvas_margin(
+    tmp_path: Path,
+) -> None:
+    prompt = build_visual_qa_request(_context(tmp_path))
+
+    assert VisualQAProblemCategory.UNWANTED_FRAME_OR_MARGIN.value in prompt
+    assert "large white external margin" in prompt
+    assert "fill the full 16:9 image edge-to-edge" in prompt
+    assert "previous frame from another location" in " ".join(prompt.lower().split())
+
+
 def test_qa_service_sends_candidate_style_and_master_in_fixed_order(
     tmp_path: Path,
 ) -> None:
@@ -123,6 +176,215 @@ def test_qa_service_sends_candidate_style_and_master_in_fixed_order(
     assert "CONTINUITY" in client.prompt
     assert "VIDEO READABILITY" in client.prompt
     assert "STYLE CONTRACT [rough_explainer_v1]" in client.prompt
+
+
+def test_qa_service_ignores_only_qwen_schema_definitions() -> None:
+    class Client:
+        async def evaluate(self, prompt: str, image_paths: tuple[str, ...]) -> str:
+            del prompt, image_paths
+            return json.dumps(
+                {
+                    "$defs": {"VisualQAResult": {"type": "string"}},
+                    "$schema": "https://json-schema.org/draft/2020-12/schema",
+                    "title": "VisualQADecision",
+                    "description": "Structured visual QA decision",
+                    "type": "object",
+                    "properties": {"result": {"type": "string"}},
+                    "required": ["result"],
+                    "additionalProperties": False,
+                    "result": "PASS",
+                    "problem_categories": [],
+                    "reasons": [],
+                    "correction_instruction": None,
+                }
+            )
+
+    decision = asyncio.run(
+        VisualQAService(Client()).evaluate(
+            "candidate.png",
+            VisualQAContext(
+                visual_purpose="Establish the tunnel",
+                what_viewer_should_understand="Miners are underground",
+                required_objects=(),
+                important_physical_action="No change",
+                location_id="tunnel",
+                expected_physical_state="Stable",
+            ),
+        )
+    )
+
+    assert decision.result is VisualQAResult.PASS
+
+
+def test_qa_service_preserves_safe_provider_diagnostic() -> None:
+    diagnostic = StructuredAIProviderDiagnostic(
+        provider="dashscope",
+        model="qwen-vl-max",
+        operation="visual_qa",
+        category="PLANNING_BAD_REQUEST",
+        attempt=1,
+        max_attempts=1,
+        http_status=400,
+    )
+
+    class Client:
+        async def evaluate(self, prompt: str, image_paths: tuple[str, ...]) -> str:
+            del prompt, image_paths
+            raise StructuredAIProviderError(
+                "request failed",
+                diagnostic=diagnostic,
+            )
+
+    with pytest.raises(VisualQAError) as raised:
+        asyncio.run(
+            VisualQAService(
+                Client(),
+                provider="dashscope",
+                model="qwen-vl-max",
+            ).evaluate(
+                "candidate.png",
+                VisualQAContext(
+                    visual_purpose="Establish the tunnel",
+                    what_viewer_should_understand="Miners are underground",
+                    required_objects=(),
+                    important_physical_action="No change",
+                    location_id="tunnel",
+                    expected_physical_state="Stable",
+                ),
+            )
+        )
+
+    assert find_structured_ai_provider_diagnostic(raised.value) == diagnostic
+
+
+def test_qa_service_still_rejects_unknown_decision_fields() -> None:
+    class Client:
+        async def evaluate(self, prompt: str, image_paths: tuple[str, ...]) -> str:
+            del prompt, image_paths
+            return json.dumps(
+                {
+                    "result": "PASS",
+                    "problem_categories": [],
+                    "reasons": [],
+                    "correction_instruction": None,
+                    "unexpected": True,
+                }
+            )
+
+    with pytest.raises(VisualQAError, match="invalid structured result"):
+        asyncio.run(
+            VisualQAService(Client()).evaluate(
+                "candidate.png",
+                VisualQAContext(
+                    visual_purpose="Establish the tunnel",
+                    what_viewer_should_understand="Miners are underground",
+                    required_objects=(),
+                    important_physical_action="No change",
+                    location_id="tunnel",
+                    expected_physical_state="Stable",
+                ),
+            )
+        )
+
+
+def test_qa_service_converts_contradictory_pass_with_hard_problem_to_regenerate() -> None:
+    class Client:
+        async def evaluate(self, prompt: str, image_paths: tuple[str, ...]) -> str:
+            del prompt, image_paths
+            return json.dumps(
+                {
+                    "result": "PASS",
+                    "problem_categories": ["MISSING_REQUIRED_OBJECT"],
+                    "reasons": ["The ventilation duct is missing"],
+                    "correction_instruction": None,
+                    "severity": None,
+                }
+            )
+
+    decision = asyncio.run(
+        VisualQAService(Client()).evaluate(
+            "candidate.png",
+            VisualQAContext(
+                visual_purpose="Establish the tunnel",
+                what_viewer_should_understand="Miners are underground",
+                required_objects=("ventilation duct",),
+                important_physical_action="No change",
+                location_id="tunnel",
+                expected_physical_state="Stable",
+            ),
+        )
+    )
+
+    assert decision.result is VisualQAResult.REGENERATE
+    assert decision.correction_instruction is not None
+    assert "ventilation duct is missing" in decision.correction_instruction
+
+
+def test_qa_service_converts_contradictory_minor_pass_to_warning() -> None:
+    class Client:
+        async def evaluate(self, prompt: str, image_paths: tuple[str, ...]) -> str:
+            del prompt, image_paths
+            return json.dumps(
+                {
+                    "result": "PASS",
+                    "problem_categories": ["STYLE_DRIFT_DETAIL"],
+                    "reasons": ["One background beam has slightly excessive detail"],
+                    "correction_instruction": None,
+                    "severity": "minor",
+                }
+            )
+
+    decision = asyncio.run(
+        VisualQAService(Client()).evaluate(
+            "candidate.png",
+            VisualQAContext(
+                visual_purpose="Establish the tunnel",
+                what_viewer_should_understand="Miners are underground",
+                required_objects=(),
+                important_physical_action="No change",
+                location_id="tunnel",
+                expected_physical_state="Stable",
+            ),
+        )
+    )
+
+    assert decision.result is VisualQAResult.PASS_WITH_WARNING
+    assert decision.severity is not None
+    assert decision.severity.value == "minor"
+
+
+def test_qa_service_accepts_positive_explanation_for_clean_pass() -> None:
+    class Client:
+        async def evaluate(self, prompt: str, image_paths: tuple[str, ...]) -> str:
+            del prompt, image_paths
+            return json.dumps(
+                {
+                    "result": "PASS",
+                    "problem_categories": [],
+                    "reasons": [
+                        "All required miners and tunnel equipment are present"
+                    ],
+                    "correction_instruction": None,
+                    "severity": None,
+                }
+            )
+
+    decision = asyncio.run(
+        VisualQAService(Client()).evaluate(
+            "candidate.png",
+            VisualQAContext(
+                visual_purpose="Establish the tunnel",
+                what_viewer_should_understand="Miners are underground",
+                required_objects=(),
+                important_physical_action="No change",
+                location_id="tunnel",
+                expected_physical_state="Stable",
+            ),
+        )
+    )
+
+    assert decision.result is VisualQAResult.PASS
+    assert decision.reasons == []
 
 
 def test_qa_compares_previous_frame_for_progression(tmp_path: Path) -> None:

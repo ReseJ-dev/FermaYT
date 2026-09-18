@@ -41,6 +41,7 @@ def build_production_pipeline_dependencies(
     *,
     projects_root: str | Path = "data/projects",
     require_tts: bool = True,
+    require_planning: bool = True,
 ) -> ProjectPipelineDependencies:
     project = get_project(session, project_id)
     if project is None:
@@ -52,18 +53,16 @@ def build_production_pipeline_dependencies(
     planning_max_tokens = _environment_int(
         "VISUAL_PLANNING_MAX_OUTPUT_TOKENS", 32_768, minimum=1
     )
-    planning_reasoning_effort = os.getenv(
-        "VISUAL_PLANNING_REASONING_EFFORT", "low"
-    ).strip().lower()
+    planning_reasoning_effort = (
+        os.getenv("VISUAL_PLANNING_REASONING_EFFORT", "low").strip().lower()
+    )
     if planning_reasoning_effort not in {"low", "high", "max"}:
-        raise ValueError(
-            "VISUAL_PLANNING_REASONING_EFFORT must be low, high, or max"
-        )
+        raise ValueError("VISUAL_PLANNING_REASONING_EFFORT must be low, high, or max")
     elevenlabs_timeout = _environment_float(
         "ELEVENLABS_TTS_TIMEOUT_SECONDS", 300.0, minimum=1.0
     )
     needs_dashscope = (
-        project.planning_provider == "dashscope"
+        (require_planning and project.planning_provider == "dashscope")
         or project.visual_qa_enabled
         or project.image_provider == "qwen"
         or (require_tts and project.tts_provider == "qwen")
@@ -98,8 +97,7 @@ def build_production_pipeline_dependencies(
             raise ValueError("Настройте Qwen Image endpoint в Settings")
     elif project.image_provider == "zimage":
         image_key = (
-            secret_store.get_secret(KIE_API_KEY)
-            or os.getenv("KIE_API_KEY", "").strip()
+            secret_store.get_secret(KIE_API_KEY) or os.getenv("KIE_API_KEY", "").strip()
         )
         if not image_key:
             raise ValueError("Добавьте KIE_API_KEY в Settings")
@@ -116,7 +114,9 @@ def build_production_pipeline_dependencies(
         else:
             raise ValueError("Выбран неизвестный TTS provider")
 
-    if project.planning_provider == "dashscope":
+    if not require_planning:
+        planning_client = None
+    elif project.planning_provider == "dashscope":
         assert dashscope_key is not None
         planning_client = DashScopeVisualPlanningClient(
             api_key=dashscope_key,
@@ -194,7 +194,9 @@ def build_production_pipeline_dependencies(
         visual_qa_service=qa_service,
         projects_root=projects_root,
         preflight_validator=lambda current: _validate_models(
-            current, require_tts=require_tts
+            current,
+            require_tts=require_tts,
+            require_planning=require_planning,
         ),
     )
 
@@ -240,11 +242,15 @@ def _kie_aspect_ratio(width: int, height: int) -> str:
     return "9:16" if height > width else "16:9"
 
 
-def _validate_models(project: Any, *, require_tts: bool = True) -> None:
-    required = {
-        "planning model": project.planning_model,
-        "image model": project.image_model,
-    }
+def _validate_models(
+    project: Any,
+    *,
+    require_tts: bool = True,
+    require_planning: bool = True,
+) -> None:
+    required = {"image model": project.image_model}
+    if require_planning:
+        required["planning model"] = project.planning_model
     if require_tts:
         required["TTS model"] = project.tts_model
     if project.visual_qa_enabled:

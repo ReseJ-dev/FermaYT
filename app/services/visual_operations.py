@@ -42,7 +42,7 @@ from app.services.visual_planning import require_current_project_visual_plan
 logger = logging.getLogger(__name__)
 
 ProviderResolver = Callable[[str, Mapping[str, Any] | None], ImageProvider]
-VISUAL_OPERATION_POLICY_VERSION = "visual_operation_policy_v2"
+VISUAL_OPERATION_POLICY_VERSION = "visual_operation_policy_v3"
 
 
 def resolve_project_visual_operations(
@@ -185,9 +185,7 @@ def resolve_project_visual_operations(
                 "resolved_operation": resolved_operation.value,
                 "fallback_used": fallback_from is not None,
                 "fallback_from": (
-                    fallback_from.value
-                    if fallback_from is not None
-                    else None
+                    fallback_from.value if fallback_from is not None else None
                 ),
                 "reason": reasons,
                 "source_visual_ids": source_visual_ids,

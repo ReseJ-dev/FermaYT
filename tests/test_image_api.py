@@ -233,6 +233,8 @@ Permanent style details.
     assert "falling rock and dust" in compact
     assert "Dust and small rocks fall" in compact
     assert "begins shedding debris" in compact
+    assert "miners in helmets" in compact
+    assert "Ceiling duct" in compact
     assert "canonical master style direction" not in compact
     assert "Do not depict photorealism" in compact
     assert compact != calm
@@ -258,6 +260,97 @@ STYLE CONTRACT [rough_explainer_v1]
 
     assert len(compact) <= 800
     assert "Falling rock above the tunnel exit" in compact
+
+
+def test_zimage_qa_compaction_preserves_semantic_repairs_not_duplicate_style() -> None:
+    correction = (
+        "Remove all text and speech bubbles. "
+        "Recreate the scene using the rough_explainer_v1 style: use thick uneven "
+        "black outlines, simple crude geometry, flat muted colors, minimal shading. "
+        "Include the ventilation duct overhead center, support timbers every 2m, "
+        "electrical conduit on the right wall, and equipment/cables on the left. "
+        "Show the miner protagonist wearing a helmet with a lamp and reflective gear, "
+        "and include at least two other miners. Ensure the tunnel extends clearly "
+        "toward camera-right with a vanishing point. Remove the security camera. "
+        "Remove all realism and gradients. "
+        "Avoid any text or labels."
+    )
+    prompt = f"""VISUAL FOCUS:
+Tunnel exit direction.
+CURRENT PHYSICAL STATE:
+Normal operations.
+Regenerate the illustration so that {correction} Preserve every correct visual element.
+STYLE CONTRACT [rough_explainer_v1]
+{"style " * 200}
+"""
+
+    compact = _fit_kie_zimage_prompt(prompt)
+
+    assert len(compact) <= 800
+    for required in (
+        "ventilation duct",
+        "support timbers",
+        "electrical conduit",
+        "helmet",
+        "reflective gear",
+        "other miners",
+        "camera-right",
+    ):
+        assert required in compact
+    assert compact.count("rough_explainer_v1") == 0
+    assert "speech bubble" not in compact.lower()
+    assert "text" not in compact.lower()
+    assert "explainer" not in compact.lower()
+    assert "security camera" not in compact.lower()
+    assert "..." not in compact
+
+
+def test_zimage_drops_inline_negative_object_without_losing_positive_repair() -> None:
+    prompt = f"""LOCATION CONTINUITY:
+Rough underground mine tunnel with structural supports.
+OBJECT CONTINUITY:
+Ventilation Duct appears as Large metal duct running overhead.; Electrical Conduit appears as Cables and junction boxes feeding ceiling lights.
+CURRENT PHYSICAL STATE:
+Systems active, ventilation airflow implied, lights on.
+Regenerate the illustration so that Show a large ventilation duct with bold airflow lines, visible wall conduit, and remove the security camera. Preserve every correct visual element.
+STYLE CONTRACT [rough_explainer_v1]
+{"style " * 200}
+"""
+
+    compact = _fit_kie_zimage_prompt(prompt)
+
+    assert len(compact) <= 800
+    assert "ventilation duct" in compact.lower()
+    assert "airflow lines" in compact.lower()
+    assert "wall conduit" in compact.lower()
+    assert "security camera" not in compact.lower()
+
+
+def test_zimage_semantic_compaction_preserves_character_identity_and_attributes() -> None:
+    prompt = f"""CHARACTER CONTINUITY:
+Miner Protagonist appears as The viewpoint miner in the side tunnel, seen from behind, wearing helmet with lamp and reflective gear.; Other Miners appears as Several fellow workers partially visible in wide shots.
+OBJECT CONTINUITY:
+Ventilation Duct appears as Large metal duct running overhead.; Support Timbers appears as Structural supports holding the ceiling.
+VISUAL FOCUS:
+The tunnel exit.
+CURRENT PHYSICAL STATE:
+Normal operations.
+STYLE CONTRACT [rough_explainer_v1]
+{"style " * 200}
+"""
+
+    compact = _fit_kie_zimage_prompt(prompt)
+
+    assert len(compact) <= 800
+    for required in (
+        "Miner Protagonist",
+        "helmet",
+        "reflective gear",
+        "Other Miners",
+        "Ventilation Duct",
+        "Support Timbers",
+    ):
+        assert required in compact
 
 
 def configure_qwen(

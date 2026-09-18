@@ -13,6 +13,7 @@ from app.clients.image_api import (
 from app.clients.tts_api import ElevenLabsTTSApiClient, QwenTTSApiClient
 from app.provider_capabilities import ImageProviderCapabilities
 from app.tts_capabilities import TTSProviderCapabilities
+from app.video_providers import VideoGenerationProvider
 
 
 @runtime_checkable
@@ -117,3 +118,25 @@ def get_tts_provider(
     if provider_name == "elevenlabs":
         return ElevenLabsTTSApiClient(**options)
     raise ValueError(f"Unknown TTS provider: {name}")
+
+
+def get_video_provider(
+    name: str,
+    config: Mapping[str, Any] | None = None,
+) -> VideoGenerationProvider:
+    """Create one provider-neutral asynchronous video adapter."""
+    from app.clients.video_api import (
+        SeedanceVideoProvider,
+        ViduVideoProvider,
+        WanVideoProvider,
+    )
+
+    options = dict(config or {})
+    provider_name = name.strip().lower()
+    if provider_name == "vidu":
+        return ViduVideoProvider(**options)
+    if provider_name == "wan":
+        return WanVideoProvider(**options)
+    if provider_name == "seedance":
+        return SeedanceVideoProvider(**options)
+    raise ValueError(f"Unknown video provider: {name}")

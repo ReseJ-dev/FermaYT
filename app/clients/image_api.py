@@ -5,6 +5,7 @@ import base64
 import json
 import mimetypes
 import os
+import re
 import time
 from pathlib import Path
 from typing import ClassVar, Protocol
@@ -215,9 +216,7 @@ class BytePlusImageApiClient:
         }
 
         try:
-            async with httpx.AsyncClient(
-                timeout=self.TIMEOUT_SECONDS
-            ) as client:
+            async with httpx.AsyncClient(timeout=self.TIMEOUT_SECONDS) as client:
                 response = await client.post(
                     self.endpoint,
                     headers=headers,
@@ -410,9 +409,7 @@ class QwenImageApiClient:
             ) from exc
 
         api_key = (
-            self.api_key
-            if self.api_key is not None
-            else os.getenv("DASHSCOPE_API_KEY")
+            self.api_key if self.api_key is not None else os.getenv("DASHSCOPE_API_KEY")
         )
         if not api_key or not api_key.strip():
             raise _diagnostic_error(
@@ -465,9 +462,7 @@ class QwenImageApiClient:
         }
 
         try:
-            async with httpx.AsyncClient(
-                timeout=self.TIMEOUT_SECONDS
-            ) as client:
+            async with httpx.AsyncClient(timeout=self.TIMEOUT_SECONDS) as client:
                 response = await client.post(
                     endpoint.strip(),
                     headers=headers,
@@ -821,7 +816,11 @@ class KieZImageApiClient:
             provider_error=(
                 f"Generation task {task_id} did not finish within "
                 f"{self.generation_timeout:g} seconds"
-                + (f"; last polling error: {last_poll_error}" if last_poll_error else "")
+                + (
+                    f"; last polling error: {last_poll_error}"
+                    if last_poll_error
+                    else ""
+                )
             ),
         )
 
@@ -916,7 +915,9 @@ def _fit_kie_zimage_prompt(prompt: str) -> str:
     compact = " ".join(prompt.split())
     if len(compact) <= maximum:
         return compact
-    style_marker = "Use this permanent drawing style throughout the entire illustration."
+    style_marker = (
+        "Use this permanent drawing style throughout the entire illustration."
+    )
     legacy_marker = "STYLE CONTRACT ["
     if style_marker in compact:
         dynamic = compact.split(style_marker, 1)[0].strip()
@@ -928,11 +929,10 @@ def _fit_kie_zimage_prompt(prompt: str) -> str:
         tail = maximum - len(separator) - head
         return f"{compact[:head].rstrip()}{separator}{compact[-tail:].lstrip()}"
     style = (
-        "Draw a rough amateur hand-drawn 2D explainer with thick uneven black "
-        "outlines, crude geometry, simple cartoon people with dot eyes, flat muted "
-        "colors, minimal shading, sparse backgrounds, and imperfect perspective. "
-        "Do not depict photorealism, realistic materials or anatomy, cinematic "
-        "light, polished art, 3D, depth of field, or gradients. Prefer simplicity."
+        "Rough handmade 2D cartoon: thick uneven outlines, crude geometry, dot-eyed "
+        "people, flat muted colors, sparse detail, minimal shading, imperfect "
+        "perspective. Do not depict photorealism, realistic materials or anatomy, "
+        "cinematic light, polished art, 3D depth, or gradients."
     )
     available = maximum - len(style) - 1
     semantic_sections = _extract_kie_semantic_sections(dynamic)
@@ -951,24 +951,33 @@ def _fit_kie_zimage_prompt(prompt: str) -> str:
         "Regenerate the illustration so that ",
         (" Preserve every correct visual element",),
     )
-    if semantic_sections:
-        labels_and_limits = (
-            ("{}", "VISUAL FOCUS", 115),
-            ("Depict {}.", "CURRENT PHYSICAL STATE", 85),
-            ("Show how {}.", "WHAT CHANGED", 90),
-            ("Frame the scene as {}.", "CURRENT CAMERA / COMPOSITION", 65),
-            ("Keep the setting recognizable as {}.", "LOCATION CONTINUITY", 65),
-            ("Exclude {}.", "DO NOT SHOW", 45),
-        )
-        parts = ["No visible text, labels, titles, watermarks, or UI."]
+    if qa_correction:
+        parts = [_KIE_PICTORIAL_SCENE_INSTRUCTION]
         if desired_scene:
-            parts.append(
-                f"Show {_truncate_at_word(desired_scene, 150).rstrip('.')} clearly."
-            )
-        if qa_correction:
-            parts.append(
-                f"Correct {_truncate_at_word(qa_correction, 115).rstrip('.')} while preserving correct elements."
-            )
+            parts.append(f"Show {_truncate_clean_at_word(desired_scene, 90)}.")
+        prefix = " ".join(parts)
+        correction_budget = max(120, available - len(prefix) - 2)
+        compact_correction = _compact_kie_qa_correction(
+            qa_correction,
+            correction_budget,
+        )
+        parts.append(
+            f"{_truncate_clean_at_word(compact_correction, correction_budget)}."
+        )
+        dynamic = " ".join(parts)
+    elif semantic_sections:
+        parts = [_KIE_PICTORIAL_SCENE_INSTRUCTION]
+        if desired_scene:
+            parts.append(f"Show {_truncate_clean_at_word(desired_scene, 90)}.")
+        labels_and_limits = (
+            ("Inside {}.", "LOCATION CONTINUITY", 55),
+            ("The scene contains {}.", "OBJECT CONTINUITY", 70),
+            ("People shown are {}.", "CHARACTER CONTINUITY", 105),
+            ("Visual focus is {}.", "VISUAL FOCUS", 50),
+            ("Visible change is {}.", "WHAT CHANGED", 45),
+            ("The situation is {}.", "CURRENT PHYSICAL STATE", 45),
+            ("Camera view is {}.", "CURRENT CAMERA / COMPOSITION", 40),
+        )
         parts.extend(
             template.format(_kie_semantic_excerpt(heading, section, limit))
             for template, heading, limit in labels_and_limits
@@ -976,7 +985,7 @@ def _fit_kie_zimage_prompt(prompt: str) -> str:
         )
         dynamic = " ".join(parts)
     elif desired_scene or qa_correction:
-        parts = ["No visible text, labels, titles, watermarks, or UI."]
+        parts = [_KIE_PICTORIAL_SCENE_INSTRUCTION]
         if desired_scene:
             parts.append(
                 f"Show {_truncate_at_word(desired_scene, 300).rstrip('.')} clearly."
@@ -987,9 +996,14 @@ def _fit_kie_zimage_prompt(prompt: str) -> str:
             )
         dynamic = " ".join(parts)
     if len(dynamic) > available:
-        dynamic = _truncate_at_word(dynamic, available)
+        dynamic = _truncate_clean_at_word(dynamic, available)
     fitted = f"{dynamic} {style}"
     return _truncate_at_word(fitted, maximum)
+
+
+_KIE_PICTORIAL_SCENE_INSTRUCTION = (
+    "Purely pictorial silent scene with clean unmarked surfaces."
+)
 
 
 def normalize_image_prompt_for_provider(
@@ -1003,7 +1017,11 @@ def normalize_image_prompt_for_provider(
     transformations: list[dict[str, object]] = []
     if normalized != prompt:
         transformations.append(
-            {"type": "TRIM", "before_length": len(prompt), "after_length": len(normalized)}
+            {
+                "type": "TRIM",
+                "before_length": len(prompt),
+                "after_length": len(normalized),
+            }
         )
     provider_id = provider.strip().lower()
     if provider_id == "zimage":
@@ -1075,11 +1093,122 @@ def _extract_kie_semantic_sections(dynamic_prompt: str) -> dict[str, str]:
 
 
 def _kie_semantic_excerpt(heading: str, value: str, maximum: int) -> str:
+    if heading == "LOCATION CONTINUITY":
+        value = value.removeprefix(
+            "Use the same recurring environment. Preserve this geometry."
+        ).strip()
     if heading == "VISUAL FOCUS" and "First notice:" in value:
         before, first_notice = value.split("First notice:", 1)
         value = f"{first_notice.strip()} {before.strip()}"
+    if heading in {"CHARACTER CONTINUITY", "OBJECT CONTINUITY"}:
+        items = [item.strip() for item in value.split(";") if item.strip()]
+        if items:
+            explicit_entities = [item for item in items if " appears as " in item]
+            if explicit_entities:
+                items = explicit_entities
+            per_item = max(18, (maximum - 2 * (len(items) - 1)) // len(items))
+            value = "; ".join(
+                _compact_kie_entity_item(item, per_item) for item in items
+            )
+    if heading == "CURRENT CAMERA / COMPOSITION" and "camera-right" in value.lower():
+        value = f"toward camera-right; {value}"
+    if heading == "CURRENT PHYSICAL STATE" and "overhead lights" in value.lower():
+        clauses = [item.strip() for item in value.split(".") if item.strip()]
+        lights = [item for item in clauses if "overhead lights" in item.lower()]
+        others = [item for item in clauses if "overhead lights" not in item.lower()]
+        value = "; ".join(lights + others)
+    if heading == "CURRENT PHYSICAL STATE" and re.search(
+        r"ventilation airflow implied",
+        value,
+        flags=re.IGNORECASE,
+    ):
+        value = "Duct airflow lines; systems active"
     value = value.replace(":", ",")
-    return _truncate_at_word(value, maximum)
+    return _truncate_clean_at_word(value, maximum)
+
+
+def _compact_kie_qa_correction(value: str, maximum: int) -> str:
+    """Keep every semantic repair area without priming Z-Image with rejected UI."""
+    sentences = [
+        item.strip().rstrip(".!?")
+        for item in re.split(r"(?<=[.!?])\s+", value.strip())
+        if item.strip()
+    ]
+    semantic = []
+    for item in sentences:
+        item = _without_kie_negative_object_clause(item)
+        if item and not _is_kie_duplicate_or_typography_correction(item):
+            semantic.append(item)
+    if not semantic:
+        return "Preserve the required people, objects, physical state, and camera view"
+    separator_length = 2 * (len(semantic) - 1)
+    budgets = _allocate_kie_clause_budgets(semantic, maximum - separator_length)
+    return "; ".join(
+        _truncate_clean_at_word(sentence, budget)
+        for sentence, budget in zip(semantic, budgets, strict=True)
+    )
+
+
+def _allocate_kie_clause_budgets(clauses: list[str], available: int) -> list[int]:
+    """Allocate space by clause size so one verbose repair cannot erase later ones."""
+    if not clauses:
+        return []
+    minimum = min(20, max(1, available // len(clauses)))
+    budgets = [minimum] * len(clauses)
+    remaining = max(0, available - minimum * len(clauses))
+    weights = [max(1, len(clause) - minimum) for clause in clauses]
+    total_weight = sum(weights)
+    additions = [remaining * weight // total_weight for weight in weights]
+    for index, addition in enumerate(additions):
+        budgets[index] += addition
+    leftover = available - sum(budgets)
+    for index in sorted(
+        range(len(clauses)),
+        key=lambda item: (remaining * weights[item]) % total_weight,
+        reverse=True,
+    )[:leftover]:
+        budgets[index] += 1
+    return budgets
+
+
+def _is_kie_duplicate_or_typography_correction(value: str) -> bool:
+    lowered = value.lower()
+    typography_terms = (
+        "text",
+        "speech bubble",
+        "caption",
+        "label",
+        "watermark",
+        "ui element",
+    )
+    style_terms = (
+        "rough_explainer",
+        "thick uneven",
+        "flat muted",
+        "minimal shading",
+        "crude geometry",
+        "remove all realism",
+        "avoid any realism",
+        "avoid realism",
+        "gradients",
+        "cinematic effects",
+    )
+    return any(term in lowered for term in typography_terms + style_terms)
+
+
+def _without_kie_negative_object_clause(value: str) -> str:
+    """Avoid naming an unwanted object in a positive-only image prompt."""
+    lowered = value.lstrip().lower()
+    if lowered.startswith(
+        ("remove ", "exclude ", "avoid ", "do not ", "without ", "no ")
+    ):
+        return ""
+    return re.sub(
+        r"(?:,\s*|\s+and\s+)(?:remove|exclude|avoid|do not|without|no)\b.*$",
+        "",
+        value,
+        flags=re.IGNORECASE,
+    ).rstrip(" ,.;:")
 
 
 def _extract_kie_instruction(
@@ -1101,6 +1230,45 @@ def _truncate_at_word(value: str, maximum: int) -> str:
         return value
     shortened = value[: max(1, maximum - 3)].rsplit(" ", 1)[0].rstrip(" ,.;:")
     return f"{shortened or value[: maximum - 3]}..."
+
+
+def _truncate_clean_at_word(value: str, maximum: int) -> str:
+    """Shorten prose without ellipses that can look like image callout copy."""
+    if len(value) <= maximum:
+        return value.rstrip(" ,.;:")
+    shortened = value[:maximum].rsplit(" ", 1)[0].rstrip(" ,.;:")
+    return shortened or value[:maximum].rstrip(" ,.;:")
+
+
+def _compact_kie_entity_item(value: str, maximum: int) -> str:
+    if " appears as " not in value:
+        return _truncate_clean_at_word(value, maximum)
+    entity, description = value.split(" appears as ", 1)
+    lowered = description.lower()
+    if "wearing " in lowered:
+        wearing_at = lowered.index("wearing ")
+        description = description[wearing_at:]
+    elif "partially visible" in lowered:
+        visible_at = lowered.index("partially visible")
+        description = description[visible_at:]
+        description = description.split(",", 1)[0]
+    description = description.replace("helmet with lamp", "lamp helmet")
+    description = description.replace("running overhead", "overhead")
+    description = description.replace(
+        "wearing lamp helmet and reflective gear",
+        "in lamp helmet, reflective gear",
+    )
+    if "duct" in entity.lower() and "overhead" in description.lower():
+        description = "overhead"
+    if "conduit" in entity.lower() or "electrical" in entity.lower():
+        return _truncate_clean_at_word(
+            f"{entity} to lamps",
+            maximum,
+        )
+    if maximum <= len(entity) + 8:
+        return _truncate_clean_at_word(entity, maximum)
+    natural = f"{entity} {description}"
+    return _truncate_clean_at_word(natural, maximum)
 
 
 SeedreamImageProvider = BytePlusImageApiClient

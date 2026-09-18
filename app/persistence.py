@@ -85,9 +85,15 @@ class Project(Base):
             "planning_budget_amount IS NULL OR planning_budget_amount > 0",
             name="ck_projects_planning_budget_amount",
         ),
-        CheckConstraint("planning_max_paid_requests > 0", name="ck_projects_planning_paid"),
-        CheckConstraint("planning_max_input_tokens > 0", name="ck_projects_planning_input"),
-        CheckConstraint("planning_max_output_tokens > 0", name="ck_projects_planning_output"),
+        CheckConstraint(
+            "planning_max_paid_requests > 0", name="ck_projects_planning_paid"
+        ),
+        CheckConstraint(
+            "planning_max_input_tokens > 0", name="ck_projects_planning_input"
+        ),
+        CheckConstraint(
+            "planning_max_output_tokens > 0", name="ck_projects_planning_output"
+        ),
         CheckConstraint(
             "planning_max_total_estimated_tokens > 0",
             name="ck_projects_planning_total_tokens",
@@ -152,6 +158,20 @@ class Project(Base):
 
     image_provider: Mapped[str] = mapped_column(String(50), nullable=False)
     image_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    video_generation_mode: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="OFF"
+    )
+    video_provider: Mapped[str] = mapped_column(
+        String(50), nullable=False, default="vidu"
+    )
+    video_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    video_resolution: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="720p"
+    )
+    video_clip_duration: Mapped[int] = mapped_column(Integer, nullable=False, default=5)
+    video_budget_amount: Mapped[float | None] = mapped_column(
+        Numeric(18, 8), nullable=True, default=None
+    )
     tts_provider: Mapped[str] = mapped_column(String(50), nullable=False)
     tts_model: Mapped[str | None] = mapped_column(String(255), nullable=True)
     tts_voice: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -277,6 +297,16 @@ class Project(Base):
             order_by="MasterSceneGenerationAttempt.created_at",
         )
     )
+    video_generation_attempts: Mapped[list[VideoGenerationAttempt]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="VideoGenerationAttempt.created_at",
+    )
+    generated_video_assets: Mapped[list[GeneratedVideoAsset]] = relationship(
+        back_populates="project",
+        cascade="all, delete-orphan",
+        order_by="GeneratedVideoAsset.created_at",
+    )
 
     @validates("story_text")
     def validate_story_text(self, key: str, value: str) -> str:
@@ -312,7 +342,9 @@ class Project(Base):
     @validates("planning_provider", "visual_qa_provider")
     def validate_structured_provider(self, key: str, value: str) -> str:
         normalized = value.strip().lower()
-        supported = {"dashscope", "kimi"} if key == "planning_provider" else {"dashscope"}
+        supported = (
+            {"dashscope", "kimi"} if key == "planning_provider" else {"dashscope"}
+        )
         if normalized not in supported:
             raise ValueError("unsupported structured AI provider")
         return normalized
@@ -331,6 +363,46 @@ class Project(Base):
         del key
         if value is not None and value <= 0:
             raise ValueError("generation_budget_amount must be positive")
+        return value
+
+    @validates("video_generation_mode")
+    def validate_video_generation_mode(self, key: str, value: str) -> str:
+        del key
+        normalized = value.strip().upper()
+        if normalized not in {"OFF", "MANUAL", "AUTO_LATER"}:
+            raise ValueError("unsupported video generation mode")
+        return normalized
+
+    @validates("video_provider")
+    def validate_video_provider(self, key: str, value: str) -> str:
+        del key
+        normalized = value.strip().lower()
+        if normalized not in {"vidu", "wan", "seedance"}:
+            raise ValueError("unsupported video provider")
+        return normalized
+
+    @validates("video_resolution")
+    def validate_video_resolution(self, key: str, value: str) -> str:
+        del key
+        normalized = value.strip()
+        if normalized.casefold() not in {"480p", "540p", "720p", "1080p"}:
+            raise ValueError("unsupported video resolution")
+        return normalized
+
+    @validates("video_clip_duration")
+    def validate_video_clip_duration(self, key: str, value: int) -> int:
+        del key
+        if not 1 <= value <= 30:
+            raise ValueError("video clip duration must be between 1 and 30 seconds")
+        return value
+
+    @validates("video_budget_amount")
+    def validate_video_budget_amount(
+        self, key: str, value: float | None
+    ) -> float | None:
+        del key
+        if value is not None and value <= 0:
+            raise ValueError("video budget amount must be positive")
         return value
 
     @validates("planning_budget_amount")
@@ -611,9 +683,7 @@ class ProjectVisualExecutionPlan(Base):
         nullable=False,
     )
 
-    project: Mapped[Project] = relationship(
-        back_populates="visual_execution_plans"
-    )
+    project: Mapped[Project] = relationship(back_populates="visual_execution_plans")
     visual_plan: Mapped[ProjectVisualPlan] = relationship(
         back_populates="execution_plans"
     )
@@ -861,9 +931,7 @@ class BeatVisualQAEvaluation(Base):
         nullable=False,
     )
 
-    candidate: Mapped[BeatVisualResult] = relationship(
-        back_populates="qa_evaluations"
-    )
+    candidate: Mapped[BeatVisualResult] = relationship(back_populates="qa_evaluations")
 
 
 class ProjectNarrationAsset(Base):
@@ -878,7 +946,9 @@ class ProjectNarrationAsset(Base):
         CheckConstraint("duration > 0", name="ck_project_narration_duration"),
     )
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_generate_uuid
+    )
     project_id: Mapped[str] = mapped_column(
         ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -896,7 +966,9 @@ class ProjectNarrationAsset(Base):
     timing_granularity: Mapped[str] = mapped_column(String(32), nullable=False)
     timing_confidence: Mapped[float] = mapped_column(Float, nullable=False)
     timing_data: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False)
-    timing_warnings: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    timing_warnings: Mapped[list[str]] = mapped_column(
+        JSON, nullable=False, default=list
+    )
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), default=_utc_now, nullable=False
     )
@@ -921,7 +993,9 @@ class ProjectNarrationAlignment(Base):
         ),
     )
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_generate_uuid
+    )
     project_id: Mapped[str] = mapped_column(
         ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -949,9 +1023,7 @@ class ProjectNarrationAlignment(Base):
         cascade="all, delete-orphan",
         order_by="VisualBeatTiming.position",
     )
-    timelines: Mapped[list[ProjectTimeline]] = relationship(
-        back_populates="alignment"
-    )
+    timelines: Mapped[list[ProjectTimeline]] = relationship(back_populates="alignment")
 
 
 class VisualBeatTiming(Base):
@@ -975,7 +1047,9 @@ class VisualBeatTiming(Base):
         ),
     )
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_generate_uuid
+    )
     alignment_id: Mapped[str] = mapped_column(
         ForeignKey("project_narration_alignments.id", ondelete="CASCADE"),
         nullable=False,
@@ -1009,7 +1083,9 @@ class ProjectTimeline(Base):
         CheckConstraint("duration > 0", name="ck_project_timeline_duration"),
     )
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_generate_uuid
+    )
     project_id: Mapped[str] = mapped_column(
         ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -1026,7 +1102,8 @@ class ProjectTimeline(Base):
         ForeignKey("project_narration_assets.id", ondelete="CASCADE"), nullable=False
     )
     alignment_id: Mapped[str] = mapped_column(
-        ForeignKey("project_narration_alignments.id", ondelete="CASCADE"), nullable=False
+        ForeignKey("project_narration_alignments.id", ondelete="CASCADE"),
+        nullable=False,
     )
     rhythm_version: Mapped[str] = mapped_column(String(64), nullable=False)
     generation_scope_type: Mapped[str] = mapped_column(
@@ -1061,19 +1138,29 @@ class TimelineEntry(Base):
     __tablename__ = "timeline_entries"
     __table_args__ = (
         UniqueConstraint("timeline_id", "beat_id", name="uq_timeline_entries_beat"),
-        UniqueConstraint("timeline_id", "position", name="uq_timeline_entries_position"),
+        UniqueConstraint(
+            "timeline_id", "position", name="uq_timeline_entries_position"
+        ),
         CheckConstraint("start_time >= 0", name="ck_timeline_entry_start"),
         CheckConstraint("end_time > start_time", name="ck_timeline_entry_range"),
     )
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_generate_uuid
+    )
     timeline_id: Mapped[str] = mapped_column(
-        ForeignKey("project_timelines.id", ondelete="CASCADE"), nullable=False, index=True
+        ForeignKey("project_timelines.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     position: Mapped[int] = mapped_column(Integer, nullable=False)
     beat_id: Mapped[str] = mapped_column(String(255), nullable=False)
     beat_visual_result_id: Mapped[str | None] = mapped_column(
         ForeignKey("beat_visual_results.id", ondelete="SET NULL"), nullable=True
+    )
+    asset_type: Mapped[str] = mapped_column(String(16), nullable=False, default="STILL")
+    video_asset_id: Mapped[str | None] = mapped_column(
+        ForeignKey("generated_video_assets.id", ondelete="SET NULL"), nullable=True
     )
     operation: Mapped[str] = mapped_column(String(32), nullable=False)
     asset_path: Mapped[str] = mapped_column(Text, nullable=False)
@@ -1081,14 +1168,147 @@ class TimelineEntry(Base):
     master_scene_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     start_time: Mapped[float] = mapped_column(Float, nullable=False)
     end_time: Mapped[float] = mapped_column(Float, nullable=False)
-    transform_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    transform_metadata: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True
+    )
     overlay_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
-    transition_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    transition_metadata: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True
+    )
+    clip_start: Mapped[float | None] = mapped_column(Float, nullable=True)
+    clip_end: Mapped[float | None] = mapped_column(Float, nullable=True)
+    mute_audio: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    fit_metadata: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         UTCDateTime(), default=_utc_now, nullable=False
     )
 
     timeline: Mapped[ProjectTimeline] = relationship(back_populates="entries")
+
+
+class VideoGenerationAttempt(Base):
+    """Durable paid-submission boundary for one asynchronous remote video task."""
+
+    __tablename__ = "video_generation_attempts"
+    __table_args__ = (
+        UniqueConstraint("request_hash", name="uq_video_generation_request_hash"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_generate_uuid
+    )
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    job_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    beat_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    accepted_image_result_id: Mapped[str | None] = mapped_column(
+        ForeignKey("beat_visual_results.id", ondelete="SET NULL"), nullable=True
+    )
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    model: Mapped[str] = mapped_column(String(255), nullable=False)
+    operation: Mapped[str] = mapped_column(String(50), nullable=False)
+    capability_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
+    request_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    prompt: Mapped[str] = mapped_column(Text, nullable=False)
+    reference_snapshot: Mapped[list[dict[str, Any]]] = mapped_column(
+        JSON, nullable=False
+    )
+    source_image_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    source_video_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    requested_duration: Mapped[int] = mapped_column(Integer, nullable=False)
+    requested_resolution: Mapped[str] = mapped_column(String(20), nullable=False)
+    requested_aspect_ratio: Mapped[str] = mapped_column(String(20), nullable=False)
+    status: Mapped[str] = mapped_column(
+        String(40), nullable=False, default="PENDING_SUBMISSION", index=True
+    )
+    remote_task_id: Mapped[str | None] = mapped_column(
+        String(255), nullable=True, index=True
+    )
+    submission_started_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+    submitted_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    last_polled_at: Mapped[datetime | None] = mapped_column(
+        UTCDateTime(), nullable=True
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(UTCDateTime(), nullable=True)
+    output_path: Mapped[str | None] = mapped_column(Text, nullable=True)
+    output_sha256: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    duration: Mapped[float | None] = mapped_column(Float, nullable=True)
+    width: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    height: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    fps: Mapped[float | None] = mapped_column(Float, nullable=True)
+    codec: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    provider_has_audio: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
+    remote_result_url: Mapped[str | None] = mapped_column(Text, nullable=True)
+    provider_metadata: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True
+    )
+    usage_snapshot: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    estimated_cost: Mapped[float | None] = mapped_column(Numeric(18, 8), nullable=True)
+    actual_cost: Mapped[float | None] = mapped_column(Numeric(18, 8), nullable=True)
+    cost_certainty: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="ESTIMATED"
+    )
+    currency: Mapped[str | None] = mapped_column(String(3), nullable=True)
+    error_code: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utc_now, nullable=False
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utc_now, onupdate=_utc_now, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="video_generation_attempts")
+    asset: Mapped[GeneratedVideoAsset | None] = relationship(
+        back_populates="attempt", uselist=False
+    )
+
+
+class GeneratedVideoAsset(Base):
+    """Immutable local validated MP4; remote URLs are never render authority."""
+
+    __tablename__ = "generated_video_assets"
+    __table_args__ = (
+        UniqueConstraint("attempt_id", name="uq_generated_video_asset_attempt"),
+    )
+
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_generate_uuid
+    )
+    project_id: Mapped[str] = mapped_column(
+        ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    attempt_id: Mapped[str] = mapped_column(
+        ForeignKey("video_generation_attempts.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    beat_id: Mapped[str | None] = mapped_column(String(255), nullable=True, index=True)
+    provider: Mapped[str] = mapped_column(String(50), nullable=False)
+    model: Mapped[str] = mapped_column(String(255), nullable=False)
+    operation: Mapped[str] = mapped_column(String(50), nullable=False)
+    file_path: Mapped[str] = mapped_column(Text, nullable=False)
+    file_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    duration: Mapped[float] = mapped_column(Float, nullable=False)
+    width: Mapped[int] = mapped_column(Integer, nullable=False)
+    height: Mapped[int] = mapped_column(Integer, nullable=False)
+    fps: Mapped[float] = mapped_column(Float, nullable=False)
+    codec: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    provider_has_audio: Mapped[bool] = mapped_column(Boolean, nullable=False)
+    mute_audio_default: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=True
+    )
+    source_lineage: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        UTCDateTime(), default=_utc_now, nullable=False
+    )
+
+    project: Mapped[Project] = relationship(back_populates="generated_video_assets")
+    attempt: Mapped[VideoGenerationAttempt] = relationship(back_populates="asset")
 
 
 class ProjectVideoRender(Base):
@@ -1102,12 +1322,16 @@ class ProjectVideoRender(Base):
         CheckConstraint("attempt >= 1", name="ck_project_video_render_attempt"),
     )
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_generate_uuid
+    )
     project_id: Mapped[str] = mapped_column(
         ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
     )
     timeline_id: Mapped[str] = mapped_column(
-        ForeignKey("project_timelines.id", ondelete="CASCADE"), nullable=False, index=True
+        ForeignKey("project_timelines.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
     )
     timeline_revision: Mapped[str] = mapped_column(String(64), nullable=False)
     render_config_version: Mapped[str] = mapped_column(String(64), nullable=False)
@@ -1212,22 +1436,20 @@ class VisualPromptOverride(Base):
         ),
     )
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_generate_uuid
+    )
     project_id: Mapped[str] = mapped_column(
         ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
     )
-    visual_plan_id: Mapped[str] = mapped_column(
-        String(36), nullable=False, index=True
-    )
+    visual_plan_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     visual_plan_revision: Mapped[str] = mapped_column(
         String(64), nullable=False, index=True
     )
     target_type: Mapped[str] = mapped_column(String(20), nullable=False)
     target_id: Mapped[str] = mapped_column(String(255), nullable=False)
     scene_prompt_override: Mapped[str] = mapped_column(Text, nullable=False)
-    base_semantic_fingerprint: Mapped[str] = mapped_column(
-        String(64), nullable=False
-    )
+    base_semantic_fingerprint: Mapped[str] = mapped_column(String(64), nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
     created_at: Mapped[datetime] = mapped_column(
@@ -1245,7 +1467,9 @@ class MasterSceneGenerationAttempt(Base):
 
     __tablename__ = "master_scene_generation_attempts"
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_generate_uuid
+    )
     project_id: Mapped[str] = mapped_column(
         ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -1253,7 +1477,9 @@ class MasterSceneGenerationAttempt(Base):
     visual_plan_revision: Mapped[str] = mapped_column(
         String(64), nullable=False, index=True
     )
-    master_scene_id: Mapped[str] = mapped_column(String(255), nullable=False, index=True)
+    master_scene_id: Mapped[str] = mapped_column(
+        String(255), nullable=False, index=True
+    )
     attempt: Mapped[int] = mapped_column(Integer, nullable=False)
     prompt_assembly_snapshot: Mapped[dict[str, Any]] = mapped_column(
         JSON, nullable=False
@@ -1316,13 +1542,19 @@ class ProviderPricing(Base):
     __tablename__ = "provider_pricing"
     __table_args__ = (
         UniqueConstraint(
-            "provider", "model", "operation", "pricing_unit", "version",
+            "provider",
+            "model",
+            "operation",
+            "pricing_unit",
+            "version",
             name="uq_provider_pricing_version",
         ),
         CheckConstraint("price >= 0", name="ck_provider_pricing_non_negative"),
     )
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_generate_uuid
+    )
     provider: Mapped[str] = mapped_column(String(100), nullable=False, index=True)
     model: Mapped[str] = mapped_column(String(255), nullable=False)
     operation: Mapped[str] = mapped_column(String(100), nullable=False)
@@ -1342,14 +1574,18 @@ class ProviderUsageRecord(Base):
     __tablename__ = "provider_usage_records"
     __table_args__ = (
         UniqueConstraint(
-            "job_id", "pipeline_stage", "request_revision",
+            "job_id",
+            "pipeline_stage",
+            "request_revision",
             name="uq_provider_usage_request",
         ),
         CheckConstraint("input_units >= 0", name="ck_provider_usage_input_units"),
         CheckConstraint("output_units >= 0", name="ck_provider_usage_output_units"),
     )
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_generate_uuid
+    )
     project_id: Mapped[str] = mapped_column(
         ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -1394,7 +1630,9 @@ class PlanningProviderAttempt(Base):
         ),
     )
 
-    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_generate_uuid)
+    id: Mapped[str] = mapped_column(
+        String(36), primary_key=True, default=_generate_uuid
+    )
     project_id: Mapped[str] = mapped_column(
         ForeignKey("projects.id", ondelete="CASCADE"), nullable=False, index=True
     )
@@ -1421,15 +1659,11 @@ class PlanningProviderAttempt(Base):
     progress_state: Mapped[str] = mapped_column(
         String(40), nullable=False, default="WAITING_FOR_PROVIDER"
     )
-    validation_category: Mapped[str | None] = mapped_column(
-        String(100), nullable=True
-    )
+    validation_category: Mapped[str | None] = mapped_column(String(100), nullable=True)
     remote_execution_status: Mapped[str | None] = mapped_column(
         String(64), nullable=True
     )
-    provider_request_id: Mapped[str | None] = mapped_column(
-        String(255), nullable=True
-    )
+    provider_request_id: Mapped[str | None] = mapped_column(String(255), nullable=True)
     input_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     output_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     total_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
@@ -1471,7 +1705,9 @@ def _prevent_style_reference_update(
 
 @event.listens_for(ProviderPricing, "before_update")
 @event.listens_for(ProviderPricing, "before_delete")
-def _prevent_pricing_mutation(mapper: object, connection: object, target: object) -> None:
+def _prevent_pricing_mutation(
+    mapper: object, connection: object, target: object
+) -> None:
     del mapper, connection, target
     raise ValueError("Provider pricing versions are immutable")
 

@@ -1,6 +1,7 @@
 """Integration tests for the local project and scene web interface."""
 
 import asyncio
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -1087,12 +1088,16 @@ def test_prompt_sheet_dynamically_separates_masters_beats_and_free_operations(
     sheet = client.get(f"/api/projects/{project_id}/prompt-sheet")
 
     assert page.status_code == 200
-    assert page.text.index("MASTER SCENES") < page.text.index("BEAT VISUALS")
+    assert page.text.index("MASTER SCENES") < page.text.index("ALL VISUAL BEATS")
     assert 'data-target-id="shaft_master"' in page.text
     assert 'data-target-id="beat_1"' in page.text
     assert 'data-target-id="beat_8"' in page.text
     assert "data-prompt-search" in page.text
     assert "data-prompt-filter" in page.text
+    assert "data-generate-selected" in page.text
+    assert "STORYBOARD" in page.text
+    assert page.text.index("MASTER SCENES") < page.text.index("ALL VISUAL BEATS")
+    assert page.text.index("ALL VISUAL BEATS") < page.text.index("STORYBOARD")
     rows = sheet.json()["targets"]
     by_id = {row["target_id"]: row for row in rows}
     assert by_id["beat_2"]["prompt_mode"] == "NO_PROVIDER_CALL"
@@ -1101,6 +1106,51 @@ def test_prompt_sheet_dynamically_separates_masters_beats_and_free_operations(
     reuse = client.get(f"/api/projects/{project_id}/prompts/BEAT/beat_7").json()
     assert reuse["final_provider_prompt"] is None
     assert reuse["target_metadata"]["source_visual_id"] == "beat_6"
+
+
+def test_visual_sheet_generate_selected_uses_stable_ids_in_story_order(
+    web_app: tuple,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, session_factory, _ = web_app
+    project_id = _create_project(client)
+    plan = VisualPlan.model_validate(_plan_payload())
+    _save_prompt_sheet_plan(session_factory, project_id, plan)
+    captured: list[tuple[str, ...]] = []
+
+    monkeypatch.setattr(
+        main_module,
+        "build_production_pipeline_dependencies",
+        lambda *args, **kwargs: SimpleNamespace(),
+    )
+    monkeypatch.setattr(
+        main_module,
+        "_run_selected_visuals_worker",
+        lambda job_id, selected_project_id, beat_ids, dependencies: captured.append(
+            beat_ids
+        ),
+    )
+
+    response = client.post(
+        f"/api/projects/{project_id}/visual-sheet/generate-selected",
+        json={"beat_ids": ["beat_8", "beat_1", "beat_8"]},
+    )
+
+    assert response.status_code == 200
+    job_id = response.json()["id"]
+    for _ in range(50):
+        job = client.get(f"/api/jobs/{job_id}").json()
+        if job["status"] not in {"queued", "running"}:
+            break
+        time.sleep(0.01)
+    assert job["status"] == "completed"
+    assert captured == [("beat_1", "beat_8")]
+
+    unknown = client.post(
+        f"/api/projects/{project_id}/visual-sheet/generate-selected",
+        json={"beat_ids": ["missing-beat"]},
+    )
+    assert unknown.status_code == 422
 
 
 def test_prompt_sheet_override_lifecycle_and_exact_provider_preview(

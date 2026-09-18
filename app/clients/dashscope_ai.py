@@ -83,7 +83,9 @@ class _DashScopeStructuredClient:
             messages=messages,
             timeout=self.timeout,
             max_attempts=self.max_attempts if self.allow_transport_retries else 1,
-            retry_base_delay=(self.retry_base_delay if self.allow_transport_retries else 0),
+            retry_base_delay=(
+                self.retry_base_delay if self.allow_transport_retries else 0
+            ),
             max_output_tokens=self.max_output_tokens,
             temperature=0.1,
             on_metadata=self._capture_metadata,
@@ -137,7 +139,13 @@ class DashScopeVisualQAClient(_DashScopeStructuredClient):
         timeout: float = _DashScopeStructuredClient.TIMEOUT_SECONDS,
     ) -> None:
         super().__init__(
-            api_key=api_key, model=model, endpoint=endpoint, timeout=timeout
+            api_key=api_key,
+            model=model,
+            endpoint=endpoint,
+            timeout=timeout,
+            max_attempts=1,
+            retry_base_delay=0,
+            allow_transport_retries=False,
         )
 
     async def evaluate(self, prompt: str, image_paths: tuple[str, ...]) -> str:

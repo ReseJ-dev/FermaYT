@@ -35,6 +35,8 @@ class PricingUnit(str, Enum):
     PER_INPUT_TOKEN = "PER_INPUT_TOKEN"
     PER_OUTPUT_TOKEN = "PER_OUTPUT_TOKEN"
     PER_REASONING_TOKEN = "PER_REASONING_TOKEN"
+    PER_SECOND = "PER_SECOND"
+    PER_CREDIT = "PER_CREDIT"
 
 
 class UsageStatus(str, Enum):

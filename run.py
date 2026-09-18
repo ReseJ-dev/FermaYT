@@ -1,7 +1,10 @@
 """Run the local FermaYT web application."""
 
+import asyncio
 import os
+from collections.abc import Coroutine
 from pathlib import Path
+from typing import Any
 
 import uvicorn
 
@@ -32,17 +35,44 @@ def remove_own_pid_file() -> None:
         PID_FILE.unlink(missing_ok=True)
 
 
+def run_server() -> None:
+    """Run Uvicorn without joining abandoned provider threads on loop shutdown."""
+    config = uvicorn.Config(
+        "app.main:app",
+        host=HOST,
+        port=PORT,
+        reload=False,
+        loop="asyncio",
+    )
+    server = uvicorn.Server(config)
+    _run_server_coroutine(server.serve())
+
+
+def _run_server_coroutine(server: Coroutine[Any, Any, None]) -> None:
+    """Own the loop so Ctrl+C is not blocked by asyncio's executor join."""
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    try:
+        loop.run_until_complete(server)
+    except KeyboardInterrupt:
+        # Uvicorn re-raises the captured SIGINT after completing its graceful
+        # shutdown. Treat that expected Ctrl+C as a normal desktop-app exit.
+        pass
+    finally:
+        # FastAPI/Uvicorn has already run its lifespan shutdown here. Closing a
+        # manually owned loop tells its executor to stop accepting work without
+        # waiting for an in-flight synchronous provider call. cli_main then uses
+        # os._exit so CPython's thread-executor atexit hook cannot hang Ctrl+C.
+        loop.close()
+        asyncio.set_event_loop(None)
+
+
 def main() -> None:
     """Start the application on the local loopback interface."""
     prepare_data_directories()
     write_pid_file()
     try:
-        uvicorn.run(
-            "app.main:app",
-            host=HOST,
-            port=PORT,
-            reload=False,
-        )
+        run_server()
     finally:
         remove_own_pid_file()
 

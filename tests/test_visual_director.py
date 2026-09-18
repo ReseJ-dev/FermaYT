@@ -144,6 +144,9 @@ def test_visual_director_requires_semantic_granularity_and_cost_aware_states() -
     assert "45-70 meaningful visible states" in request
     assert "25-40" in request
     assert "REUSE with a new crop, zoom, pan, focus" in request
+    assert "viewer focus changes" in request
+    assert "does not require a newly generated image" in request
+    assert '"intentional static hold"' in request
 
 
 def test_long_narration_with_too_few_beats_fails_pacing_validation() -> None:

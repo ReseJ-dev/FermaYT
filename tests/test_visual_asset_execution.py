@@ -438,11 +438,11 @@ def test_eight_beat_story_executes_asset_graph_without_unnecessary_calls(
     assert all(item.generation_status == "SUCCEEDED" for item in results)
     assert [call[0] for call in provider.calls] == [
         "generate",  # immutable master first
-        "generate",  # beat 1 NEW_IMAGE
-        "edit",      # beat 3
-        "edit",      # beat 4
-        "edit",      # beat 6
-        "reference", # beat 8
+        "reference",  # beat 1 uses the immutable master for continuity
+        "edit",  # beat 3
+        "edit",  # beat 4
+        "edit",  # beat 6
+        "reference",  # beat 8
     ]
     assert "Narration for beat_1" not in (results[0].prompt_used or "")
     assert "Use this permanent drawing style" in (results[0].prompt_used or "")
@@ -667,23 +667,33 @@ def test_reference_selection_orders_roles_and_respects_provider_limit(
         "PREVIOUS_STATE",
     ]
 
-    master.provider = "user"
-    user_master_for_new_image = select_visual_references(
+    master.provider = "fake"
+    generated_master_and_previous_for_new_image = select_visual_references(
         beat,
         VisualOperation.NEW_IMAGE,
         ImageProviderCapabilities(
             reference_generation=True,
             multiple_references=True,
-            max_reference_images=2,
+            max_reference_images=3,
         ),
         style_reference=style,
         master_asset=master,
-        source=None,
+        source=source,
     )
-    assert [item.semantic_role for item in user_master_for_new_image] == [
+    assert [
+        item.semantic_role for item in generated_master_and_previous_for_new_image
+    ] == [
         "STYLE",
         "MASTER_LOCATION",
+        "PREVIOUS_STATE",
     ]
+    assert generated_master_and_previous_for_new_image[0].reference.reference_id == (
+        "rough_explainer_v1"
+    )
+    assert all(
+        item.reference.role.value != "STYLE"
+        for item in generated_master_and_previous_for_new_image[1:]
+    )
 
     master.provider = "user"
     user_master_for_new_image = select_visual_references(
@@ -778,7 +788,7 @@ def test_generated_candidate_passes_qa_and_becomes_accepted(
     assert result.qa_status == "PASS"
     assert result.qa_provider == "fake-vision"
     assert result.qa_model == "fake-vision-model"
-    assert result.qa_prompt_version == "visual_qa_v4"
+    assert result.qa_prompt_version == "visual_qa_v5"
     assert result.accepted_at is not None
     assert len(result.qa_evaluations) == 1
     assert client.calls[0][1][0] == result.output_path
@@ -820,6 +830,18 @@ def test_invalid_visual_qa_result_rejects_generated_beat(
     assert result.qa_warning is not None
     assert "rejected without automated QA" in result.qa_warning
     assert result.qa_evaluations == []
+
+    client.decisions.append(_qa_pass())
+    paid_image_calls = len(provider.calls)
+    recovered = asyncio.run(
+        executor.execute_beat(project_id, execution.id, "beat_1")
+    )
+
+    assert recovered.id == result.id
+    assert recovered.is_accepted is True
+    assert recovered.qa_status == "PASS"
+    assert len(provider.calls) == paid_image_calls
+    assert len(client.calls) == 2
 
 
 def test_complete_asset_graph_produces_visual_qa_debug_summary(
@@ -1152,7 +1174,7 @@ def test_visual_qa_result_and_immutable_evaluation_survive_restart(
         assert persisted.qa_revision is not None
         assert persisted.is_accepted is True
         assert len(persisted.qa_evaluations) == 1
-        assert persisted.qa_evaluations[0].prompt_version == "visual_qa_v4"
+        assert persisted.qa_evaluations[0].prompt_version == "visual_qa_v5"
     engine.dispose()
 
 

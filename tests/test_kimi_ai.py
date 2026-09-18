@@ -45,7 +45,7 @@ def test_kimi_planning_client_uses_json_mode(
     assert captured["reasoning_effort"] == "low"
 
 
-def test_kimi_k2_6_omits_unsupported_reasoning_effort(
+def test_kimi_k2_6_disables_thinking_and_omits_unsupported_reasoning_effort(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, object] = {}
@@ -74,6 +74,7 @@ def test_kimi_k2_6_omits_unsupported_reasoning_effort(
 
     assert captured["model"] == "kimi-k2.6"
     assert "reasoning_effort" not in captured
+    assert captured["thinking"] == {"type": "disabled"}
 
 
 def test_kimi_preflight_checks_models_without_paid_completion(
