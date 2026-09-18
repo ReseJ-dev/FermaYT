@@ -745,3 +745,32 @@ def test_seedance_i2v_rejects_unverified_mixed_reference_mode(
         asyncio.run(provider.submit(request))
     assert "STYLE_REFERENCE" in str(raised.value)
     assert calls == 0
+
+
+def test_recovery_execution_contexts_are_exact_and_contain_no_credentials() -> None:
+    providers = (
+        ViduVideoProvider(
+            api_key="vidu-secret",
+            endpoint="https://vidu.test/ent/v2",
+        ),
+        WanVideoProvider(
+            api_key="wan-secret",
+            endpoint="https://wan.test/api/v1",
+            workspace_id="workspace-7",
+            region="eu-test-1",
+        ),
+        SeedanceVideoProvider(
+            api_key="seedance-secret",
+            endpoint="https://seed.test/api/v3",
+        ),
+    )
+
+    contexts = [provider.execution_context_snapshot() for provider in providers]
+    encoded = json.dumps(contexts)
+
+    assert "vidu-secret" not in encoded
+    assert "wan-secret" not in encoded
+    assert "seedance-secret" not in encoded
+    assert contexts[1]["workspace_id"] == "workspace-7"
+    assert contexts[1]["region"] == "eu-test-1"
+    assert contexts[1]["endpoint"] == "https://wan.test/api/v1"

@@ -139,6 +139,8 @@ def _probe(_: str | Path) -> MediaProbeResult:
 
 
 def _execute(session: Session, project, provider, request, tmp_path: Path, **kwargs):
+    downloader = kwargs.pop("downloader", _download)
+    prober = kwargs.pop("prober", _probe)
     return asyncio.run(
         execute_video_generation(
             session,
@@ -150,8 +152,8 @@ def _execute(session: Session, project, provider, request, tmp_path: Path, **kwa
             projects_root=tmp_path / "projects",
             job_id="job-1",
             poll_interval=0,
-            downloader=_download,
-            prober=_probe,
+            downloader=downloader,
+            prober=prober,
             **kwargs,
         )
     )
@@ -207,6 +209,74 @@ def test_poll_timeout_resumes_same_task_without_second_submission(
     ]
     asset = _execute(session, project, provider, request, tmp_path)
     assert asset.file_path.endswith(".mp4")
+    assert provider.submit_calls == 1
+
+
+def test_download_failure_reuses_same_remote_task_without_second_submission(
+    session: Session, tmp_path: Path
+) -> None:
+    project = _project(session)
+    provider = FakeVideoProvider(
+        [
+            VideoTaskResult(
+                RemoteVideoTaskState.SUCCEEDED,
+                result_url="https://provider.invalid/recovered.mp4",
+            )
+        ]
+    )
+    request = _request(tmp_path)
+
+    async def fail_download(_: str, __: Path) -> Path:
+        raise OSError("temporary network failure")
+
+    with pytest.raises(VideoGenerationError) as first:
+        _execute(
+            session,
+            project,
+            provider,
+            request,
+            tmp_path,
+            downloader=fail_download,
+        )
+    assert first.value.code == "VIDEO_DOWNLOAD_FAILED"
+
+    asset = _execute(session, project, provider, request, tmp_path)
+
+    assert Path(asset.file_path).exists()
+    assert provider.submit_calls == 1
+
+
+def test_ffprobe_failure_reuses_same_remote_task_without_second_submission(
+    session: Session, tmp_path: Path
+) -> None:
+    project = _project(session)
+    provider = FakeVideoProvider(
+        [
+            VideoTaskResult(
+                RemoteVideoTaskState.SUCCEEDED,
+                result_url="https://provider.invalid/recovered.mp4",
+            )
+        ]
+    )
+    request = _request(tmp_path)
+
+    def fail_probe(_: str | Path) -> MediaProbeResult:
+        raise ValueError("ffprobe could not parse the file")
+
+    with pytest.raises(VideoGenerationError) as first:
+        _execute(
+            session,
+            project,
+            provider,
+            request,
+            tmp_path,
+            prober=fail_probe,
+        )
+    assert first.value.code == "VIDEO_VALIDATION_FAILED"
+
+    asset = _execute(session, project, provider, request, tmp_path)
+
+    assert asset.duration == pytest.approx(5.0)
     assert provider.submit_calls == 1
 
 
@@ -342,7 +412,9 @@ def test_exact_wan_profile_rejects_invalid_duration_or_resolution_before_submiss
     duration: int,
     resolution: str,
 ) -> None:
-    project = _project(session, video_provider="wan", video_model="wan2.7-i2v-2026-04-25")
+    project = _project(
+        session, video_provider="wan", video_model="wan2.7-i2v-2026-04-25"
+    )
     provider = WanVideoProvider(
         api_key="secret",
         model="wan2.7-i2v-2026-04-25",

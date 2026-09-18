@@ -41,6 +41,7 @@ class _AsyncVideoHTTPProvider:
     provider_id: str
     model: str
     capabilities: VideoProviderCapabilities
+    api_variant = "async_video_http_v1"
 
     def __init__(self, *, api_key: str | None, model: str, endpoint: str) -> None:
         self.api_key = api_key
@@ -62,6 +63,21 @@ class _AsyncVideoHTTPProvider:
     def validate_configuration(self) -> None:
         """Fail before a paid submission boundary when credentials are absent."""
         self._headers()
+
+    def execution_context_snapshot(self) -> dict[str, Any]:
+        """Return only immutable, non-secret configuration needed for polling."""
+
+        return {
+            "schema_version": "video_provider_execution_context_v1",
+            "provider_id": self.provider_id,
+            "model_id": self.model,
+            "endpoint": self.endpoint,
+            "api_variant": self.api_variant,
+            "provider_config": {
+                "model": self.model,
+                "endpoint": self.endpoint,
+            },
+        }
 
     async def _post_json(
         self, url: str, *, headers: dict[str, str], payload: dict[str, Any]
@@ -102,6 +118,7 @@ class ViduVideoProvider(_AsyncVideoHTTPProvider):
     """Vidu Enterprise v2 task API adapter (Q3/Q2 model-configurable)."""
 
     provider_id = "vidu"
+    api_variant = "vidu_enterprise_v2"
     DEFAULT_ENDPOINT = "https://api.vidu.com/ent/v2"
 
     def __init__(
@@ -207,6 +224,7 @@ class WanVideoProvider(_AsyncVideoHTTPProvider):
     """Alibaba Model Studio workspace video-synthesis task adapter."""
 
     provider_id = "wan"
+    api_variant = "dashscope_workspace_video_synthesis_v1"
 
     def __init__(
         self,
@@ -218,6 +236,8 @@ class WanVideoProvider(_AsyncVideoHTTPProvider):
     ) -> None:
         configured = endpoint or os.getenv("DASHSCOPE_VIDEO_ENDPOINT", "").strip()
         workspace = workspace_id or os.getenv("DASHSCOPE_WORKSPACE_ID", "").strip()
+        self.workspace_id = workspace
+        self.region = region
         self.workspace_endpoint_configured = bool(configured or workspace)
         if not configured:
             if not workspace:
@@ -229,6 +249,18 @@ class WanVideoProvider(_AsyncVideoHTTPProvider):
             self.provider_id, self.model
         ) or unsupported_video_model_profile(self.provider_id, self.model)
         self.capabilities = self.model_profile.capabilities
+
+    def execution_context_snapshot(self) -> dict[str, Any]:
+        context = super().execution_context_snapshot()
+        context["region"] = self.region
+        context["workspace_id"] = self.workspace_id
+        context["provider_config"] = {
+            "model": self.model,
+            "endpoint": self.endpoint,
+            "workspace_id": self.workspace_id,
+            "region": self.region,
+        }
+        return context
 
     def validate_configuration(self) -> None:
         super().validate_configuration()
@@ -308,6 +340,7 @@ class SeedanceVideoProvider(_AsyncVideoHTTPProvider):
     """BytePlus ModelArk Contents Generations v3 adapter."""
 
     provider_id = "seedance"
+    api_variant = "byteplus_modelark_contents_v3"
     DEFAULT_ENDPOINT = "https://ark.ap-southeast.bytepluses.com/api/v3"
 
     def __init__(
@@ -514,8 +547,7 @@ def _validate_profile_references(
             provider=provider,
         )
     image_count = sum(
-        item.role is not VideoReferenceRole.SOURCE_VIDEO
-        and item.role in accepted
+        item.role is not VideoReferenceRole.SOURCE_VIDEO and item.role in accepted
         for item in request.references
     )
     if (
@@ -545,7 +577,10 @@ def _validate_profile_references(
                 f"{request.operation.value} requires exactly one {role.value}",
                 provider=provider,
             )
-    if request.operation is VideoOperation.REFERENCE_TO_VIDEO and not request.references:
+    if (
+        request.operation is VideoOperation.REFERENCE_TO_VIDEO
+        and not request.references
+    ):
         raise VideoGenerationError(
             VIDEO_BAD_REQUEST,
             "REFERENCE_TO_VIDEO requires at least one verified image reference",

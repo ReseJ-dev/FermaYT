@@ -10,10 +10,12 @@ from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 import httpx
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.costs import (
@@ -24,10 +26,12 @@ from app.costs import (
     record_provider_usage,
 )
 from app.errors import (
+    VIDEO_AUTH_ERROR,
     VIDEO_BUDGET_EXCEEDED,
     VIDEO_CAPABILITY_UNSUPPORTED,
     VIDEO_DOWNLOAD_FAILED,
     VIDEO_POLL_TIMEOUT,
+    VIDEO_RECOVERY_CONFIGURATION_MISSING,
     VIDEO_SUBMISSION_TIMEOUT_UNKNOWN,
     VIDEO_TASK_FAILED,
     VIDEO_VALIDATION_FAILED,
@@ -60,7 +64,13 @@ VideoDownloader = Callable[[str, Path], Awaitable[Path]]
 VideoProber = Callable[[str | Path], MediaProbeResult]
 
 ACTIVE_VIDEO_STATUSES = frozenset(
-    {"SUBMITTED", "QUEUED", "PROCESSING", "REMOTE_STATUS_UNKNOWN"}
+    {
+        "SUBMITTED",
+        "QUEUED",
+        "PROCESSING",
+        "REMOTE_STATUS_UNKNOWN",
+        "REMOTE_SUCCEEDED",
+    }
 )
 
 
@@ -212,36 +222,29 @@ async def execute_video_generation(
     configuration_validator = getattr(provider, "validate_configuration", None)
     if callable(configuration_validator):
         configuration_validator()
-    request_hash = _request_hash(provider, request, project.id, beat_id)
+    execution_context = _provider_execution_context(provider)
+    request_hash = _request_hash(
+        provider,
+        request,
+        project.id,
+        beat_id,
+        execution_context,
+    )
     existing = session.scalar(
         select(VideoGenerationAttempt).where(
             VideoGenerationAttempt.request_hash == request_hash
         )
     )
     if existing is not None:
-        if existing.asset is not None:
-            return existing.asset
-        if existing.status == "SUBMISSION_STATUS_UNKNOWN":
-            raise VideoGenerationError(
-                VIDEO_SUBMISSION_TIMEOUT_UNKNOWN,
-                "The original submission may have been billed; explicit reconciliation is required",
-                provider=existing.provider,
-            )
-        if existing.remote_task_id:
-            return await resume_video_attempt(
-                session,
-                existing,
-                provider,
-                projects_root=projects_root,
-                poll_interval=poll_interval,
-                max_poll_duration=max_poll_duration,
-                downloader=downloader,
-                prober=prober,
-            )
-        raise VideoGenerationError(
-            VIDEO_SUBMISSION_TIMEOUT_UNKNOWN,
-            "A pre-existing attempt has no authoritative remote task ID",
-            provider=existing.provider,
+        return await _reuse_existing_attempt(
+            session,
+            existing,
+            provider,
+            projects_root=projects_root,
+            poll_interval=poll_interval,
+            max_poll_duration=max_poll_duration,
+            downloader=downloader,
+            prober=prober,
         )
 
     estimate, currency = _estimate_request(session, provider, request)
@@ -259,6 +262,7 @@ async def execute_video_generation(
         model=provider.model,
         operation=request.operation.value,
         capability_snapshot=capability_snapshot,
+        provider_execution_context=execution_context,
         request_hash=request_hash,
         request_snapshot=snapshot,
         prompt=request.prompt,
@@ -288,7 +292,29 @@ async def execute_video_generation(
         cost_certainty="ESTIMATED" if estimate is not None else "UNKNOWN",
     )
     session.add(attempt)
-    session.commit()
+    try:
+        session.commit()
+    except IntegrityError:
+        # Another worker won the unique request-hash race. The loser attaches
+        # to the durable attempt and must never submit another paid task.
+        session.rollback()
+        existing = session.scalar(
+            select(VideoGenerationAttempt).where(
+                VideoGenerationAttempt.request_hash == request_hash
+            )
+        )
+        if existing is None:
+            raise
+        return await _reuse_existing_attempt(
+            session,
+            existing,
+            provider,
+            projects_root=projects_root,
+            poll_interval=poll_interval,
+            max_poll_duration=max_poll_duration,
+            downloader=downloader,
+            prober=prober,
+        )
     session.refresh(attempt)
 
     attempt.submission_started_at = datetime.now(UTC)
@@ -343,6 +369,7 @@ async def resume_video_attempt(
         )
     if provider.provider_id != attempt.provider or provider.model != attempt.model:
         raise ValueError("Resume provider/model does not match persisted attempt")
+    _require_matching_execution_context(session, attempt, provider)
     deadline = time.monotonic() + max_poll_duration
     result = None
     while time.monotonic() <= deadline:
@@ -359,7 +386,8 @@ async def resume_video_attempt(
         attempt.provider_metadata = dict(result.provider_metadata or {})
         attempt.usage_snapshot = dict(result.usage or {})
         if result.state is RemoteVideoTaskState.SUCCEEDED:
-            attempt.status = "SUCCEEDED"
+            # Remote completion and durable local completion are distinct.
+            attempt.status = "REMOTE_SUCCEEDED"
             attempt.remote_result_url = result.result_url
             session.commit()
             break
@@ -488,6 +516,8 @@ async def resume_incomplete_video_attempts(
     projects_root: str | Path = "data/projects",
     poll_interval: float = 5.0,
     max_poll_duration: float = 600.0,
+    downloader: VideoDownloader | None = None,
+    prober: VideoProber = probe_media,
 ) -> list[GeneratedVideoAsset]:
     attempts = list(
         session.scalars(
@@ -499,11 +529,15 @@ async def resume_incomplete_video_attempts(
     )
     assets: list[GeneratedVideoAsset] = []
     for attempt in attempts:
-        provider = provider_resolver(
-            attempt.provider,
-            {"model": attempt.model},
-        )
         try:
+            recovery_config = _recovery_provider_config(session, attempt)
+            provider = provider_resolver(
+                attempt.provider,
+                recovery_config,
+            )
+            configuration_validator = getattr(provider, "validate_configuration", None)
+            if callable(configuration_validator):
+                configuration_validator()
             assets.append(
                 await resume_video_attempt(
                     session,
@@ -512,11 +546,216 @@ async def resume_incomplete_video_attempts(
                     projects_root=projects_root,
                     poll_interval=poll_interval,
                     max_poll_duration=max_poll_duration,
+                    downloader=downloader,
+                    prober=prober,
                 )
             )
-        except VideoGenerationError:
+        except (TypeError, ValueError) as exc:
+            _mark_recovery_configuration_missing(
+                session,
+                attempt,
+                f"Persisted video provider configuration cannot be restored: {exc}",
+            )
+            continue
+        except VideoGenerationError as exc:
+            if exc.code == VIDEO_AUTH_ERROR:
+                _mark_recovery_configuration_missing(
+                    session,
+                    attempt,
+                    "Credentials required for exact video task recovery are unavailable",
+                )
             continue
     return assets
+
+
+async def _reuse_existing_attempt(
+    session: Session,
+    attempt: VideoGenerationAttempt,
+    provider: VideoGenerationProvider,
+    *,
+    projects_root: str | Path,
+    poll_interval: float,
+    max_poll_duration: float,
+    downloader: VideoDownloader | None,
+    prober: VideoProber,
+) -> GeneratedVideoAsset:
+    if attempt.asset is not None:
+        return attempt.asset
+    if attempt.status == "RECOVERY_CONFIGURATION_MISSING":
+        raise VideoGenerationError(
+            VIDEO_RECOVERY_CONFIGURATION_MISSING,
+            attempt.error_message or "Video recovery configuration is incomplete",
+            provider=attempt.provider,
+            remote_task_id=attempt.remote_task_id,
+        )
+    if attempt.status == "SUBMISSION_STATUS_UNKNOWN":
+        raise VideoGenerationError(
+            VIDEO_SUBMISSION_TIMEOUT_UNKNOWN,
+            "The original submission may have been billed; explicit reconciliation is required",
+            provider=attempt.provider,
+        )
+    if attempt.remote_task_id:
+        return await resume_video_attempt(
+            session,
+            attempt,
+            provider,
+            projects_root=projects_root,
+            poll_interval=poll_interval,
+            max_poll_duration=max_poll_duration,
+            downloader=downloader,
+            prober=prober,
+        )
+    raise VideoGenerationError(
+        VIDEO_SUBMISSION_TIMEOUT_UNKNOWN,
+        "A pre-existing attempt has no authoritative remote task ID",
+        provider=attempt.provider,
+    )
+
+
+def _provider_execution_context(
+    provider: VideoGenerationProvider,
+) -> dict[str, Any]:
+    snapshotter = getattr(provider, "execution_context_snapshot", None)
+    if callable(snapshotter):
+        context = snapshotter()
+    else:
+        # Protocol-only providers are useful for local/test integrations. They
+        # remain resumable in-process, but persisted restart recovery fails
+        # closed unless they expose an exact endpoint-bearing snapshot.
+        context = {
+            "schema_version": "video_provider_execution_context_v1",
+            "provider_id": provider.provider_id,
+            "model_id": provider.model,
+            "api_variant": "protocol_only",
+            "provider_config": {"model": provider.model},
+        }
+    _validate_execution_context(context, provider.provider_id, provider.model)
+    return json.loads(json.dumps(context, sort_keys=True))
+
+
+def _validate_execution_context(
+    context: Any,
+    provider_id: str,
+    model: str,
+) -> None:
+    if not isinstance(context, dict):
+        raise TypeError("provider execution context must be an object")
+    if context.get("schema_version") != "video_provider_execution_context_v1":
+        raise ValueError("provider execution context schema is unsupported")
+    if context.get("provider_id") != provider_id or context.get("model_id") != model:
+        raise ValueError("provider execution context identity does not match")
+    provider_config = context.get("provider_config")
+    if not isinstance(provider_config, dict) or provider_config.get("model") != model:
+        raise ValueError("provider execution context is incomplete")
+    _reject_secret_context_keys(context)
+    endpoint = context.get("endpoint")
+    if endpoint is not None:
+        if not isinstance(endpoint, str):
+            raise ValueError("provider endpoint must be a string")
+        parsed = urlsplit(endpoint)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.netloc
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("provider endpoint is not a safe base URL")
+        if provider_config.get("endpoint") != endpoint:
+            raise ValueError("provider endpoint snapshot is inconsistent")
+
+
+def _reject_secret_context_keys(value: Any) -> None:
+    forbidden = ("api_key", "authorization", "bearer", "secret", "password", "token")
+    if isinstance(value, dict):
+        for key, nested in value.items():
+            normalized = str(key).lower()
+            if any(marker in normalized for marker in forbidden):
+                raise ValueError("provider execution context contains a secret field")
+            _reject_secret_context_keys(nested)
+    elif isinstance(value, list):
+        for nested in value:
+            _reject_secret_context_keys(nested)
+
+
+def _recovery_provider_config(
+    session: Session,
+    attempt: VideoGenerationAttempt,
+) -> dict[str, Any]:
+    context = attempt.provider_execution_context
+    try:
+        _validate_execution_context(context, attempt.provider, attempt.model)
+        assert isinstance(context, dict)
+        endpoint = context.get("endpoint")
+        if not isinstance(endpoint, str) or not endpoint:
+            raise ValueError("persisted provider endpoint is missing")
+        stored_config = context["provider_config"]
+        allowed = {
+            "vidu": ("model", "endpoint"),
+            "wan": ("model", "endpoint", "workspace_id", "region"),
+            "seedance": ("model", "endpoint"),
+        }.get(attempt.provider)
+        if allowed is None:
+            raise ValueError("persisted provider adapter is unsupported")
+        config = {key: stored_config[key] for key in allowed if key in stored_config}
+        if config.get("model") != attempt.model or config.get("endpoint") != endpoint:
+            raise ValueError("persisted provider configuration is inconsistent")
+        if attempt.provider == "wan" and not config.get("region"):
+            raise ValueError("persisted Wan region is missing")
+        return config
+    except (AssertionError, KeyError, TypeError, ValueError) as exc:
+        _mark_recovery_configuration_missing(
+            session,
+            attempt,
+            f"Exact video recovery configuration is unavailable: {exc}",
+        )
+        raise VideoGenerationError(
+            VIDEO_RECOVERY_CONFIGURATION_MISSING,
+            attempt.error_message
+            or "Exact video recovery configuration is unavailable",
+            provider=attempt.provider,
+            remote_task_id=attempt.remote_task_id,
+        ) from exc
+
+
+def _require_matching_execution_context(
+    session: Session,
+    attempt: VideoGenerationAttempt,
+    provider: VideoGenerationProvider,
+) -> None:
+    try:
+        current = _provider_execution_context(provider)
+        persisted = attempt.provider_execution_context
+        _validate_execution_context(persisted, attempt.provider, attempt.model)
+        if current != persisted:
+            raise ValueError(
+                "runtime provider context differs from the persisted context"
+            )
+    except (TypeError, ValueError) as exc:
+        _mark_recovery_configuration_missing(
+            session,
+            attempt,
+            f"Exact video recovery configuration does not match: {exc}",
+        )
+        raise VideoGenerationError(
+            VIDEO_RECOVERY_CONFIGURATION_MISSING,
+            attempt.error_message
+            or "Exact video recovery configuration does not match",
+            provider=attempt.provider,
+            remote_task_id=attempt.remote_task_id,
+        ) from exc
+
+
+def _mark_recovery_configuration_missing(
+    session: Session,
+    attempt: VideoGenerationAttempt,
+    message: str,
+) -> None:
+    attempt.status = "RECOVERY_CONFIGURATION_MISSING"
+    attempt.error_code = VIDEO_RECOVERY_CONFIGURATION_MISSING
+    attempt.error_message = message[:1000]
+    session.commit()
 
 
 def _validate_request(
@@ -554,10 +793,7 @@ def _validate_request(
         if operation_profile is not None
         else capabilities.supported_aspect_ratios
     )
-    if (
-        durations
-        and request.duration_seconds not in durations
-    ):
+    if durations and request.duration_seconds not in durations:
         raise VideoGenerationError(
             VIDEO_CAPABILITY_UNSUPPORTED, "Requested duration is unsupported"
         )
@@ -750,12 +986,14 @@ def _request_hash(
     request: VideoGenerationRequest,
     project_id: str,
     beat_id: str | None,
+    execution_context: dict[str, Any],
 ) -> str:
     payload = {
         "project_id": project_id,
         "beat_id": beat_id,
         "provider": provider.provider_id,
         "model": provider.model,
+        "provider_execution_context": execution_context,
         "request": _request_snapshot(request),
     }
     return hashlib.sha256(

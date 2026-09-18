@@ -1209,6 +1209,9 @@ class VideoGenerationAttempt(Base):
     model: Mapped[str] = mapped_column(String(255), nullable=False)
     operation: Mapped[str] = mapped_column(String(50), nullable=False)
     capability_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
+    provider_execution_context: Mapped[dict[str, Any] | None] = mapped_column(
+        JSON, nullable=True
+    )
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False, index=True)
     request_snapshot: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     prompt: Mapped[str] = mapped_column(Text, nullable=False)

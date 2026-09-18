@@ -247,6 +247,19 @@ def _apply_additive_schema_updates(engine: Engine) -> None:
                         f"ADD COLUMN {name} {sql_type}"
                     )
                 )
+    if "video_generation_attempts" in table_names:
+        video_attempt_columns = {
+            column["name"]
+            for column in inspector.get_columns("video_generation_attempts")
+        }
+        if "provider_execution_context" not in video_attempt_columns:
+            with engine.begin() as connection:
+                connection.execute(
+                    text(
+                        "ALTER TABLE video_generation_attempts "
+                        "ADD COLUMN provider_execution_context JSON"
+                    )
+                )
     if "master_scene_assets" in table_names:
         master_columns = {
             column["name"] for column in inspector.get_columns("master_scene_assets")
