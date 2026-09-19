@@ -29,6 +29,23 @@ def _beat(
         "location_id": "shaft",
         "characters_visible": ["miners"],
         "important_objects": ["ladder"],
+        "main_visual_idea": (
+            "The ladder is broken" if progressive_change else "The ladder is intact"
+        ),
+        "visible_physical_state": (
+            "The ladder is broken" if progressive_change else "The ladder is intact"
+        ),
+        "essential_environment_cues": ["simple mine shaft"],
+        "optional_entities_to_omit": [],
+        "character_count_target": 1,
+        "background_complexity": "SPARSE",
+        "complexity_budget": {
+            "max_main_subjects": 1,
+            "max_supporting_objects": 2,
+            "max_environment_concepts": 1,
+            "max_main_actions": 1,
+        },
+        "split_reason": None,
         "camera_framing": "WIDE" if beat_id == "beat_1" else "MEDIUM",
         "camera_view": camera_view,
         "framing_reason": "Show the relevant geography",

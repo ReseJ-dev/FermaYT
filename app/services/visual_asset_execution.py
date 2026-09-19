@@ -65,6 +65,8 @@ from app.provider_diagnostics import (
 )
 from app.providers import (
     ImageProvider,
+    ImageReference,
+    ImageReferenceRole,
     get_image_provider,
     get_image_provider_capabilities,
 )
@@ -93,6 +95,7 @@ from app.services.prompt_assembly import (
 )
 from app.services.visual_asset_selection import (
     SelectedVisualReference,
+    select_requested_visual_references,
     select_source_asset,
     select_visual_references,
 )
@@ -114,6 +117,19 @@ def provider_operation_name(operation: VisualOperation, has_references: bool) ->
     if has_references:
         return "REFERENCE_GENERATION"
     return "NEW_IMAGE"
+
+
+def _planned_continuity_reference(reference_id: str) -> ImageReference:
+    """Trace a required-but-unavailable reference without sending fake pixels."""
+    digest = hashlib.sha256(
+        f"planned-continuity:{reference_id}".encode()
+    ).hexdigest()
+    return ImageReference(
+        reference_id=reference_id,
+        file_path=f"planned://{reference_id}",
+        sha256=digest,
+        role=ImageReferenceRole.CONTENT_CONTINUITY,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -368,15 +384,33 @@ class VisualBeatAssetExecutor:
                 accepted_results,
                 context.master_assets,
             )
-        master_asset = (
+        requested_master_asset = (
             context.master_assets.get(beat.master_scene_id)
             if beat.master_scene_id is not None
             else None
         )
-        if master_asset is not None and not context.capabilities.reference_generation:
-            # The provider cannot consume the pixels. ImagePromptBuilder still
-            # injects the matching immutable master definition as semantic geometry.
-            master_asset = None
+        master_asset = (
+            requested_master_asset
+            if context.capabilities.reference_generation
+            else None
+        )
+        requested_selections = select_requested_visual_references(
+            beat,
+            style_reference=context.style_reference,
+            master_asset=requested_master_asset,
+            source=source,
+        )
+        requested_references = tuple(
+            item.reference for item in requested_selections
+        )
+        if (
+            beat.master_scene_id is not None
+            and requested_master_asset is None
+            and not context.capabilities.reference_generation
+        ):
+            requested_references += (
+                _planned_continuity_reference(f"master:{beat.master_scene_id}"),
+            )
         selected_references = select_visual_references(
             beat,
             operation,
@@ -404,6 +438,7 @@ class VisualBeatAssetExecutor:
             operation=operation,
             auto_scene_prompt=auto_prompt,
             references=references,
+            requested_references=requested_references,
             style_id=self.style_id,
             provider=context.execution_plan.provider,
             model=context.execution_plan.model,
@@ -536,6 +571,7 @@ class VisualBeatAssetExecutor:
                 operation=operation,
                 auto_scene_prompt=auto_prompt,
                 references=references,
+                requested_references=requested_references,
                 style_id=self.style_id,
                 provider=context.execution_plan.provider,
                 model=context.execution_plan.model,
@@ -1169,6 +1205,9 @@ def _build_qa_context(
     required_entities = tuple(
         item.name for item in context.plan.characters if item.id in character_ids
     )
+    required_object_names = tuple(
+        item.name for item in context.plan.important_objects if item.id in object_ids
+    )
     required_attributes = tuple(
         item.description for item in context.plan.characters if item.id in character_ids
     )
@@ -1189,7 +1228,7 @@ def _build_qa_context(
         required_objects=tuple(beat.important_objects),
         important_physical_action=beat.change_from_previous_beat,
         location_id=beat.location_id,
-        expected_physical_state=beat.physical_state,
+        expected_physical_state=beat.visible_physical_state,
         resolved_operation=operation.value,
         characters_visible=tuple(beat.characters_visible),
         character_definitions=character_definitions,
@@ -1213,9 +1252,24 @@ def _build_qa_context(
         information_added_beyond_narration=(beat.information_added_beyond_narration),
         required_entities=required_entities,
         required_attributes=required_attributes,
-        required_environment=f"{location.description}; {location.spatial_layout}",
-        required_state=beat.physical_state,
+        required_environment="; ".join(
+            (location.name, *beat.essential_environment_cues)
+        ),
+        required_state=beat.visible_physical_state,
         forbidden_major_mismatches=tuple(dict.fromkeys(forbidden_mismatches)),
+        main_visual_idea=beat.main_visual_idea,
+        visible_physical_state=beat.visible_physical_state,
+        essential_visible_entities=tuple(
+            dict.fromkeys((*required_entities, *required_object_names))
+        ),
+        essential_environment_cues=tuple(beat.essential_environment_cues),
+        optional_entities_to_omit=tuple(beat.optional_entities_to_omit),
+        character_count_target=beat.character_count_target,
+        background_complexity=beat.background_complexity.value,
+        max_main_subjects=beat.complexity_budget.max_main_subjects,
+        max_supporting_objects=beat.complexity_budget.max_supporting_objects,
+        max_environment_concepts=beat.complexity_budget.max_environment_concepts,
+        max_main_actions=beat.complexity_budget.max_main_actions,
     )
 
 

@@ -54,9 +54,9 @@ from app.services.visual_asset_execution import (
 )
 from app.services.visual_operations import resolve_project_visual_operations
 from app.services.visual_planning import (
-    VISUAL_DIRECTOR_VERSION,
     create_project_visual_plan,
     hash_story_text,
+    is_visual_plan_record_compatible,
     load_project_visual_plan_state,
 )
 from app.style_contracts import get_image_style_contract
@@ -250,7 +250,7 @@ async def run_project_video_pipeline(
         existing_plan is not None
         and existing_plan.is_current
         and plan_record is not None
-        and plan_record.visual_director_version == VISUAL_DIRECTOR_VERSION
+        and is_visual_plan_record_compatible(plan_record)
     )
     await emit(
         ProjectPipelineStage.PLANNING,

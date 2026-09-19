@@ -581,6 +581,34 @@ A simple image that clearly advances the story is better than a beautiful image
 that only decorates the narration. Do not optimize only for fewer API calls or only
 for visual variety.
 
+VISUAL SIMPLIFICATION. Your job is NOT to visualize everything mentioned in the
+narration. Understand the complete semantic state, then choose the minimum visible
+representation required for immediate understanding. Before every beat ask, "What can
+be removed while preserving the meaning?" Never ask what else could be included.
+One frame has exactly one dominant main_visual_idea. Prefer one main subject, zero to
+two supporting objects, one simple environment concept, one main action/state, and one
+representative character. Raise those soft limits only when the story-critical meaning
+genuinely requires it. Fewer objects and fewer characters are better. Keep backgrounds
+sparse, avoid decorative realism, and do not expand a scene for beauty.
+
+Keep FULL STORY STATE separate from VISIBLE ELEMENTS FOR THIS BEAT. physical_state,
+location definitions, continuity and master scenes may retain the complete truth.
+main_visual_idea, visible_physical_state, characters_visible, important_objects and
+essential_environment_cues are only the subset that must be drawn now. Use one minimal
+environment cue when possible. Master-scene inventories preserve continuity; they are
+not a checklist of objects to copy into every frame. Put known but unnecessary entities
+in optional_entities_to_omit. If narration says several people but their exact number
+is irrelevant, use one representative character and character_count_target=1. Preserve
+story-critical identity and state.
+
+Choose the simplest explanatory framing. Prefer WIDE, MEDIUM or CLOSE for direct facts,
+and CUTAWAY_DIAGRAM for mechanisms or spatial relationships. A side view may be stated
+in camera_view. Avoid complex perspective unless meaning requires it. When two
+independent important visual facts compete for one frame, split them into adjacent
+beats and explain the separation in split_reason. Splitting semantic beats does not
+require another paid image: prefer REUSE, TRANSFORM, OVERLAY, a different crop/focus,
+or a simple EDIT_EXISTING when the established asset can communicate the next fact.
+
 {reading_instruction} Narration and
 visuals have different jobs: do not paraphrase narration and do not write image
 generation prompts. First identify all characters, locations, important objects,
@@ -678,6 +706,12 @@ silently verify every item:
 
 For each beat, use visual_focus for the one action/object viewers should notice first,
 and must_not_show for story mistakes or distracting elements that must be excluded.
+Also verify that main_visual_idea contains one dominant fact, visible_physical_state is
+only the state that must be drawn, characters_visible and important_objects contain
+only essential visible IDs, essential_environment_cues contains only the minimum cues
+needed to recognize the place, and optional_entities_to_omit names deliberate
+omissions. The complexity_budget is a strong simplicity target, not permission to
+discard a story-critical fact.
 
 Return exactly one JSON object matching the supplied JSON Schema. Return no markdown,
 code fences, commentary, or image prompts.

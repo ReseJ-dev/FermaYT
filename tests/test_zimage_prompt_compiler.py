@@ -55,6 +55,20 @@ def _ground_moves_plan() -> tuple[VisualPlan, VisualBeat]:
             "physical_state": (
                 "ground vibration; small debris jumps; support timbers shift"
             ),
+            "main_visual_idea": "Ground vibration makes small debris jump.",
+            "visible_physical_state": (
+                "ground vibration; small debris jumps; support timbers shift"
+            ),
+            "essential_environment_cues": ["narrow side tunnel with timber walls"],
+            "optional_entities_to_omit": [],
+            "character_count_target": 1,
+            "background_complexity": "SPARSE",
+            "complexity_budget": {
+                "max_main_subjects": 1,
+                "max_supporting_objects": 2,
+                "max_environment_concepts": 1,
+                "max_main_actions": 1,
+            },
             "change_from_previous_beat": (
                 "stable side tunnel becomes the first visible structural movement"
             ),
@@ -103,6 +117,11 @@ def test_real_ground_moves_beat_preserves_all_required_semantics() -> None:
         "change_from_previous",
         "style",
     }
+    assert compiled.prompt.index("Subject:") < compiled.prompt.index("Action:")
+    assert compiled.prompt.index("Action:") < compiled.prompt.index("Objects:")
+    assert compiled.prompt.index("Objects:") < compiled.prompt.index("Location:")
+    assert compiled.prompt.index("Location:") < compiled.prompt.index("Camera:")
+    assert compiled.prompt.index("Camera:") < compiled.prompt.index("Style:")
 
 
 def test_ground_moves_qa_retry_keeps_original_semantics_plus_delta() -> None:
@@ -123,15 +142,47 @@ def test_ground_moves_qa_retry_keeps_original_semantics_plus_delta() -> None:
     assert "qa_correction" in retry.report["preserved_fields"]
 
 
+def test_zimage_compiles_visible_state_instead_of_full_story_inventory() -> None:
+    plan, _ = _ground_moves_plan()
+    payload = plan.model_dump(mode="json")
+    beat_payload = payload["visual_beats"][4]
+    beat_payload["physical_state"] = (
+        "Ground vibration plus a distant ventilation fan and an unused rail cart."
+    )
+    beat_payload["main_visual_idea"] = "Small debris jumps as the ground vibrates."
+    beat_payload["visible_physical_state"] = (
+        "Small debris jumps beside the miner boots and support timbers shift."
+    )
+    beat_payload["optional_entities_to_omit"] = []
+    plan = VisualPlan.model_validate(payload)
+
+    compiled = compile_zimage_semantic_prompt(
+        plan,
+        target=plan.visual_beats[4],
+        operation=VisualOperation.NEW_IMAGE,
+        manual_scene_override=None,
+        qa_correction=None,
+    )
+
+    lowered = compiled.prompt.lower()
+    assert "ground vibrat" in lowered
+    assert "small debris" in lowered
+    assert "support timbers" in lowered
+    assert "ventilation fan" not in lowered
+    assert "rail cart" not in lowered
+
+
 def test_zimage_rejects_semantics_that_cannot_represent_required_identity() -> None:
     plan, beat = _ground_moves_plan()
     payload = plan.model_dump(mode="json")
-    impossible_name = "critical-object-" + "identity" * 40
+    impossible_name = "critical-object-" + "identity" * 80
     payload["important_objects"][2]["name"] = impossible_name
     plan = VisualPlan.model_validate(payload)
     beat = plan.visual_beats[4]
 
-    with pytest.raises(ImagePromptBuildError, match="ZIMAGE_PROMPT_TOO_COMPLEX"):
+    with pytest.raises(
+        ImagePromptBuildError, match="PROMPT_REQUIRED_STATE_TRUNCATED"
+    ):
         compile_zimage_semantic_prompt(
             plan,
             target=beat,

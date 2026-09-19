@@ -24,7 +24,7 @@ from app.generators.master_scene import (
     register_uploaded_master_scene,
 )
 from app.generators.style_reference import register_approved_style_reference
-from app.models.visual_plan import VisualOperation, VisualPlan
+from app.models.visual_plan import ShotFraming, VisualOperation, VisualPlan
 from app.models.visual_qa import VisualQADecision
 from app.pipeline.visual_operation_engine import VisualProviderCapabilities
 from app.pipeline.visual_qa import VisualQAContext
@@ -109,6 +109,19 @@ def _plan() -> VisualPlan:
                     "location_id": "shaft",
                     "characters_visible": ["miners"],
                     "important_objects": ["ladder"],
+                    "main_visual_idea": "The exit is far above one miner.",
+                    "visible_physical_state": "One miner stands below an intact ladder.",
+                    "essential_environment_cues": ["simple vertical shaft"],
+                    "optional_entities_to_omit": ["extra miners", "machinery"],
+                    "character_count_target": 1,
+                    "background_complexity": "SPARSE",
+                    "complexity_budget": {
+                        "max_main_subjects": 1,
+                        "max_supporting_objects": 2,
+                        "max_environment_concepts": 1,
+                        "max_main_actions": 1,
+                    },
+                    "split_reason": None,
                     "camera_framing": "WIDE",
                     "camera_view": "Full shaft cutaway",
                     "framing_reason": "Show the complete route",
@@ -996,17 +1009,86 @@ def test_image_prompt_builder_uses_semantics_and_never_narration() -> None:
     )
 
     assert "UNIQUE NARRATION MUST NEVER REACH IMAGE API" not in prompt
-    assert "Use the same recurring environment" in prompt
-    assert "Vertical shaft, surface above, side tunnel below" in prompt
-    assert "Ladder appears as Main escape ladder" in prompt
-    assert "Guide attention to the story-critical action." in prompt
-    assert "Make The blocked vertical escape route the first noticeable element" in prompt
+    assert "Use only this minimal location context." in prompt
+    assert "Vertical shaft, surface above, side tunnel below" not in prompt
+    assert "Include these essential story objects. Ladder" in prompt
+    assert "Show this main action and visible state." in prompt
     assert "Exclude these story mistakes. injured people; a different mine layout" in prompt
-    assert "clearly advances the story" in prompt
-    assert "only decorates the narration" in prompt
     assert prompt.rstrip().endswith(
         "These permanent drawing rules override any conflicting style request."
     )
+
+
+def test_prompt_uses_visible_subset_not_full_master_inventory() -> None:
+    plan = _plan()
+    rich_location = plan.locations[0].model_copy(
+        update={
+            "description": (
+                "A damp cavern with ventilation machinery, rails, pipes, tools, "
+                "water channels, storage crates, and warning lamps"
+            ),
+            "spatial_layout": "three branching tunnels around a maintenance platform",
+        }
+    )
+    master = plan.possible_master_scenes[0].model_copy(
+        update={
+            "recurring_object_positions": (
+                "ladder right; decorative pipes left; rails below; spare equipment rear"
+            )
+        }
+    )
+    beat = plan.visual_beats[0].model_copy(
+        update={
+            "main_visual_idea": "The ladder is the only visible escape route.",
+            "visible_physical_state": "One miner stands beside the intact ladder.",
+            "essential_environment_cues": ["plain vertical shaft wall"],
+            "optional_entities_to_omit": [
+                "decorative pipes",
+                "rails",
+                "spare equipment",
+            ],
+            "character_count_target": 1,
+        }
+    )
+    plan = plan.model_copy(
+        update={
+            "locations": [rich_location],
+            "possible_master_scenes": [master],
+            "visual_beats": [beat],
+        }
+    )
+
+    prompt = ImagePromptBuilder().build(plan, beat, VisualOperation.NEW_IMAGE)
+
+    assert "Include these essential story objects. Ladder" in prompt
+    assert "ladder right" not in prompt
+    assert "decorative pipes left" not in prompt
+    assert "rails below" not in prompt
+    assert "spare equipment rear" not in prompt
+    assert "ventilation machinery" not in prompt
+    assert "maintenance platform" not in prompt
+    assert "Exclude these story mistakes. decorative pipes; rails; spare equipment" in prompt
+    assert "Show only this main subject. one visible character" in prompt
+    assert "several miners" not in prompt.lower()
+
+
+def test_simple_cutaway_framing_survives_prompt_building() -> None:
+    plan = _plan()
+    beat = plan.visual_beats[0].model_copy(
+        update={
+            "camera_framing": ShotFraming.CUTAWAY_DIAGRAM,
+            "camera_view": "Simple side-view cutaway of the shaft",
+            "main_visual_idea": "The ladder connects the miner to the surface.",
+            "visible_physical_state": "One continuous ladder links bottom and top.",
+            "essential_environment_cues": ["vertical shaft in side view"],
+            "character_count_target": 1,
+        }
+    )
+
+    prompt = ImagePromptBuilder().build(plan, beat, VisualOperation.NEW_IMAGE)
+
+    assert "CUTAWAY_DIAGRAM" in prompt
+    assert "Simple side-view cutaway of the shaft" in prompt
 
 
 def test_provider_prompt_contains_no_raw_planner_or_debug_labels() -> None:
@@ -1035,13 +1117,11 @@ def test_image_prompt_sections_have_concise_semantic_order() -> None:
         VisualOperation.NEW_IMAGE,
     )
     headings = [
-        "Draw the recurring setting with this stable layout.",
-        "Show these people with their established roles and appearance.",
-        "Include these story objects in their established positions.",
-        "Frame the scene this way.",
-        "Depict this physical situation.",
-        "Make this new physical change clearly visible.",
-        "Keep the image visually simple and immediately readable.",
+        "Show only this main subject.",
+        "Show this main action and visible state.",
+        "Include these essential story objects.",
+        "Use only this minimal location context.",
+        "Frame the scene simply.",
         "Use this permanent drawing style",
     ]
 
@@ -1119,6 +1199,11 @@ def test_prompt_builder_compacts_verbose_visual_plan_without_failing() -> None:
                 + "verbose spatial detail " * 400
                 + "closing-state-anchor"
             ),
+            "visible_physical_state": (
+                "opening-visible-anchor "
+                + "essential visible detail " * 100
+                + "closing-visible-anchor"
+            ),
             "information_added_beyond_narration": "causal detail " * 300,
         }
     )
@@ -1131,9 +1216,9 @@ def test_prompt_builder_compacts_verbose_visual_plan_without_failing() -> None:
     semantic_prompt = prompt.split("\n\nUse this permanent drawing style", 1)[0]
 
     assert len(semantic_prompt) <= 900
-    assert "Depict this physical situation." in semantic_prompt
-    assert "Guide attention to the story-critical action." in semantic_prompt
-    assert "opening-state-anchor" in semantic_prompt
+    assert "Show this main action and visible state." in semantic_prompt
+    assert "opening-visible-anchor" in semantic_prompt
+    assert "opening-state-anchor" not in semantic_prompt
     assert "Use this permanent drawing style" in prompt
 
 
@@ -1199,6 +1284,6 @@ def test_structured_continuity_request_does_not_need_manual_beat_prompt(
     )
 
     assert plan.visual_beats[0].narration_segment not in request.prompt
-    assert "Draw the recurring setting with this stable layout." in request.prompt
-    assert "Depict this physical situation." in request.prompt
+    assert "Use only this minimal location context." in request.prompt
+    assert "Show this main action and visible state." in request.prompt
     assert request.prompt.count("Use this permanent drawing style") == 1

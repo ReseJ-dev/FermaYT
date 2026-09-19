@@ -74,18 +74,21 @@
       <div class="prompt-detail-grid">
         <section class="prompt-detail-main">
           <div class="prompt-field" data-narration-field><h3>NARRATION</h3><p data-detail-narration>—</p></div>
-          <div class="prompt-field"><h3>SEMANTIC REQUIREMENT</h3><dl class="prompt-kv" data-detail-semantics></dl></div>
+          <div class="prompt-field"><h3>FULL SEMANTIC REQUIREMENT</h3><dl class="prompt-kv" data-detail-semantics></dl></div>
+          <div class="prompt-field"><h3>SIMPLIFIED VISUAL CORE</h3><dl class="prompt-kv" data-detail-visual-core></dl></div>
+          <div class="prompt-field"><h3>SIMPLIFICATION TRACE</h3><p>Split required: <strong data-detail-split-required>—</strong></p><p>Continuity mode: <strong data-detail-continuity-mode>—</strong></p><dl class="prompt-kv" data-detail-simplification-trace></dl></div>
           <div class="prompt-field" data-provider-prompt-fields><h3>AUTO SCENE PROMPT</h3><pre data-detail-auto></pre></div>
           <div class="prompt-field prompt-override-editor" data-provider-prompt-fields><div class="prompt-field-heading"><h3>MANUAL SCENE OVERRIDE</h3><span data-override-state>AUTO</span></div><textarea rows="6" data-override-input placeholder="Describe only the desired visual scene…"></textarea><small>Style, operation, references, semantics and QA remain automatic.</small><div class="prompt-editor-actions"><button class="button button-secondary button-small" type="button" data-edit-override>Edit Override</button><button class="button button-primary button-small" type="button" data-save-override>Save Override</button><button class="button button-secondary button-small" type="button" data-clear-override>Clear Override · Use Auto Prompt</button></div></div>
           <div class="prompt-field" data-provider-prompt-fields><h3>EFFECTIVE SCENE PROMPT</h3><pre data-detail-effective></pre></div>
           <div class="prompt-field"><h3>OPERATION</h3><p><strong data-detail-operation>—</strong></p><p data-detail-operation-instructions></p><p data-detail-operation-detail></p></div>
           <div class="prompt-field"><h3>SOURCE / MASTER</h3><p>Source: <span data-detail-source>—</span></p><p>Master: <span data-detail-master>—</span></p><p>Time: <span data-detail-time>—</span></p></div>
-          <div class="prompt-field"><h3>REFERENCES</h3><ul class="prompt-reference-list" data-detail-references></ul></div>
+          <div class="prompt-field"><h3>REFERENCES REQUESTED</h3><ul class="prompt-reference-list" data-detail-references-requested></ul><h3>REFERENCES ACTUALLY SENT</h3><ul class="prompt-reference-list" data-detail-references></ul></div>
           <div class="prompt-field"><h3>PERMANENT STYLE CONTRACT</h3><p><code data-detail-style>—</code></p><pre data-detail-style-contract></pre></div>
         </section>
         <aside class="prompt-detail-preview">
           <div class="prompt-preview-controls"><label>Provider<select data-preview-provider><option value="seedream">Seedream</option><option value="qwen">Qwen Image</option><option value="zimage">Z-Image</option></select></label><label>Model<input data-preview-model></label><button class="button button-secondary button-small" type="button" data-refresh-preview>Refresh exact preview</button></div>
           <div class="prompt-field" data-provider-prompt-fields><h3>QA CORRECTION</h3><p data-detail-qa-correction>—</p></div>
+          <div class="prompt-field" data-provider-prompt-fields><h3>PRE-SHORTEN PROMPT</h3><pre data-detail-pre-shorten></pre><p>Truncated fields: <span data-detail-truncated-fields>None</span></p></div>
           <div class="prompt-field" data-provider-prompt-fields><h3>FINAL PROVIDER PROMPT</h3><pre class="final-provider-prompt" data-detail-final></pre></div>
           <div class="prompt-field" data-provider-prompt-fields><h3>PROVIDER TRANSFORMATIONS</h3><ul data-detail-transformations></ul></div>
           <div class="prompt-no-provider" data-no-provider hidden><strong>NO IMAGE PROVIDER CALL</strong><p>This operation uses an existing asset or a deterministic local operation.</p></div>

@@ -13,7 +13,11 @@ from app.pipeline.visual_operation_engine import VisualDecisionEvidence
 from app.production_profiles import select_draft_key_beats
 from app.repositories import create_project, save_project_visual_plan_record
 from app.services.visual_operations import resolve_project_visual_operations
-from app.services.visual_planning import hash_story_text
+from app.services.visual_planning import (
+    VISUAL_DIRECTOR_VERSION,
+    VISUAL_PLAN_SCHEMA_VERSION,
+    hash_story_text,
+)
 
 
 @pytest.fixture
@@ -67,8 +71,8 @@ def test_draft_execution_has_fewer_paid_operations_than_final(
     save_project_visual_plan_record(
         session,
         project_id=project.id,
-        schema_version="visual_plan_v1",
-        visual_director_version="visual_director_v1",
+        schema_version=VISUAL_PLAN_SCHEMA_VERSION,
+        visual_director_version=VISUAL_DIRECTOR_VERSION,
         story_text_hash=hash_story_text(project.story_text),
         plan_json=plan.model_dump(mode="json"),
     )

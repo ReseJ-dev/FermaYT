@@ -37,7 +37,11 @@ from app.services.visual_asset_selection import (
     select_visual_references,
 )
 from app.services.visual_operations import resolve_project_visual_operations
-from app.services.visual_planning import hash_story_text
+from app.services.visual_planning import (
+    VISUAL_DIRECTOR_VERSION,
+    VISUAL_PLAN_SCHEMA_VERSION,
+    hash_story_text,
+)
 from app.services.visual_qa import VisualQAManualOverrideService
 
 
@@ -259,6 +263,19 @@ def _beat(
         "location_id": "shaft",
         "characters_visible": ["miners"],
         "important_objects": ["rod", "debris"],
+        "main_visual_idea": physical_state,
+        "visible_physical_state": physical_state,
+        "essential_environment_cues": [camera_view],
+        "optional_entities_to_omit": [],
+        "character_count_target": 1,
+        "background_complexity": "SPARSE",
+        "complexity_budget": {
+            "max_main_subjects": 1,
+            "max_supporting_objects": 2,
+            "max_environment_concepts": 1,
+            "max_main_actions": 2,
+        },
+        "split_reason": None,
         "camera_framing": framing,
         "camera_view": camera_view,
         "framing_reason": "Make the current state easy to understand",
@@ -302,8 +319,8 @@ def _setup_execution(
     plan_record = save_project_visual_plan_record(
         session,
         project_id=project.id,
-        schema_version="visual_plan_v1",
-        visual_director_version="visual_director_v1",
+        schema_version=VISUAL_PLAN_SCHEMA_VERSION,
+        visual_director_version=VISUAL_DIRECTOR_VERSION,
         story_text_hash=hash_story_text(project.story_text),
         plan_json=plan.model_dump(mode="json"),
     )
@@ -509,8 +526,8 @@ def test_executor_consumes_real_stage_two_resolution(
     save_project_visual_plan_record(
         session,
         project_id=project.id,
-        schema_version="visual_plan_v1",
-        visual_director_version="visual_director_v1",
+        schema_version=VISUAL_PLAN_SCHEMA_VERSION,
+        visual_director_version=VISUAL_DIRECTOR_VERSION,
         story_text_hash=hash_story_text(project.story_text),
         plan_json=plan.model_dump(mode="json"),
     )
@@ -788,11 +805,11 @@ def test_generated_candidate_passes_qa_and_becomes_accepted(
     assert result.qa_status == "PASS"
     assert result.qa_provider == "fake-vision"
     assert result.qa_model == "fake-vision-model"
-    assert result.qa_prompt_version == "visual_qa_v5"
+    assert result.qa_prompt_version == "visual_qa_v6"
     assert result.accepted_at is not None
     assert len(result.qa_evaluations) == 1
     assert client.calls[0][1][0] == result.output_path
-    assert "five dimension scores" in client.calls[0][0]
+    assert "six dimension scores" in client.calls[0][0]
     assert "intentional change from previous beat" in client.calls[0][0]
 
     repeated = asyncio.run(executor.execute_beat(project_id, execution.id, "beat_1"))
@@ -1174,7 +1191,7 @@ def test_visual_qa_result_and_immutable_evaluation_survive_restart(
         assert persisted.qa_revision is not None
         assert persisted.is_accepted is True
         assert len(persisted.qa_evaluations) == 1
-        assert persisted.qa_evaluations[0].prompt_version == "visual_qa_v5"
+        assert persisted.qa_evaluations[0].prompt_version == "visual_qa_v6"
     engine.dispose()
 
 

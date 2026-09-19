@@ -4,11 +4,26 @@ import pytest
 from pydantic import ValidationError
 
 from app.models.visual_plan import (
+    BackgroundComplexity,
     CameraMovement,
     ShotFraming,
     VisualBeat,
+    VisualComplexityBudget,
     VisualOperation,
 )
+
+
+def _simplicity() -> dict[str, object]:
+    return {
+        "main_visual_idea": "One stable visual fact",
+        "visible_physical_state": "One stable visible state",
+        "essential_environment_cues": ["simple setting"],
+        "optional_entities_to_omit": [],
+        "character_count_target": 0,
+        "background_complexity": BackgroundComplexity.SPARSE,
+        "complexity_budget": VisualComplexityBudget(),
+        "split_reason": None,
+    }
 
 
 def test_visual_operation_serializes_as_requested_string() -> None:
@@ -18,6 +33,7 @@ def test_visual_operation_serializes_as_requested_string() -> None:
 def test_dependent_visual_operation_requires_a_source() -> None:
     with pytest.raises(ValidationError, match="requires source_visual_id"):
         VisualBeat(
+            **_simplicity(),
             id="beat",
             narration_segment="Narration",
             visual_purpose="Purpose",
@@ -38,6 +54,7 @@ def test_dependent_visual_operation_requires_a_source() -> None:
 def test_visual_beat_rejects_extra_prompt_field() -> None:
     with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
         VisualBeat(
+            **_simplicity(),
             id="beat",
             narration_segment="Narration",
             visual_purpose="Purpose",
@@ -58,6 +75,7 @@ def test_visual_beat_rejects_extra_prompt_field() -> None:
 
 def test_non_overlay_beat_discards_provider_overlay_description() -> None:
     beat = VisualBeat(
+        **_simplicity(),
         id="beat",
         narration_segment="Narration",
         visual_purpose="Purpose",

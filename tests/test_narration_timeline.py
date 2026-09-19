@@ -58,7 +58,11 @@ from app.services.timeline import (
     format_timeline_debug,
     timeline_is_current,
 )
-from app.services.visual_planning import hash_story_text
+from app.services.visual_planning import (
+    VISUAL_DIRECTOR_VERSION,
+    VISUAL_PLAN_SCHEMA_VERSION,
+    hash_story_text,
+)
 from app.tts_capabilities import TTSProviderCapabilities
 
 
@@ -173,6 +177,19 @@ def _plan() -> VisualPlan:
                 "location_id": "tunnel",
                 "characters_visible": ["person"],
                 "important_objects": ["gate"],
+                "main_visual_idea": f"Physical state {index}",
+                "visible_physical_state": f"State {index}",
+                "essential_environment_cues": ["simple rectangular tunnel"],
+                "optional_entities_to_omit": [],
+                "character_count_target": 1,
+                "background_complexity": "SPARSE",
+                "complexity_budget": {
+                    "max_main_subjects": 1,
+                    "max_supporting_objects": 2,
+                    "max_environment_concepts": 1,
+                    "max_main_actions": 1,
+                },
+                "split_reason": None,
                 "camera_framing": "WIDE",
                 "camera_view": f"Tunnel view {index}",
                 "framing_reason": "Keep geography readable",
@@ -243,8 +260,8 @@ def _setup_graph(session: Session, tmp_path: Path) -> tuple[Any, Any, list[Any]]
     plan_record = save_project_visual_plan_record(
         session,
         project_id=project.id,
-        schema_version="visual_plan_v1",
-        visual_director_version="visual_director_v1",
+        schema_version=VISUAL_PLAN_SCHEMA_VERSION,
+        visual_director_version=VISUAL_DIRECTOR_VERSION,
         story_text_hash=hash_story_text(story),
         plan_json=plan.model_dump(mode="json"),
     )

@@ -160,8 +160,54 @@ def select_visual_references(
     source: VisualAssetSource | None,
 ) -> tuple[SelectedVisualReference, ...]:
     """Select the minimum useful references in deterministic semantic order."""
+    candidates = list(
+        select_requested_visual_references(
+            beat,
+            style_reference=style_reference,
+            master_asset=master_asset,
+            source=source,
+        )
+    )
     if not capabilities.reference_generation:
         return ()
+    unique = candidates
+
+    maximum = capabilities.max_reference_images
+    if len(unique) > maximum:
+        required_hash = source.sha256 if source is not None else None
+        selected = unique[:maximum]
+        if (
+            operation is VisualOperation.EDIT_EXISTING
+            and required_hash is not None
+            and all(item.reference.sha256 != required_hash for item in selected)
+        ):
+            source_reference = next(
+                item for item in unique if item.reference.sha256 == required_hash
+            )
+            selected[-1] = source_reference
+        unique = selected
+
+    for selected in unique:
+        logger.info(
+            "Visual reference selected",
+            extra={
+                "beat_id": beat.id,
+                "reference_role": selected.semantic_role,
+                "reference_asset_id": selected.reference.reference_id,
+                "selection_reason": selected.reason,
+            },
+        )
+    return tuple(unique)
+
+
+def select_requested_visual_references(
+    beat: VisualBeat,
+    *,
+    style_reference: StyleReferenceAsset | None,
+    master_asset: MasterSceneAsset | None,
+    source: VisualAssetSource | None,
+) -> tuple[SelectedVisualReference, ...]:
+    """Return semantic continuity requirements before provider capability filtering."""
     candidates: list[SelectedVisualReference] = []
     if style_reference is not None:
         candidates.append(
@@ -206,31 +252,6 @@ def select_visual_references(
         hashes.add(candidate.reference.sha256)
         unique.append(candidate)
 
-    maximum = capabilities.max_reference_images
-    if len(unique) > maximum:
-        required_hash = source.sha256 if source is not None else None
-        selected = unique[:maximum]
-        if (
-            operation is VisualOperation.EDIT_EXISTING
-            and required_hash is not None
-            and all(item.reference.sha256 != required_hash for item in selected)
-        ):
-            source_reference = next(
-                item for item in unique if item.reference.sha256 == required_hash
-            )
-            selected[-1] = source_reference
-        unique = selected
-
-    for selected in unique:
-        logger.info(
-            "Visual reference selected",
-            extra={
-                "beat_id": beat.id,
-                "reference_role": selected.semantic_role,
-                "reference_asset_id": selected.reference.reference_id,
-                "selection_reason": selected.reason,
-            },
-        )
     return tuple(unique)
 
 

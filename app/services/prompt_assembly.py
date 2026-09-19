@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from app.clients.image_api import normalize_image_prompt_for_provider
 from app.generators.image_prompt import (
     ImagePromptBuilder,
+    build_simplified_visual_core,
     sanitize_provider_visual_text,
 )
 from app.generators.style_reference import build_reference_role_instruction
@@ -46,6 +47,7 @@ from app.repositories import (
 )
 from app.services.visual_asset_selection import (
     VisualAssetSource,
+    select_requested_visual_references,
     select_visual_references,
 )
 from app.style_contracts import (
@@ -87,6 +89,12 @@ class PromptAssembly:
     visual_plan_id: str
     visual_plan_revision: str
     semantic_requirement: dict[str, Any]
+    simplified_visual_core: dict[str, Any] | None
+    complexity_budget: dict[str, Any] | None
+    visible_entities: list[str]
+    omitted_entities: list[str]
+    split_required: bool
+    environment_cues_used: list[str]
     semantic_fingerprint: str
     auto_scene_prompt: str | None
     manual_scene_override: str | None
@@ -97,12 +105,17 @@ class PromptAssembly:
     operation: str
     operation_instructions: str | None
     references_used: list[dict[str, Any]]
+    references_requested: list[dict[str, Any]]
+    references_actually_sent: list[dict[str, Any]]
+    continuity_mode: str
     style_contract_version: str
     style_contract_snapshot: str
     qa_correction: str | None
     assembled_prompt_before_provider_transform: str | None
+    pre_shorten_prompt: str | None
     provider_transformations: list[dict[str, object]]
     provider_compaction_report: dict[str, object] | None
+    truncated_fields: list[str]
     final_provider_prompt: str | None
     provider: str
     model: str | None
@@ -132,10 +145,18 @@ def semantic_requirement_for_target(
         return {
             "visual_purpose": beat.visual_purpose,
             "what_viewer_should_understand": beat.what_viewer_should_understand,
+            "main_visual_idea": beat.main_visual_idea,
             "location_id": beat.location_id,
+            "essential_environment_cues": list(beat.essential_environment_cues),
             "characters_visible": list(beat.characters_visible),
             "important_objects": list(beat.important_objects),
             "physical_state": beat.physical_state,
+            "visible_physical_state": beat.visible_physical_state,
+            "optional_entities_to_omit": list(beat.optional_entities_to_omit),
+            "character_count_target": beat.character_count_target,
+            "background_complexity": beat.background_complexity.value,
+            "complexity_budget": beat.complexity_budget.model_dump(mode="json"),
+            "split_reason": beat.split_reason,
             "camera_framing": beat.camera_framing.value,
             "camera_view": beat.camera_view,
             "visual_focus": beat.visual_focus,
@@ -289,6 +310,7 @@ def compile_prompt_assembly(
     operation: VisualOperation | str,
     auto_scene_prompt: str | None,
     references: tuple[ImageReference, ...] = (),
+    requested_references: tuple[ImageReference, ...] | None = None,
     style_id: str = DEFAULT_IMAGE_STYLE_ID,
     provider: str | None = None,
     model: str | None = None,
@@ -297,6 +319,11 @@ def compile_prompt_assembly(
     target_type = PromptTargetType(target_type)
     operation = VisualOperation(operation)
     requirement = semantic_requirement_for_target(plan, target_type, target_id)
+    simplified_core = (
+        build_simplified_visual_core(plan, _beat(plan, target_id)).as_dict()
+        if target_type is PromptTargetType.BEAT
+        else None
+    )
     fingerprint = _stable_hash(requirement)
     resolution = (
         resolve_prompt_override(
@@ -316,6 +343,42 @@ def compile_prompt_assembly(
     )
     operation_instructions = _operation_instructions(operation)
     reference_snapshot = [_reference_snapshot(item) for item in references]
+    requested_reference_snapshot = [
+        _reference_snapshot(item)
+        for item in (
+            references if requested_references is None else requested_references
+        )
+    ]
+    continuity_mode = (
+        "REFERENCE_BASED"
+        if reference_snapshot
+        else "TEXT_ONLY_FALLBACK"
+        if requested_reference_snapshot
+        else "NONE"
+    )
+    complexity_budget = (
+        dict(simplified_core.get("complexity_budget") or {})
+        if simplified_core is not None
+        else None
+    )
+    visible_entities = list(
+        simplified_core.get("visible_entities") or ()
+        if simplified_core is not None
+        else ()
+    )
+    omitted_entities = list(
+        simplified_core.get("omitted_entities") or ()
+        if simplified_core is not None
+        else ()
+    )
+    environment_cues_used = list(
+        simplified_core.get("environment_cues_used") or ()
+        if simplified_core is not None
+        else ()
+    )
+    split_required = bool(
+        simplified_core and simplified_core.get("split_required")
+    )
     provider_id = (provider or project.image_provider).strip().lower()
     provider_model = model if model is not None else project.image_model
     style = get_image_style_contract(style_id)
@@ -327,6 +390,12 @@ def compile_prompt_assembly(
             visual_plan_id=plan_id,
             visual_plan_revision=visual_plan_revision(plan),
             semantic_requirement=requirement,
+            simplified_visual_core=simplified_core,
+            complexity_budget=complexity_budget,
+            visible_entities=visible_entities,
+            omitted_entities=omitted_entities,
+            split_required=split_required,
+            environment_cues_used=environment_cues_used,
             semantic_fingerprint=fingerprint,
             auto_scene_prompt=None,
             manual_scene_override=None,
@@ -339,12 +408,17 @@ def compile_prompt_assembly(
             operation=operation.value,
             operation_instructions=operation_instructions,
             references_used=reference_snapshot,
+            references_requested=requested_reference_snapshot,
+            references_actually_sent=reference_snapshot,
+            continuity_mode="NONE",
             style_contract_version=style.style_id,
             style_contract_snapshot=style.render_for_image_provider(),
             qa_correction=None,
             assembled_prompt_before_provider_transform=None,
+            pre_shorten_prompt=None,
             provider_transformations=[],
             provider_compaction_report=None,
+            truncated_fields=[],
             final_provider_prompt=None,
             provider=provider_id,
             model=provider_model,
@@ -353,13 +427,23 @@ def compile_prompt_assembly(
     if auto_scene_prompt is None:
         raise ValueError("generated image operation requires auto_scene_prompt")
     auto_dynamic_prompt = _without_style_contract(auto_scene_prompt, style_id)
+    auto_dynamic_prompt = _without_reference_instructions(
+        auto_dynamic_prompt,
+        references if requested_references is None else requested_references,
+    )
     manual = active_override.scene_prompt_override if active_override else None
     effective = manual or auto_dynamic_prompt
     if manual is None:
-        assembled = auto_scene_prompt
+        assembled = (
+            auto_scene_prompt
+            if references
+            or not requested_reference_snapshot
+            else apply_image_style_contract(auto_dynamic_prompt, style_id)
+        )
     else:
         assembled = _assemble_manual_dynamic_prompt(
             requirement,
+            simplified_core,
             manual,
             operation_instructions,
             references,
@@ -416,6 +500,12 @@ def compile_prompt_assembly(
         visual_plan_id=plan_id,
         visual_plan_revision=visual_plan_revision(plan),
         semantic_requirement=requirement,
+        simplified_visual_core=simplified_core,
+        complexity_budget=complexity_budget,
+        visible_entities=visible_entities,
+        omitted_entities=omitted_entities,
+        split_required=split_required,
+        environment_cues_used=environment_cues_used,
         semantic_fingerprint=fingerprint,
         auto_scene_prompt=auto_dynamic_prompt,
         manual_scene_override=manual,
@@ -426,12 +516,19 @@ def compile_prompt_assembly(
         operation=operation.value,
         operation_instructions=operation_instructions,
         references_used=reference_snapshot,
+        references_requested=requested_reference_snapshot,
+        references_actually_sent=reference_snapshot,
+        continuity_mode=continuity_mode,
         style_contract_version=style.style_id,
         style_contract_snapshot=style.render_for_image_provider(),
         qa_correction=qa_correction,
         assembled_prompt_before_provider_transform=assembled,
+        pre_shorten_prompt=provider_ready,
         provider_transformations=transformations,
         provider_compaction_report=compaction_report,
+        truncated_fields=list(
+            (compaction_report or {}).get("truncated_fields", [])  # type: ignore[arg-type]
+        ),
         final_provider_prompt=final_prompt,
         provider=provider_id,
         model=provider_model,
@@ -464,31 +561,40 @@ def preview_generation_request(
             else _preview_resolved_operation(plan, beat, capabilities)
         )
         if references is None:
-            references = _preview_beat_references(
+            requested_references, references = _preview_beat_reference_sets(
                 session,
                 project,
                 beat,
                 resolved,
                 capabilities=capabilities,
             )
+        else:
+            requested_references = references
+        prompt_references = references or requested_references
         auto = build_auto_beat_scene_prompt(
             project,
             plan,
             beat,
             resolved,
-            references,
+            prompt_references,
             style_id=project.style_id,
         )
     else:
         master = _master(plan, target_id)
         resolved = VisualOperation(operation or VisualOperation.NEW_IMAGE)
         if references is None:
+            requested_references = _preview_master_requested_references(
+                session,
+                project,
+            )
             references = _preview_master_references(
                 session,
                 project,
                 provider=provider,
                 model=model,
             )
+        else:
+            requested_references = references
         if operation is None and references:
             resolved = VisualOperation.REFERENCE_GENERATION
         auto = build_auto_master_scene_prompt(
@@ -507,6 +613,7 @@ def preview_generation_request(
         operation=resolved,
         auto_scene_prompt=auto,
         references=references,
+        requested_references=requested_references,
         style_id=project.style_id,
         provider=provider,
         model=model,
@@ -968,16 +1075,26 @@ def _preview_master_references(
     return (to_style_image_reference(style_reference),)
 
 
-def _preview_beat_references(
+def _preview_master_requested_references(
+    session: Session,
+    project: Project,
+) -> tuple[ImageReference, ...]:
+    style_reference = get_style_reference_asset(session, project.id, project.style_id)
+    if style_reference is None:
+        return ()
+    from app.generators.style_reference import to_style_image_reference
+
+    return (to_style_image_reference(style_reference),)
+
+
+def _preview_beat_reference_sets(
     session: Session,
     project: Project,
     beat: VisualBeat,
     operation: VisualOperation,
     *,
     capabilities: ImageProviderCapabilities,
-) -> tuple[ImageReference, ...]:
-    if not capabilities.reference_generation:
-        return ()
+) -> tuple[tuple[ImageReference, ...], tuple[ImageReference, ...]]:
     style_reference = get_style_reference_asset(session, project.id, project.style_id)
     master_asset = session.scalar(
         select(MasterSceneAsset).where(
@@ -1011,6 +1128,15 @@ def _preview_beat_references(
         and source_result.file_sha256 is not None
         else None
     )
+    requested = [
+        item.reference
+        for item in select_requested_visual_references(
+            beat,
+            style_reference=style_reference,
+            master_asset=master_asset,
+            source=source,
+        )
+    ]
     selected = [
         item.reference
         for item in select_visual_references(
@@ -1023,7 +1149,7 @@ def _preview_beat_references(
         )
     ]
     if master_asset is None and beat.master_scene_id is not None:
-        selected.append(_planned_reference(f"master:{beat.master_scene_id}"))
+        requested.append(_planned_reference(f"master:{beat.master_scene_id}"))
     planned_source = None
     if (
         source is None
@@ -1031,17 +1157,10 @@ def _preview_beat_references(
         and operation is not VisualOperation.NEW_IMAGE
     ):
         planned_source = _planned_reference(f"beat:{beat.source_visual_id}")
-        selected.append(planned_source)
-    unique = list({item.sha256: item for item in selected}.values())
-    limited = unique[: capabilities.max_reference_images]
-    if (
-        operation is VisualOperation.EDIT_EXISTING
-        and planned_source is not None
-        and all(item.sha256 != planned_source.sha256 for item in limited)
-        and limited
-    ):
-        limited[-1] = planned_source
-    return tuple(limited)
+        requested.append(planned_source)
+    requested_unique = tuple({item.sha256: item for item in requested}.values())
+    sent_unique = tuple({item.sha256: item for item in selected}.values())
+    return requested_unique, sent_unique
 
 
 def _preview_capabilities(
@@ -1109,6 +1228,7 @@ def _operation_detail(beat: VisualBeat) -> str | None:
 
 def _assemble_manual_dynamic_prompt(
     requirement: dict[str, Any],
+    simplified_core: dict[str, Any] | None,
     manual: str,
     operation_instructions: str | None,
     references: tuple[ImageReference, ...],
@@ -1117,7 +1237,7 @@ def _assemble_manual_dynamic_prompt(
 ) -> str:
     parts = [
         NO_VISIBLE_TEXT_INSTRUCTION,
-        _semantic_guard_instruction(requirement),
+        _semantic_guard_instruction(requirement, simplified_core),
         f"Create an illustration showing {sanitize_provider_visual_text(manual)}.",
     ]
     if operation_instructions:
@@ -1132,25 +1252,51 @@ def _assemble_manual_dynamic_prompt(
     return apply_image_style_contract(" ".join(parts), style_id)
 
 
-def _semantic_guard_instruction(requirement: dict[str, Any]) -> str:
+def _semantic_guard_instruction(
+    requirement: dict[str, Any], simplified_core: dict[str, Any] | None
+) -> str:
     """Render semantic authority as natural direction, never planner field labels."""
+    if simplified_core is not None:
+        core_parts = [
+            simplified_core.get("main_subject"),
+            simplified_core.get("main_visual_idea"),
+            simplified_core.get("visible_physical_state"),
+            "; ".join(simplified_core.get("essential_objects") or ()),
+            simplified_core.get("minimal_location"),
+            simplified_core.get("simple_framing"),
+        ]
+        concise = "; ".join(
+            sanitize_provider_visual_text(str(item)).strip(" .;")
+            for item in core_parts
+            if item
+        )
+        omitted = simplified_core.get("omitted_entities") or ()
+        suffix = (
+            f" Exclude {', '.join(str(item) for item in omitted)}."
+            if omitted
+            else ""
+        )
+        return f"Keep the required visual core: {concise}.{suffix}"
     parts: list[str] = []
-    understanding = requirement.get("what_viewer_should_understand")
-    purpose = requirement.get("visual_purpose")
-    if understanding:
-        parts.append(f"The viewer must immediately understand {understanding}")
-    if purpose:
-        parts.append(f"the illustration must visually {purpose}")
+    main_idea = requirement.get("main_visual_idea")
+    if main_idea:
+        parts.append(f"Show one dominant visual fact, {main_idea}")
     location = requirement.get("location_id")
     if location:
         parts.append(f"keep the scene in the established {location} location")
+    environment_cues = requirement.get("essential_environment_cues") or ()
+    if environment_cues:
+        parts.append(
+            "use only these minimal location cues, "
+            + ", ".join(str(item) for item in environment_cues)
+        )
     characters = requirement.get("characters_visible") or ()
     if characters:
         parts.append(f"show {', '.join(str(item) for item in characters)}")
     objects = requirement.get("important_objects") or ()
     if objects:
         parts.append(f"include {', '.join(str(item) for item in objects)}")
-    physical_state = requirement.get("physical_state")
+    physical_state = requirement.get("visible_physical_state")
     if physical_state:
         parts.append(f"depict {physical_state}")
     framing = requirement.get("camera_framing")
@@ -1163,8 +1309,17 @@ def _semantic_guard_instruction(requirement: dict[str, Any]) -> str:
     if focus:
         parts.append(f"guide attention to {focus}")
     excluded = requirement.get("must_not_show") or ()
+    excluded = tuple(excluded) + tuple(
+        requirement.get("optional_entities_to_omit") or ()
+    )
     if excluded:
         parts.append(f"exclude {', '.join(str(item) for item in excluded)}")
+    count = requirement.get("character_count_target")
+    if count is not None:
+        parts.append(f"show no more than the intended {count} visible people")
+    background = requirement.get("background_complexity")
+    if background:
+        parts.append(f"keep the background {str(background).lower()}")
     description = requirement.get("description")
     geometry = requirement.get("environment_geometry")
     positions = requirement.get("recurring_object_positions")
@@ -1186,6 +1341,21 @@ def _without_style_contract(prompt: str, style_id: str) -> str:
     if normalized.endswith(rendered):
         return normalized[: -len(rendered)].rstrip()
     return normalized
+
+
+def _without_reference_instructions(
+    prompt: str, references: tuple[ImageReference, ...]
+) -> str:
+    """Keep Prompt Sheet AUTO SCENE PROMPT limited to visible scene content."""
+    if not references:
+        return prompt
+    content = sanitize_provider_visual_text(
+        build_reference_role_instruction(references)
+    )
+    block = (
+        "\n\nUse the attached images only as visual guidance. " + content
+    )
+    return prompt.replace(block, "", 1).strip()
 
 
 def _operation_instructions(operation: VisualOperation) -> str | None:

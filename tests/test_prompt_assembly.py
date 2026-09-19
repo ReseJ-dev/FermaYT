@@ -32,7 +32,11 @@ from app.services.prompt_assembly import (
     semantic_requirement_for_target,
     set_prompt_override,
 )
-from app.services.visual_planning import hash_story_text
+from app.services.visual_planning import (
+    VISUAL_DIRECTOR_VERSION,
+    VISUAL_PLAN_SCHEMA_VERSION,
+    hash_story_text,
+)
 from tests.test_visual_asset_execution import (
     FakeImageProvider,
     FakeVisualQAClient,
@@ -72,6 +76,20 @@ def test_auto_and_manual_beat_assembly_preserve_authoritative_layers(
         assert automatic.override_state == PromptOverrideState.AUTO.value
         assert automatic.manual_scene_override is None
         assert automatic.effective_scene_prompt == automatic.auto_scene_prompt
+        assert automatic.simplified_visual_core is not None
+        assert automatic.simplified_visual_core["main_visual_idea"] == (
+            beat.main_visual_idea
+        )
+        assert automatic.complexity_budget == beat.complexity_budget.model_dump(
+            mode="json"
+        )
+        assert automatic.visible_entities
+        assert automatic.environment_cues_used
+        assert automatic.split_required is False
+        assert "Use this permanent drawing style" not in (
+            automatic.auto_scene_prompt or ""
+        )
+        assert "attached image" not in (automatic.auto_scene_prompt or "").lower()
         assert automatic.final_provider_prompt
         assert "Use this permanent drawing style" in automatic.final_provider_prompt
         assert "WHAT CHANGED:" not in automatic.final_provider_prompt
@@ -114,17 +132,48 @@ def test_auto_and_manual_beat_assembly_preserve_authoritative_layers(
         assert manual.manual_scene_override == override.scene_prompt_override
         assert manual.effective_scene_prompt == override.scene_prompt_override
         assert manual.semantic_requirement == before_semantics
+        assert manual.simplified_visual_core == automatic.simplified_visual_core
         qa_context = VisualQAContext.from_beat(beat)
-        assert qa_context.expected_physical_state == beat.physical_state
+        assert qa_context.expected_physical_state == beat.visible_physical_state
         assert qa_context.location_id == beat.location_id
         assert manual.auto_scene_prompt != manual.effective_scene_prompt
         assert manual.operation == "REFERENCE_GENERATION"
         assert manual.operation_instructions
         assert manual.references_used[0]["reference_id"] == "master-1"
+        assert manual.references_requested == manual.references_actually_sent
+        assert manual.continuity_mode == "REFERENCE_BASED"
         assert "reference" in (
             manual.assembled_prompt_before_provider_transform or ""
         ).lower()
         assert "Use this permanent drawing style" in (manual.final_provider_prompt or "")
+        assert "master-1" not in (manual.final_provider_prompt or "")
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_text_only_provider_exposes_requested_but_unsent_references(
+    tmp_path: Path,
+) -> None:
+    engine, _, session = _session(tmp_path)
+    try:
+        project_id, _, _ = _setup_execution(session)
+        assembly = preview_generation_request(
+            session,
+            project_id,
+            target_type="BEAT",
+            target_id="beat_3",
+            provider="zimage",
+            model="z-image",
+        )
+
+        assert assembly.references_requested
+        assert assembly.references_actually_sent == []
+        assert assembly.references_used == []
+        assert assembly.continuity_mode == "TEXT_ONLY_FALLBACK"
+        assert assembly.pre_shorten_prompt
+        assert assembly.provider_compaction_report is not None
+        assert "truncated_fields" in assembly.provider_compaction_report
     finally:
         session.close()
         engine.dispose()
@@ -387,8 +436,8 @@ def test_revision_safety_orphaning_and_restart_persistence(tmp_path: Path) -> No
         save_project_visual_plan_record(
             session,
             project_id=project_id,
-            schema_version="visual_plan_v1",
-            visual_director_version="visual_director_v2",
+            schema_version=VISUAL_PLAN_SCHEMA_VERSION,
+            visual_director_version=VISUAL_DIRECTOR_VERSION,
             story_text_hash=hash_story_text(project.story_text),
             plan_json=stale_plan.model_dump(mode="json"),
         )
@@ -407,8 +456,8 @@ def test_revision_safety_orphaning_and_restart_persistence(tmp_path: Path) -> No
         save_project_visual_plan_record(
             session,
             project_id=project_id,
-            schema_version="visual_plan_v1",
-            visual_director_version="visual_director_v2",
+            schema_version=VISUAL_PLAN_SCHEMA_VERSION,
+            visual_director_version=VISUAL_DIRECTOR_VERSION,
             story_text_hash=hash_story_text(project.story_text),
             plan_json=changed.model_dump(mode="json"),
         )
@@ -433,8 +482,8 @@ def test_revision_safety_orphaning_and_restart_persistence(tmp_path: Path) -> No
         save_project_visual_plan_record(
             session,
             project_id=project_id,
-            schema_version="visual_plan_v1",
-            visual_director_version="visual_director_v2",
+            schema_version=VISUAL_PLAN_SCHEMA_VERSION,
+            visual_director_version=VISUAL_DIRECTOR_VERSION,
             story_text_hash=hash_story_text(project.story_text),
             plan_json=removed.model_dump(mode="json"),
         )

@@ -529,6 +529,10 @@ document.addEventListener("DOMContentLoaded", () => {
       setText("[data-detail-style]", detail.style_contract_version || "—");
       setText("[data-detail-style-contract]", detail.style_contract_snapshot || "—");
       setText("[data-detail-qa-correction]", detail.qa_correction || "—");
+      setText("[data-detail-pre-shorten]", detail.pre_shorten_prompt || "—");
+      setText("[data-detail-truncated-fields]", (detail.truncated_fields || []).join(", ") || "None");
+      setText("[data-detail-continuity-mode]", detail.continuity_mode || "NONE");
+      setText("[data-detail-split-required]", detail.split_required ? "REQUIRED" : "NOT REQUIRED");
       setText("[data-detail-final]", detail.final_provider_prompt || "NO IMAGE PROVIDER CALL");
       const transformations = promptDialog.querySelector("[data-detail-transformations]");
       if (transformations) {
@@ -539,8 +543,14 @@ document.addEventListener("DOMContentLoaded", () => {
       const references = promptDialog.querySelector("[data-detail-references]");
       if (references) {
         references.replaceChildren();
-        (detail.references_used || []).forEach((item) => references.append(makeListItem(`${item.role} · ${item.reference_id}`)));
-        if (!(detail.references_used || []).length) references.append(makeListItem("None"));
+        (detail.references_actually_sent || []).forEach((item) => references.append(makeListItem(`${item.role} · ${item.reference_id}`)));
+        if (!(detail.references_actually_sent || []).length) references.append(makeListItem("None"));
+      }
+      const requestedReferences = promptDialog.querySelector("[data-detail-references-requested]");
+      if (requestedReferences) {
+        requestedReferences.replaceChildren();
+        (detail.references_requested || []).forEach((item) => requestedReferences.append(makeListItem(`${item.role} · ${item.reference_id}`)));
+        if (!(detail.references_requested || []).length) requestedReferences.append(makeListItem("None"));
       }
       promptDialog.querySelectorAll("[data-provider-prompt-fields]").forEach((element) => { element.hidden = noProvider; });
       const noProviderPanel = promptDialog.querySelector("[data-no-provider]");
@@ -557,6 +567,13 @@ document.addEventListener("DOMContentLoaded", () => {
       setText("[data-detail-time]", time ? `${Number(time.start).toFixed(1)}–${Number(time.end).toFixed(1)}s` : "—");
       setText("[data-detail-operation-detail]", detail.target_metadata?.operation_detail || "");
       renderKeyValues(promptDialog.querySelector("[data-detail-semantics]"), detail.semantic_requirement);
+      renderKeyValues(promptDialog.querySelector("[data-detail-visual-core]"), detail.simplified_visual_core);
+      renderKeyValues(promptDialog.querySelector("[data-detail-simplification-trace]"), {
+        complexity_budget: detail.complexity_budget,
+        visible_entities: detail.visible_entities,
+        omitted_entities: detail.omitted_entities,
+        environment_cues_actually_used: detail.environment_cues_used,
+      });
       renderHistory(detail.attempts || []);
       const stored = detail.stored_override;
       if (overrideInput instanceof HTMLTextAreaElement) overrideInput.value = stored?.scene_prompt_override || detail.manual_scene_override || "";

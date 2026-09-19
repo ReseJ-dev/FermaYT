@@ -35,7 +35,7 @@ from app.style_contracts import (
 
 logger = logging.getLogger(__name__)
 
-VISUAL_QA_PROMPT_VERSION = "visual_qa_v5"
+VISUAL_QA_PROMPT_VERSION = "visual_qa_v6"
 
 
 class VisualQAClient(Protocol):
@@ -71,6 +71,17 @@ class VisualQAContext:
     required_state: str | None = None
     forbidden_major_mismatches: tuple[str, ...] = ()
     generated_text_explicitly_required: bool = False
+    main_visual_idea: str | None = None
+    visible_physical_state: str | None = None
+    essential_visible_entities: tuple[str, ...] = ()
+    essential_environment_cues: tuple[str, ...] = ()
+    optional_entities_to_omit: tuple[str, ...] = ()
+    character_count_target: int | None = None
+    background_complexity: str | None = None
+    max_main_subjects: int | None = None
+    max_supporting_objects: int | None = None
+    max_environment_concepts: int | None = None
+    max_main_actions: int | None = None
 
     @classmethod
     def from_beat(
@@ -88,7 +99,7 @@ class VisualQAContext:
             required_objects=tuple(beat.important_objects),
             important_physical_action=beat.change_from_previous_beat,
             location_id=beat.location_id,
-            expected_physical_state=beat.physical_state,
+            expected_physical_state=beat.visible_physical_state,
             resolved_operation=beat.preferred_visual_operation.value,
             characters_visible=tuple(beat.characters_visible),
             camera_view=beat.camera_view,
@@ -100,6 +111,21 @@ class VisualQAContext:
             information_added_beyond_narration=(
                 beat.information_added_beyond_narration
             ),
+            main_visual_idea=beat.main_visual_idea,
+            visible_physical_state=beat.visible_physical_state,
+            essential_visible_entities=tuple(
+                dict.fromkeys((*beat.characters_visible, *beat.important_objects))
+            ),
+            essential_environment_cues=tuple(beat.essential_environment_cues),
+            optional_entities_to_omit=tuple(beat.optional_entities_to_omit),
+            character_count_target=beat.character_count_target,
+            background_complexity=beat.background_complexity.value,
+            max_main_subjects=beat.complexity_budget.max_main_subjects,
+            max_supporting_objects=beat.complexity_budget.max_supporting_objects,
+            max_environment_concepts=(
+                beat.complexity_budget.max_environment_concepts
+            ),
+            max_main_actions=beat.complexity_budget.max_main_actions,
         )
 
 
@@ -162,7 +188,8 @@ class VisualQAService:
             if isinstance(payload, dict):
                 payload = _without_qwen_schema_echo(payload)
                 payload = _normalize_contradictory_qwen_pass(payload)
-            return VisualQADecision.model_validate(payload)
+            decision = VisualQADecision.model_validate(payload)
+            return _normalize_simplicity_decision(decision, context)
         except (json.JSONDecodeError, TypeError, ValidationError) as exc:
             diagnostic = StructuredAIProviderDiagnostic(
                 provider=self.provider,
@@ -433,6 +460,16 @@ REQUIRED STORY INFORMATION:
 - required story state: {context.required_state or context.expected_physical_state}
 - forbidden major mismatches: {", ".join(context.forbidden_major_mismatches) or "none"}
 
+PLANNED VISUAL SIMPLICITY:
+- one-second visual idea: {context.main_visual_idea or context.what_viewer_should_understand}
+- essential visible entities only: {", ".join(context.essential_visible_entities) or ", ".join((*context.characters_visible, *context.required_objects)) or "none"}
+- required visible state: {context.visible_physical_state or context.required_state or context.expected_physical_state}
+- minimal environment cues: {", ".join(context.essential_environment_cues) or context.location_id}
+- intended visible character count: {context.character_count_target if context.character_count_target is not None else "not explicitly limited"}
+- background complexity: {context.background_complexity or "simple enough for immediate reading"}
+- complexity budget: main subjects <= {context.max_main_subjects if context.max_main_subjects is not None else "planned essentials"}; supporting objects <= {context.max_supporting_objects if context.max_supporting_objects is not None else "planned essentials"}; environment concepts <= {context.max_environment_concepts if context.max_environment_concepts is not None else "minimum needed"}; main actions <= {context.max_main_actions if context.max_main_actions is not None else 1}
+- optional entities explicitly omitted: {", ".join(context.optional_entities_to_omit) or "none"}
+
 CHECK STORY ACCURACY: required objects, visible physical action, and intended purpose.
 Explicitly verify every required entity, its story-critical role/identity attributes,
 the required environment, and required physical state. Generic people cannot replace
@@ -443,11 +480,14 @@ CHECK CONTINUITY: master location, recurring characters and objects; reject envi
 redesign. Compare recurring character helmet color, clothing colors, safety vest,
 body proportions, simple face design, and carried equipment. Use
 CHARACTER_IDENTITY_DRIFT when those identifiers change. Compare the master location's
-tunnel proportions, wall color family, ventilation pipes, supports, rail layout,
-lights, and palette. Use LOCATION_IDENTITY_DRIFT or ENVIRONMENT_MISMATCH when the
-required environment is replaced or redesigned. A previous frame from another
-location does not override the explicitly required current location or its master;
-do not reject a legitimate location transition described by the current requirements.
+identity, proportions, palette and geometry only for anchors actually required by the
+current simplified visual core. The master is continuity authority, not mandatory
+inventory: do not require its pipes, supports, rails, lights, tools, machinery, or
+other objects when they are absent from the planned essential entities and environment
+cues. Use LOCATION_IDENTITY_DRIFT or ENVIRONMENT_MISMATCH when the required environment
+is replaced or redesigned. A previous frame from another location does not override
+the explicitly required current location or its master; do not reject a legitimate
+location transition described by the current requirements.
 CHECK STYLE: compare line thickness, character simplification, color flatness,
 shading level, detail ceiling, and handmade appearance against STYLE_REFERENCE.
 Use STYLE_DETAIL_DRIFT for excess or inconsistent detail and STYLE_SHADING_DRIFT for
@@ -459,6 +499,18 @@ and REGENERATE for a large white external margin, drawn rectangular image frame,
 paper-like border, poster/panel boundary, or fake canvas edge unless the story
 explicitly requires it. CHECK VIDEO READABILITY: rapid understanding, needed
 simplification, and whether crop/framing should change.
+CHECK VISUAL SIMPLICITY AS A SEPARATE REQUIREMENT: decide whether the main visual
+idea is obvious in about one second and whether there is one dominant subject/action.
+Compare the candidate against PLANNED VISUAL SIMPLICITY, not against everything known
+about the master location. Extra master inventory is not automatically required.
+Flag unnecessary objects, extra characters, detailed background machinery or rock
+texture, and unrelated competing actions. A complex detailed scene rendered with
+thick outlines is not a simple explainer drawing. Use EXCESSIVE_VISUAL_COMPLEXITY
+when clutter clearly obscures the planned core, TOO_MANY_CHARACTERS when the planned
+count is materially exceeded, UNCLEAR_VISUAL_FOCUS when the one-second idea is not
+obvious, MULTIPLE_COMPETING_ACTIONS for unrelated actions, and
+UNNECESSARY_BACKGROUND_DETAIL for a minor usable excess. EXCESSIVE_CLUTTER remains
+valid for object clutter. Do not invent missing items merely to fill the scene.
 CHECK UNINTENDED TEXT: reject any visible prompt wording, pseudo-text, caption, section
 heading, operation name,
 technical label, watermark, or interface text unless readable story-world text is
@@ -481,11 +533,24 @@ PERMANENT STYLE CONTRACT:
 
 The intended style is deliberately simple, rough, flat and slightly imperfect. Do not
 reject crude geometry, uneven lines, simplified anatomy or mildly imperfect perspective.
-Reject meaningful realism, polish, detail drift, clutter, or loss of readability.
+Sparse backgrounds, naive drawing, simplified proportions and visibly sketch-like
+construction are desirable, not defects. Reject meaningful realism, polish, detail
+drift, clutter, or loss of readability. Do not require an aesthetically polished or
+more detailed drawing, but still require a coherent, intact and readable result; do
+not reward broken rendering merely because it is simple.
+
+SIMPLICITY SEVERITY:
+- harmless slight extra background detail with a clear focal idea: PASS_WITH_WARNING;
+- clearly overcomplicated frame, materially excessive character count, obscured focal
+  idea, or competing actions: REGENERATE;
+- do not reject harmless minor variation.
+For a complexity REGENERATE, correction_instruction must say what to REMOVE and what
+small planned core to KEEP. Do not respond only with generic wording such as "improve
+clarity" or add new objects.
 
 Return PASS only when no correction is needed. PASS_WITH_WARNING is allowed only for
 a usable frame with a minor non-blocking defect. Otherwise return REGENERATE with
-five dimension scores, stable problem_categories, concrete reasons, severity, and one
+six dimension scores, stable problem_categories, concrete reasons, severity, and one
 actionable correction_instruction that preserves all correct semantic requirements.
 Return exactly one JSON object matching
 this schema, with no markdown or commentary:
@@ -516,7 +581,54 @@ _HARD_FAILURE_CATEGORIES = {
     VisualQAProblemCategory.UNINTENDED_TEXT,
     VisualQAProblemCategory.UNWANTED_FRAME_OR_MARGIN,
     VisualQAProblemCategory.VIDEO_READABILITY,
+    VisualQAProblemCategory.EXCESSIVE_VISUAL_COMPLEXITY,
+    VisualQAProblemCategory.TOO_MANY_CHARACTERS,
+    VisualQAProblemCategory.UNCLEAR_VISUAL_FOCUS,
+    VisualQAProblemCategory.MULTIPLE_COMPETING_ACTIONS,
 }
+
+_SIMPLICITY_PROBLEM_CATEGORIES = {
+    VisualQAProblemCategory.EXCESSIVE_VISUAL_COMPLEXITY,
+    VisualQAProblemCategory.UNNECESSARY_BACKGROUND_DETAIL,
+    VisualQAProblemCategory.TOO_MANY_CHARACTERS,
+    VisualQAProblemCategory.UNCLEAR_VISUAL_FOCUS,
+    VisualQAProblemCategory.MULTIPLE_COMPETING_ACTIONS,
+    VisualQAProblemCategory.EXCESSIVE_CLUTTER,
+}
+
+
+def _normalize_simplicity_decision(
+    decision: VisualQADecision,
+    context: VisualQAContext,
+) -> VisualQADecision:
+    """Turn complexity failures into bounded removal instructions, never additions."""
+    if decision.result is not VisualQAResult.REGENERATE:
+        return decision
+    if not set(decision.problem_categories) & _SIMPLICITY_PROBLEM_CATEGORIES:
+        return decision
+    keep = list(context.essential_visible_entities)
+    if not keep:
+        keep.extend(context.characters_visible)
+        keep.extend(context.required_objects)
+    state = context.visible_physical_state or context.required_state
+    cues = list(context.essential_environment_cues)
+    keep_text = ", ".join(dict.fromkeys(item for item in keep if item)) or "the main subject"
+    if state:
+        keep_text += f", {state}"
+    if cues:
+        keep_text += f", and minimal environment cues ({', '.join(cues)})"
+    count = (
+        f" Show exactly {context.character_count_target} visible character(s)."
+        if context.character_count_target is not None
+        else ""
+    )
+    focus = context.main_visual_idea or context.what_viewer_should_understand
+    correction = (
+        f"Keep only {keep_text}.{count} Remove extra characters and every unrelated "
+        "object, including machinery, pipes, tools, signs, debris, decorative "
+        f"texture, and background clutter. Keep one dominant visual idea: {focus}"
+    )
+    return decision.model_copy(update={"correction_instruction": correction})
 
 
 def is_hard_qa_failure(decision: VisualQADecision) -> bool:
@@ -534,6 +646,7 @@ def qa_candidate_penalty(decision: VisualQADecision) -> float:
         + (1 - scores.continuity) * 5
         + (1 - scores.composition) * 4
         + (1 - scores.operation_correctness) * 4
+        + (1 - scores.visual_simplicity) * 4
         + (1 - scores.style) * 2
     )
     return weighted_loss + len(decision.problem_categories) * 0.1
@@ -559,12 +672,25 @@ def apply_visual_qa_correction(
         normalized_prompt = normalized_prompt[: -len(contract)].rstrip()
     elif normalized_prompt.endswith(style.render()):
         normalized_prompt = normalized_prompt[: -len(style.render())].rstrip()
+    normalized_prompt = _remove_previous_qa_correction(normalized_prompt)
     correction = sanitize_provider_visual_text(correction)
     corrected_dynamic_prompt = (
         f"{normalized_prompt}\n\nRegenerate the illustration so that {correction}. "
         "Preserve every correct visual element."
     )
     return apply_image_style_contract(corrected_dynamic_prompt, style_id)
+
+
+def _remove_previous_qa_correction(prompt: str) -> str:
+    """Replace the prior bounded retry delta instead of accumulating corrections."""
+    marker = "\n\nRegenerate the illustration so that "
+    start = prompt.rfind(marker)
+    if start < 0:
+        return prompt
+    tail = prompt[start + len(marker) :]
+    if not tail.endswith(". Preserve every correct visual element."):
+        return prompt
+    return prompt[:start].rstrip()
 
 
 async def _finish_best(

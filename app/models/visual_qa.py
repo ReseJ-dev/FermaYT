@@ -33,6 +33,11 @@ class VisualQAProblemCategory(str, Enum):
     COMPOSITION_UNCLEAR = "COMPOSITION_UNCLEAR"
     IMPORTANT_ACTION_TOO_SMALL = "IMPORTANT_ACTION_TOO_SMALL"
     EXCESSIVE_CLUTTER = "EXCESSIVE_CLUTTER"
+    EXCESSIVE_VISUAL_COMPLEXITY = "EXCESSIVE_VISUAL_COMPLEXITY"
+    UNNECESSARY_BACKGROUND_DETAIL = "UNNECESSARY_BACKGROUND_DETAIL"
+    TOO_MANY_CHARACTERS = "TOO_MANY_CHARACTERS"
+    UNCLEAR_VISUAL_FOCUS = "UNCLEAR_VISUAL_FOCUS"
+    MULTIPLE_COMPETING_ACTIONS = "MULTIPLE_COMPETING_ACTIONS"
     UNWANTED_TEXT = "UNWANTED_TEXT"
     UNINTENDED_TEXT = "UNINTENDED_TEXT"
     WRONG_CAMERA = "WRONG_CAMERA"
@@ -63,6 +68,7 @@ class VisualQAScores(BaseModel):
     style: float = Field(default=1.0, ge=0, le=1)
     composition: float = Field(default=1.0, ge=0, le=1)
     operation_correctness: float = Field(default=1.0, ge=0, le=1)
+    visual_simplicity: float = Field(default=1.0, ge=0, le=1)
 
 
 class VisualQADecision(BaseModel):
@@ -129,6 +135,10 @@ class VisualQADecision(BaseModel):
                 VisualQAProblemCategory.UNWANTED_TEXT,
                 VisualQAProblemCategory.UNINTENDED_TEXT,
                 VisualQAProblemCategory.UNWANTED_FRAME_OR_MARGIN,
+                VisualQAProblemCategory.EXCESSIVE_VISUAL_COMPLEXITY,
+                VisualQAProblemCategory.TOO_MANY_CHARACTERS,
+                VisualQAProblemCategory.UNCLEAR_VISUAL_FOCUS,
+                VisualQAProblemCategory.MULTIPLE_COMPETING_ACTIONS,
             }
             if set(self.problem_categories) & hard_categories:
                 raise ValueError("hard failures cannot PASS_WITH_WARNING")

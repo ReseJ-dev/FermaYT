@@ -47,7 +47,11 @@ from app.secret_store import (
     KIE_API_KEY,
     KIMI_API_KEY,
 )
-from app.services.visual_planning import hash_story_text
+from app.services.visual_planning import (
+    VISUAL_DIRECTOR_VERSION,
+    VISUAL_PLAN_SCHEMA_VERSION,
+    hash_story_text,
+)
 
 
 class FakeSecretStore:
@@ -110,8 +114,8 @@ def _save_prompt_sheet_plan(session_factory: object, project_id: str, plan: obje
         save_project_visual_plan_record(
             session,
             project_id=project_id,
-            schema_version="visual_plan_v1",
-            visual_director_version="visual_director_v2",
+            schema_version=VISUAL_PLAN_SCHEMA_VERSION,
+            visual_director_version=VISUAL_DIRECTOR_VERSION,
             story_text_hash=hash_story_text(project.story_text),
             plan_json=plan.model_dump(mode="json"),  # type: ignore[attr-defined]
         )
@@ -1096,6 +1100,9 @@ def test_prompt_sheet_dynamically_separates_masters_beats_and_free_operations(
     assert "data-prompt-filter" in page.text
     assert "data-generate-selected" in page.text
     assert "STORYBOARD" in page.text
+    assert "FULL SEMANTIC REQUIREMENT" in page.text
+    assert "SIMPLIFIED VISUAL CORE" in page.text
+    assert "data-detail-visual-core" in page.text
     assert page.text.index("MASTER SCENES") < page.text.index("ALL VISUAL BEATS")
     assert page.text.index("ALL VISUAL BEATS") < page.text.index("STORYBOARD")
     rows = sheet.json()["targets"]
@@ -1106,6 +1113,11 @@ def test_prompt_sheet_dynamically_separates_masters_beats_and_free_operations(
     reuse = client.get(f"/api/projects/{project_id}/prompts/BEAT/beat_7").json()
     assert reuse["final_provider_prompt"] is None
     assert reuse["target_metadata"]["source_visual_id"] == "beat_6"
+    generated = client.get(
+        f"/api/projects/{project_id}/prompts/BEAT/beat_1"
+    ).json()
+    assert generated["simplified_visual_core"]["main_visual_idea"]
+    assert "Use this permanent drawing style" not in generated["auto_scene_prompt"]
 
 
 def test_visual_sheet_generate_selected_uses_stable_ids_in_story_order(
@@ -1185,8 +1197,25 @@ def test_prompt_sheet_override_lifecycle_and_exact_provider_preview(
         item["type"] == "ZIMAGE_LIMIT_NORMALIZATION"
         for item in zimage.json()["provider_transformations"]
     )
+    trace = zimage.json()
+    assert "complexity_budget" in trace
+    assert "visible_entities" in trace
+    assert "omitted_entities" in trace
+    assert "environment_cues_used" in trace
+    assert "references_requested" in trace
+    assert "references_actually_sent" in trace
+    assert trace["continuity_mode"] in {
+        "REFERENCE_BASED",
+        "TEXT_ONLY_FALLBACK",
+        "NONE",
+    }
+    assert "pre_shorten_prompt" in trace
+    assert "truncated_fields" in trace
     page = client.get(f"/projects/{project_id}/prompts")
     assert 'data-target-id="beat_1" data-mode="OVERRIDE"' in page.text
+    assert "REFERENCES REQUESTED" in page.text
+    assert "REFERENCES ACTUALLY SENT" in page.text
+    assert "PRE-SHORTEN PROMPT" in page.text
 
     cleared = client.delete(
         f"/api/projects/{project_id}/prompts/BEAT/beat_1/override"

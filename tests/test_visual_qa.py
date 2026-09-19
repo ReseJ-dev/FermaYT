@@ -41,6 +41,29 @@ def _context(tmp_path: Path) -> VisualQAContext:
     )
 
 
+def _simple_flood_context(tmp_path: Path) -> VisualQAContext:
+    return replace(
+        _context(tmp_path),
+        visual_purpose="Show the immediate electrical danger",
+        what_viewer_should_understand="Rising water reaches the cabinet",
+        required_objects=("electrical cabinet", "rising water"),
+        important_physical_action="Water rises to the cabinet base",
+        expected_physical_state="One miner beside a cabinet as water reaches it",
+        characters_visible=("miner",),
+        main_visual_idea="Rising water reaches the electrical cabinet",
+        visible_physical_state="water touches the base of the electrical cabinet",
+        essential_visible_entities=("one miner", "electrical cabinet", "rising water"),
+        essential_environment_cues=("simple tunnel walls",),
+        optional_entities_to_omit=("extra machinery", "tools", "rails"),
+        character_count_target=1,
+        background_complexity="SPARSE",
+        max_main_subjects=1,
+        max_supporting_objects=2,
+        max_environment_concepts=1,
+        max_main_actions=1,
+    )
+
+
 def _pass() -> VisualQADecision:
     return VisualQADecision(
         result="PASS",
@@ -637,3 +660,205 @@ def test_qa_request_requires_miner_identity_and_rejects_unintended_text(
     assert "mining helmets" in prompt and "work clothing" in prompt
     assert "generic civilians" in prompt and "unclothed people" in prompt
     assert "UNINTENDED_TEXT" in prompt
+
+
+def test_simple_required_frame_passes_simplicity_qa(tmp_path: Path) -> None:
+    class Client:
+        prompt = ""
+
+        async def evaluate(self, prompt: str, image_paths: tuple[str, ...]) -> str:
+            del image_paths
+            self.prompt = prompt
+            return json.dumps(
+                {
+                    "result": "PASS",
+                    "scores": {"visual_simplicity": 0.98},
+                    "problem_categories": [],
+                    "reasons": [],
+                    "correction_instruction": None,
+                }
+            )
+
+    client = Client()
+    decision = asyncio.run(
+        VisualQAService(client).evaluate(
+            "one-miner-water-cabinet.png", _simple_flood_context(tmp_path)
+        )
+    )
+
+    assert decision.result is VisualQAResult.PASS
+    assert "one miner, electrical cabinet, rising water" in client.prompt
+    assert "intended visible character count: 1" in client.prompt
+    assert "CHECK VISUAL SIMPLICITY AS A SEPARATE REQUIREMENT" in client.prompt
+    assert "master is continuity authority, not mandatory" in client.prompt
+
+
+def test_overcomplicated_frame_regenerates_with_removal_correction(
+    tmp_path: Path,
+) -> None:
+    class Client:
+        async def evaluate(self, prompt: str, image_paths: tuple[str, ...]) -> str:
+            del prompt, image_paths
+            return json.dumps(
+                {
+                    "result": "REGENERATE",
+                    "scores": {"visual_simplicity": 0.15},
+                    "problem_categories": [
+                        "EXCESSIVE_VISUAL_COMPLEXITY",
+                        "TOO_MANY_CHARACTERS",
+                    ],
+                    "reasons": [
+                        "Five miners, extensive equipment, tools and machinery obscure the water hazard"
+                    ],
+                    "correction_instruction": "Improve clarity",
+                    "severity": "major",
+                }
+            )
+
+    decision = asyncio.run(
+        VisualQAService(Client()).evaluate(
+            "cluttered-frame.png", _simple_flood_context(tmp_path)
+        )
+    )
+
+    assert decision.result is VisualQAResult.REGENERATE
+    assert VisualQAProblemCategory.EXCESSIVE_VISUAL_COMPLEXITY in (
+        decision.problem_categories
+    )
+    assert decision.correction_instruction is not None
+    assert "Keep only one miner, electrical cabinet, rising water" in (
+        decision.correction_instruction
+    )
+    assert "Remove extra characters and every unrelated object" in (
+        decision.correction_instruction
+    )
+    assert "Show exactly 1 visible character" in decision.correction_instruction
+
+
+def test_sparse_naive_drawing_is_not_treated_as_a_defect(tmp_path: Path) -> None:
+    class Client:
+        async def evaluate(self, prompt: str, image_paths: tuple[str, ...]) -> str:
+            del image_paths
+            assert "Sparse backgrounds, naive drawing" in prompt
+            assert "desirable, not defects" in prompt
+            return json.dumps(
+                {
+                    "result": "PASS",
+                    "scores": {"style": 0.95, "visual_simplicity": 1.0},
+                    "problem_categories": [],
+                    "reasons": [],
+                    "correction_instruction": None,
+                }
+            )
+
+    decision = asyncio.run(
+        VisualQAService(Client()).evaluate(
+            "sparse-naive-frame.png", _simple_flood_context(tmp_path)
+        )
+    )
+
+    assert decision.result is VisualQAResult.PASS
+
+
+def test_slightly_richer_background_can_pass_with_warning(tmp_path: Path) -> None:
+    class Client:
+        async def evaluate(self, prompt: str, image_paths: tuple[str, ...]) -> str:
+            del prompt, image_paths
+            return json.dumps(
+                {
+                    "result": "PASS_WITH_WARNING",
+                    "scores": {"visual_simplicity": 0.72},
+                    "problem_categories": ["UNNECESSARY_BACKGROUND_DETAIL"],
+                    "reasons": [
+                        "A few extra wall marks are visible, but the water hazard remains immediately clear"
+                    ],
+                    "correction_instruction": None,
+                    "severity": "minor",
+                }
+            )
+
+    decision = asyncio.run(
+        VisualQAService(Client()).evaluate(
+            "slightly-rich-background.png", _simple_flood_context(tmp_path)
+        )
+    )
+
+    assert decision.result is VisualQAResult.PASS_WITH_WARNING
+    assert decision.problem_categories == [
+        VisualQAProblemCategory.UNNECESSARY_BACKGROUND_DETAIL
+    ]
+
+
+def test_complexity_retry_uses_only_latest_bounded_removal_instruction(
+    tmp_path: Path,
+) -> None:
+    corrections: list[str | None] = []
+
+    async def generate(correction: str | None, output_path: str) -> str:
+        corrections.append(correction)
+        Path(output_path).write_bytes(b"candidate")
+        return output_path
+
+    responses = [
+        {
+            "result": "REGENERATE",
+            "problem_categories": ["EXCESSIVE_VISUAL_COMPLEXITY"],
+            "reasons": ["Machinery and five workers obscure the focal action"],
+            "correction_instruction": "Simplify it",
+            "severity": "major",
+        },
+        {
+            "result": "REGENERATE",
+            "problem_categories": ["EXCESSIVE_CLUTTER"],
+            "reasons": ["Tools and pipes still crowd the background"],
+            "correction_instruction": "Remove the remaining clutter",
+            "severity": "major",
+        },
+        {
+            "result": "PASS",
+            "problem_categories": [],
+            "reasons": [],
+            "correction_instruction": None,
+        },
+    ]
+
+    class Client:
+        calls = 0
+
+        async def evaluate(self, prompt: str, image_paths: tuple[str, ...]) -> str:
+            del prompt, image_paths
+            response = responses[self.calls]
+            self.calls += 1
+            return json.dumps(response)
+
+    outcome = asyncio.run(
+        generate_with_visual_qa(
+            generate,
+            str(tmp_path / "simple-final.png"),
+            _simple_flood_context(tmp_path),
+            VisualQAService(Client()),
+            max_retries=2,
+        )
+    )
+
+    assert outcome.decision is not None
+    assert outcome.decision.result is VisualQAResult.PASS
+    assert len(corrections) == 3
+    assert corrections[0] is None
+    assert corrections[1] is not None and corrections[2] is not None
+    assert corrections[1].count("Remove extra characters") == 1
+    assert corrections[2].count("Remove extra characters") == 1
+    assert "Simplify it" not in corrections[1]
+    assert "Remove the remaining clutter" not in corrections[2]
+
+
+def test_applying_new_qa_correction_replaces_previous_retry_delta() -> None:
+    from app.style_contracts import apply_image_style_contract
+
+    original = apply_image_style_contract("One miner beside rising water")
+    first = apply_visual_qa_correction(original, "Remove pipes and tools")
+    second = apply_visual_qa_correction(first, "Remove extra machinery")
+
+    assert "Remove pipes and tools" not in second
+    assert second.count("Regenerate the illustration so that") == 1
+    assert "Remove extra machinery" in second

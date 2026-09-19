@@ -30,7 +30,7 @@ class _Section:
     value: str
     minimum: int
     preferred: int
-    optional: bool = False
+    priority: str = "IMPORTANT"
 
 
 def compile_zimage_semantic_prompt(
@@ -54,12 +54,8 @@ def compile_zimage_semantic_prompt(
         if isinstance(target, VisualBeat)
         else _master_sections(plan, target, manual_scene_override, qa_correction)
     )
-    sections.append(
-        _Section(
-            "style", "Style", _COMPACT_STYLE, len(_COMPACT_STYLE), len(_COMPACT_STYLE)
-        )
-    )
-    # QA is intentionally last in semantic priority, but remains explicit on retry.
+    # QA remains a targeted delta to the original specification. Style wording is
+    # last so it can never displace subject, action, objects, location, or framing.
     if qa_correction is not None:
         correction = sanitize_provider_visual_text(qa_correction)
         if correction:
@@ -68,27 +64,58 @@ def compile_zimage_semantic_prompt(
                     "qa_correction",
                     "Correction",
                     correction,
-                    min(len(correction), 75),
-                    90,
+                    len(correction),
+                    len(correction),
+                    "CORRECTION",
                 )
             )
+    sections.append(
+        _Section(
+            "style", "Style", _COMPACT_STYLE, len(_COMPACT_STYLE), len(_COMPACT_STYLE)
+        )
+    )
 
     prefix = "Purely pictorial scene."
     fixed = len(prefix) + sum(len(f" {item.label}: .") for item in sections)
     available = KieZImageApiClient.PROMPT_MAX_CHARACTERS - fixed
-    minimums = [min(len(item.value), item.minimum) for item in sections]
+    required_length = sum(
+        len(item.value)
+        for item in sections
+        if item.priority in {"REQUIRED", "CORRECTION"}
+    )
+    if required_length > available:
+        raise _required_state_truncated(
+            "required semantic fields cannot fit the provider boundary"
+        )
+    minimums = [
+        len(item.value)
+        if item.priority in {"REQUIRED", "CORRECTION"}
+        else 0
+        if item.priority == "OPTIONAL"
+        else min(len(item.value), item.minimum)
+        for item in sections
+    ]
     if sum(minimums) > available:
-        raise _too_complex("required semantic section minimums exceed 800 characters")
+        # Required content is intact; compress IMPORTANT before losing semantics.
+        minimums = [
+            len(item.value)
+            if item.priority in {"REQUIRED", "CORRECTION"}
+            else 0
+            for item in sections
+        ]
 
     allocations = minimums[:]
     remaining = available - sum(allocations)
     # Priority order is the section order. Fill each semantic section to its
     # preferred budget before lower-priority wording receives any extra space.
-    for index, section in enumerate(sections):
-        wanted = min(len(section.value), section.preferred)
-        addition = min(max(0, wanted - allocations[index]), remaining)
-        allocations[index] += addition
-        remaining -= addition
+    for priority in ("IMPORTANT", "OPTIONAL"):
+        for index, section in enumerate(sections):
+            if section.priority != priority:
+                continue
+            wanted = min(len(section.value), section.preferred)
+            addition = min(max(0, wanted - allocations[index]), remaining)
+            allocations[index] += addition
+            remaining -= addition
 
     rendered_values = [
         _truncate_at_word(section.value, allocation)
@@ -109,9 +136,18 @@ def compile_zimage_semantic_prompt(
         if value != section.value
     ]
     report: dict[str, object] = {
-        "preserved_fields": [item.field for item in sections],
+        "preserved_fields": [
+            item.field
+            for item, value in zip(sections, rendered_values, strict=True)
+            if value == item.value
+        ],
         "compressed_fields": compressed,
+        "truncated_fields": compressed,
         "dropped_optional_fields": dropped_optional,
+        "required_fields": [
+            item.field for item in sections if item.priority == "REQUIRED"
+        ],
+        "required_state_status": "PRESERVED",
         "final_length": len(prompt),
         "maximum_characters": KieZImageApiClient.PROMPT_MAX_CHARACTERS,
     }
@@ -133,35 +169,38 @@ def _beat_sections(
     if location is None:
         raise _too_complex(f"unknown location {beat.location_id}")
 
-    action_parts: list[str] = []
-    if manual:
-        action_parts.append(f"requested scene {_truncate_at_word(manual, 65)}")
-    action_parts.append(f"required state {beat.physical_state}")
-    if not _substantially_overlaps(
-        beat.physical_state, beat.what_viewer_should_understand
-    ):
-        action_parts.append(beat.what_viewer_should_understand)
+    action_parts: list[str] = [
+        f"main visual fact {beat.main_visual_idea}",
+        f"required visible state {beat.visible_physical_state}",
+    ]
     action = _clean_join(action_parts)
-    action_minimum = min(
-        len(action),
-        (76 if manual else 0) + min(62, len(beat.physical_state) + 15),
-    )
     character_names = [by_character[item].name for item in beat.characters_visible]
     character_details = [
-        f"{by_character[item].name}, {by_character[item].description}"
+        f"{by_character[item].name}, {_compact_descriptor(by_character[item].description, 12)}"
         for item in beat.characters_visible
     ]
-    subject = _identity_first(character_names, character_details) or "no people visible"
+    subject_identity = _identity_first(character_names, character_details)
+    if subject_identity:
+        count = "one" if beat.character_count_target == 1 else str(
+            beat.character_count_target
+        )
+        subject = f"{count} visible character; {subject_identity}"
+    else:
+        subject = "no people visible"
     object_names = [by_object[item].name for item in beat.important_objects]
     object_details = [
-        f"{by_object[item].name}, {by_object[item].description}"
+        f"{by_object[item].name}, {_compact_descriptor(by_object[item].description, 8)}"
         for item in beat.important_objects
     ]
     objects = (
         _identity_first(object_names, object_details) or "no required story object"
     )
     location_value = _identity_with_details(
-        location.name, location.description, location.spatial_layout
+        location.name,
+        *(
+            _compact_descriptor(cue, 12)
+            for cue in beat.essential_environment_cues
+        ),
     )
     camera = _clean_join((beat.camera_framing.value, beat.camera_view))
     change = beat.change_from_previous_beat
@@ -177,10 +216,10 @@ def _beat_sections(
         change = f"edit only this change; preserve all other continuity; {change}"
 
     sections = [
-        _Section("physical_state_action", "Action", action, action_minimum, 145),
-        _Section("characters", "Subject", subject, 42, 105),
-        _Section("location", "Location", location_value, 48, 105),
-        _Section("critical_objects", "Objects", objects, 42, 105),
+        _Section("characters", "Subject", subject, len(subject), len(subject), "REQUIRED"),
+        _Section("physical_state_action", "Action", action, len(action), len(action), "REQUIRED"),
+        _Section("critical_objects", "Objects", objects, len(objects), len(objects), "REQUIRED"),
+        _Section("location", "Location", location_value, len(location_value), len(location_value), "REQUIRED"),
         _Section("camera_composition", "Camera", camera, 42, 90),
         _Section(
             "change_from_previous",
@@ -190,9 +229,21 @@ def _beat_sections(
             82,
         ),
     ]
-    if beat.must_not_show:
+    if manual:
         sections.append(
-            _Section("must_not_show", "Avoid", _clean_join(beat.must_not_show), 28, 55)
+            _Section(
+                "manual_scene_override",
+                "Scene",
+                sanitize_provider_visual_text(manual),
+                0,
+                90,
+                "OPTIONAL",
+            )
+        )
+    excluded = [*beat.must_not_show, *beat.optional_entities_to_omit]
+    if excluded:
+        sections.append(
+            _Section("must_not_show", "Avoid", _clean_join(excluded), 28, 55)
         )
     dropped = [
         "visual_purpose",
@@ -205,9 +256,7 @@ def _beat_sections(
         dropped.append("anticipated_consequence")
     if qa_correction is None:
         dropped.append("qa_correction")
-    anchors = (
-        character_names + [location.name] + object_names + [beat.camera_framing.value]
-    )
+    anchors = character_names + [location.name] + object_names
     return sections, dropped, anchors
 
 
@@ -234,50 +283,78 @@ def _master_sections(
         f"{by_object[item].name}, {by_object[item].description}"
         for item in master.important_objects
     ]
+    master_action = f"required master {_compact_descriptor(master.description, 22)}"
+    master_subject = _identity_first(
+        character_names,
+        [
+            f"{name}, {_compact_descriptor(detail, 10)}"
+            for name, detail in zip(character_names, character_details, strict=True)
+        ],
+    ) or "no people visible"
+    master_location = _identity_with_details(
+        location.name,
+        _compact_descriptor(location.description, 12),
+        _compact_descriptor(master.environment_geometry, 12),
+    )
+    master_objects = (
+        _identity_first(
+            object_names,
+            [
+                f"{name}, {_compact_descriptor(detail, 8)}"
+                for name, detail in zip(object_names, object_details, strict=True)
+            ],
+        )
+        or _compact_descriptor(master.recurring_object_positions, 12)
+    )
     sections = [
         _Section(
             "physical_state_action",
             "Action",
-            _clean_join(
-                (
-                    f"requested scene {_truncate_at_word(manual, 65)}",
-                    f"required master {master.description}",
-                )
-                if manual
-                else (f"required master {master.description}",)
-            ),
-            min(len(master.description) + (76 if manual else 16), 130),
-            135,
+            master_action,
+            len(master_action),
+            len(master_action),
+            "REQUIRED",
         ),
         _Section(
             "characters",
             "Subject",
-            _identity_first(character_names, character_details) or "no people visible",
-            38,
-            95,
+            master_subject,
+            len(master_subject),
+            len(master_subject),
+            "REQUIRED",
         ),
         _Section(
             "location",
             "Location",
-            _identity_with_details(
-                location.name, location.description, master.environment_geometry
-            ),
-            48,
-            115,
+            master_location,
+            len(master_location),
+            len(master_location),
+            "REQUIRED",
         ),
         _Section(
             "critical_objects",
             "Objects",
-            _identity_first(object_names, object_details)
-            or master.recurring_object_positions,
-            40,
-            100,
+            master_objects,
+            len(master_objects),
+            len(master_objects),
+            "REQUIRED",
         ),
         _Section("camera_composition", "Camera", master.basic_composition, 42, 90),
         _Section(
             "change_from_previous", "Layout", master.recurring_object_positions, 34, 65
         ),
     ]
+    if manual:
+        sections.append(
+            _Section(
+                "manual_scene_override",
+                "Scene",
+                sanitize_provider_visual_text(manual),
+                0,
+                90,
+                "OPTIONAL",
+            )
+        )
     dropped = ["color_palette", "project_style_prose", "reference_role_prose"]
     if qa_correction is None:
         dropped.append("qa_correction")
@@ -306,12 +383,10 @@ def _identity_with_details(identity: str, *details: str) -> str:
     return _clean_join((identity, *cleaned))
 
 
-def _substantially_overlaps(left: str, right: str) -> bool:
-    left_words = {item.casefold().strip(".,;:-") for item in left.split()}
-    right_words = {item.casefold().strip(".,;:-") for item in right.split()}
-    if not left_words or not right_words:
-        return False
-    return len(left_words & right_words) / min(len(left_words), len(right_words)) >= 0.5
+def _compact_descriptor(value: str, maximum_words: int) -> str:
+    cleaned = sanitize_provider_visual_text(value)
+    clause = cleaned.split(".", 1)[0].split(";", 1)[0].strip(" ,")
+    return " ".join(clause.split()[:maximum_words])
 
 
 def _clean_join(values: object) -> str:
@@ -341,7 +416,7 @@ def _validate_required_sections(
     missing = [
         section.field
         for section, value in zip(sections, rendered_values, strict=True)
-        if not section.optional and not value.strip()
+        if section.priority == "REQUIRED" and value != section.value
     ]
     missing_anchors = [
         anchor
@@ -350,8 +425,14 @@ def _validate_required_sections(
     ]
     if missing or missing_anchors or not prompt.strip():
         joined = ", ".join(missing + missing_anchors) or "prompt"
-        raise _too_complex(f"required concepts could not be represented: {joined}")
+        raise _required_state_truncated(
+            f"required concepts could not be represented: {joined}"
+        )
 
 
 def _too_complex(reason: str) -> ImagePromptBuildError:
     return ImagePromptBuildError(f"ZIMAGE_PROMPT_TOO_COMPLEX: {reason}")
+
+
+def _required_state_truncated(reason: str) -> ImagePromptBuildError:
+    return ImagePromptBuildError(f"PROMPT_REQUIRED_STATE_TRUNCATED: {reason}")

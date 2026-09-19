@@ -76,6 +76,19 @@ def valid_plan_payload() -> dict[str, object]:
                 "location_id": "shaft",
                 "characters_visible": ["miners"],
                 "important_objects": ["ladder"],
+                "main_visual_idea": "The miners are far below the surface.",
+                "visible_physical_state": "One representative miner stands below the intact ladder.",
+                "essential_environment_cues": ["simple vertical shaft"],
+                "optional_entities_to_omit": ["pipes", "rails", "extra miners"],
+                "character_count_target": 1,
+                "background_complexity": "SPARSE",
+                "complexity_budget": {
+                    "max_main_subjects": 1,
+                    "max_supporting_objects": 2,
+                    "max_environment_concepts": 1,
+                    "max_main_actions": 1,
+                },
+                "split_reason": None,
                 "camera_framing": "WIDE",
                 "camera_view": "Wide vertical cutaway",
                 "framing_reason": "Establish distance and the complete escape route.",
@@ -106,6 +119,19 @@ def valid_plan_payload() -> dict[str, object]:
                 "location_id": "shaft",
                 "characters_visible": ["miners"],
                 "important_objects": ["ladder"],
+                "main_visual_idea": "The ladder is broken.",
+                "visible_physical_state": "The middle ladder section is broken.",
+                "essential_environment_cues": ["simple vertical shaft wall"],
+                "optional_entities_to_omit": ["pipes", "rails", "extra miners"],
+                "character_count_target": 1,
+                "background_complexity": "SPARSE",
+                "complexity_budget": {
+                    "max_main_subjects": 1,
+                    "max_supporting_objects": 2,
+                    "max_environment_concepts": 1,
+                    "max_main_actions": 1,
+                },
+                "split_reason": None,
                 "camera_framing": "CLOSE",
                 "camera_view": "Same cutaway, closer on the broken middle section",
                 "framing_reason": "Make the exact failed connection readable.",
@@ -135,6 +161,94 @@ def valid_plan_payload() -> dict[str, object]:
             },
         ],
     }
+
+
+def test_visual_director_request_requires_structured_scene_simplification() -> None:
+    request = build_visual_director_request("Several miners pass pipes and rails.")
+
+    assert "What can" in request
+    assert "be removed while preserving the meaning?" in request
+    assert "One frame has exactly one dominant main_visual_idea" in request
+    assert "FULL STORY STATE separate from VISIBLE ELEMENTS FOR THIS BEAT" in request
+    assert "Master-scene inventories preserve continuity" in request
+    assert "character_count_target=1" in request
+    assert "Splitting semantic beats does not" in request
+    assert "require another paid image" in request
+    for field in (
+        "main_visual_idea",
+        "visible_physical_state",
+        "essential_environment_cues",
+        "optional_entities_to_omit",
+        "character_count_target",
+        "background_complexity",
+        "complexity_budget",
+        "split_reason",
+    ):
+        assert f'"{field}"' in request
+
+
+def test_split_beats_keep_full_story_state_master_and_operations() -> None:
+    payload = valid_plan_payload()
+    beats = payload["visual_beats"]
+    assert isinstance(beats, list)
+    first, second = beats
+    first.update(
+        {
+            "physical_state": (
+                "The shaft contains miners, an intact ladder, pipes, rails and lamps."
+            ),
+            "main_visual_idea": "The miners are far below the surface.",
+            "visible_physical_state": "One representative miner stands far below.",
+            "essential_environment_cues": ["vertical shaft and distant opening"],
+            "optional_entities_to_omit": ["pipes", "rails", "extra miners"],
+            "character_count_target": 1,
+            "background_complexity": "SPARSE",
+            "complexity_budget": {
+                "max_main_subjects": 1,
+                "max_supporting_objects": 1,
+                "max_environment_concepts": 1,
+                "max_main_actions": 1,
+            },
+            "split_reason": "Distance and ladder failure are independent facts.",
+        }
+    )
+    second.update(
+        {
+            "main_visual_idea": "The ladder is broken.",
+            "visible_physical_state": "The middle ladder section is missing.",
+            "essential_environment_cues": ["same vertical shaft wall"],
+            "optional_entities_to_omit": ["pipes", "rails", "extra miners"],
+            "character_count_target": 1,
+            "background_complexity": "SPARSE",
+            "complexity_budget": {
+                "max_main_subjects": 1,
+                "max_supporting_objects": 1,
+                "max_environment_concepts": 1,
+                "max_main_actions": 1,
+            },
+            "split_reason": "Show the failed route separately from vertical distance.",
+        }
+    )
+
+    plan = VisualPlan.model_validate(payload)
+
+    assert "pipes, rails and lamps" in plan.visual_beats[0].physical_state
+    assert plan.visual_beats[0].visible_physical_state == (
+        "One representative miner stands far below."
+    )
+    assert plan.visual_beats[0].character_count_target == 1
+    assert plan.visual_beats[0].master_scene_id == "shaft_master"
+    assert plan.visual_beats[1].master_scene_id == "shaft_master"
+    assert plan.visual_beats[0].preferred_visual_operation is VisualOperation.NEW_IMAGE
+    assert plan.visual_beats[1].preferred_visual_operation is VisualOperation.EDIT_EXISTING
+
+
+def test_missing_visual_simplification_contract_is_not_silently_hydrated() -> None:
+    payload = valid_plan_payload()
+    del payload["visual_beats"][0]["main_visual_idea"]
+
+    with pytest.raises(Exception, match="main_visual_idea"):
+        VisualPlan.model_validate(payload)
 
 
 def test_visual_director_requires_semantic_granularity_and_cost_aware_states() -> None:

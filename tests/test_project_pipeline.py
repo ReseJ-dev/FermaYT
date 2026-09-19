@@ -42,7 +42,6 @@ from app.services.project_pipeline import (
 )
 from app.services.visual_planning import (
     VISUAL_DIRECTOR_VERSION,
-    VISUAL_PLAN_SCHEMA_VERSION,
     hash_story_text,
 )
 from app.tts_capabilities import TTSProviderCapabilities
@@ -416,9 +415,18 @@ def test_full_pipeline_uses_semantic_master_fallback_for_text_only_provider(
     )
 
     assert provider.calls == 1
-    assert "Use the same recurring environment" in provider.prompts[0]
-    assert "Vertical shaft, surface above, side tunnel below" in provider.prompts[0]
+    assert "Use only this minimal location context" in provider.prompts[0]
+    assert "Full shaft cutaway" in provider.prompts[0]
+    assert "Vertical shaft, surface above, side tunnel below" not in provider.prompts[0]
     assert list_master_scene_assets(session, project.id) == []
+    result = list_beat_visual_results(session, project.id)[0]
+    snapshot = result.prompt_assembly_snapshot
+    assert snapshot["continuity_mode"] == "TEXT_ONLY_FALLBACK"
+    assert any(
+        item["reference_id"] == "master:shaft_master"
+        for item in snapshot["references_requested"]
+    )
+    assert snapshot["references_actually_sent"] == []
     assert Path(report.final_mp4).is_file()
 
 
@@ -474,7 +482,7 @@ def test_pipeline_replans_current_story_saved_by_legacy_visual_director(
     save_project_visual_plan_record(
         session,
         project_id=project.id,
-        schema_version=VISUAL_PLAN_SCHEMA_VERSION,
+        schema_version="visual_plan_v1",
         visual_director_version="visual_director_v1",
         story_text_hash=hash_story_text(project.story_text),
         plan_json=legacy_plan.model_dump(mode="json"),

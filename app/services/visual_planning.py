@@ -34,8 +34,8 @@ from app.repositories import (
 )
 from app.services.planning_attempts import PlanningAttemptController
 
-VISUAL_PLAN_SCHEMA_VERSION = "visual_plan_v1"
-VISUAL_DIRECTOR_VERSION = "visual_director_v2"
+VISUAL_PLAN_SCHEMA_VERSION = "visual_plan_v2"
+VISUAL_DIRECTOR_VERSION = "visual_director_v3"
 
 logger = logging.getLogger(__name__)
 
@@ -317,6 +317,10 @@ def load_project_visual_plan(
     )
     if record is None:
         return None
+    if not is_visual_plan_record_compatible(record):
+        raise StaleProjectVisualPlanError(
+            "Persisted Project visual plan uses an incompatible planning contract"
+        )
     try:
         return VisualPlan.model_validate(record.plan_json)
     except Exception as exc:
@@ -347,6 +351,15 @@ def load_project_visual_plan_state(
     )
     if record is None:
         return None
+    if not is_visual_plan_record_compatible(record):
+        _log(
+            logging.INFO,
+            "Incompatible visual plan will be replanned",
+            project_id=project_id,
+            event="incompatible_plan_detected",
+            plan_id=record.id,
+        )
+        return None
     plan = load_project_visual_plan(session, project_id, scope_key=scope_key)
     assert plan is not None
     status = (
@@ -358,6 +371,15 @@ def load_project_visual_plan_state(
         plan=plan,
         record_id=record.id,
         status=status,
+    )
+
+
+def is_visual_plan_record_compatible(record: object) -> bool:
+    """Use persisted contract versions as the deterministic restart gate."""
+    return bool(
+        getattr(record, "schema_version", None) == VISUAL_PLAN_SCHEMA_VERSION
+        and getattr(record, "visual_director_version", None)
+        == VISUAL_DIRECTOR_VERSION
     )
 
 

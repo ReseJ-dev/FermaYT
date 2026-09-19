@@ -1,5 +1,6 @@
 """Validated semantic plan produced before any visual assets are generated."""
 
+import re
 from collections.abc import Sequence
 from enum import Enum
 from typing import Protocol
@@ -130,6 +131,14 @@ class CameraMovement(str, Enum):
     HIGHLIGHT = "HIGHLIGHT"
 
 
+class BackgroundComplexity(str, Enum):
+    """How much non-essential environment may remain visible in one beat."""
+
+    NONE = "NONE"
+    SPARSE = "SPARSE"
+    SIMPLE = "SIMPLE"
+
+
 class _VisualModel(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -211,14 +220,76 @@ class SafetyGeography(_VisualModel):
     obstacle_between: str = Field(min_length=1)
 
 
+class VisualComplexityBudget(_VisualModel):
+    """Strong simplicity defaults that may be raised for a story-critical scene."""
+
+    max_main_subjects: int = Field(default=1, ge=1, le=12)
+    max_supporting_objects: int = Field(default=2, ge=0, le=20)
+    max_environment_concepts: int = Field(default=1, ge=1, le=6)
+    max_main_actions: int = Field(default=1, ge=1, le=6)
+
+
 class VisualBeat(_VisualModel):
     id: str = Field(min_length=1)
     narration_segment: str = Field(min_length=1)
     visual_purpose: str = Field(min_length=1)
     what_viewer_should_understand: str = Field(min_length=1)
     location_id: str = Field(min_length=1)
-    characters_visible: list[str] = Field(default_factory=list)
-    important_objects: list[str] = Field(default_factory=list)
+    characters_visible: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Only character identities essential in this frame, not every character "
+            "present in the full story state."
+        ),
+    )
+    important_objects: list[str] = Field(
+        default_factory=list,
+        description=(
+            "Only story objects that must be visible in this frame; location and "
+            "master-scene inventories are continuity knowledge, not a visibility list."
+        ),
+    )
+    essential_environment_cues: list[str] = Field(
+        min_length=1,
+        max_length=3,
+        description=(
+            "One to three minimal setting cues needed to recognize the location; "
+            "never the full master-scene inventory."
+        ),
+    )
+    main_visual_idea: str = Field(
+        min_length=1,
+        description="The one dominant visual fact this frame must communicate.",
+    )
+    visible_physical_state: str = Field(
+        min_length=1,
+        description=(
+            "The minimum physical action/state that must actually be drawn. Full "
+            "story state remains in physical_state."
+        ),
+    )
+    optional_entities_to_omit: list[str] = Field(
+        description=(
+            "Mentioned or continuity-known entities deliberately omitted to keep the "
+            "frame readable."
+        ),
+    )
+    character_count_target: int = Field(
+        ge=0,
+        le=30,
+        description=(
+            "Number of people to draw; prefer one representative unless group size is "
+            "story-critical."
+        ),
+    )
+    background_complexity: BackgroundComplexity
+    complexity_budget: VisualComplexityBudget
+    split_reason: str | None = Field(
+        default=None,
+        description=(
+            "Why adjacent beats were needed to separate independent visual facts."
+        ),
+    )
     camera_framing: ShotFraming
     camera_view: str = Field(min_length=1)
     framing_reason: str = Field(
@@ -267,6 +338,18 @@ class VisualBeat(_VisualModel):
         description="A restrained route, arrow or highlight; never a full slide.",
     )
     estimated_duration_seconds: float = Field(gt=0, le=12)
+
+    @field_validator(
+        "characters_visible",
+        "important_objects",
+        "essential_environment_cues",
+        "optional_entities_to_omit",
+        "must_not_show",
+    )
+    @classmethod
+    def deduplicate_visual_lists(cls, value: list[str]) -> list[str]:
+        """Repair harmless provider duplication without dropping unique meaning."""
+        return list(dict.fromkeys(item.strip() for item in value if item.strip()))
 
     @model_validator(mode="before")
     @classmethod
@@ -422,6 +505,17 @@ class VisualPlan(_VisualModel):
             for master_scene in self.possible_master_scenes
         }
         for beat in self.visual_beats:
+            complexity = assess_visual_beat_complexity(beat)
+            if complexity.split_required:
+                raise ValueError(
+                    "COMPLEXITY_BUDGET_EXCEEDED: "
+                    f"beat {beat.id} requires split: {'; '.join(complexity.reasons)}"
+                )
+            if complexity.budget_exceeded:
+                raise ValueError(
+                    "COMPLEXITY_BUDGET_EXCEEDED: "
+                    f"beat {beat.id}: {'; '.join(complexity.reasons)}"
+                )
             _require_known(
                 beat.location_id,
                 location_ids,
@@ -553,6 +647,100 @@ class VisualPlan(_VisualModel):
         # Evaluate these collections so duplicate checks also apply when empty.
         _ = environment_ids, beat_ids
         return self
+
+
+class VisualComplexityAssessment(_VisualModel):
+    budget_exceeded: bool
+    split_required: bool
+    main_action_count: int
+    visible_character_count: int
+    supporting_object_count: int
+    environment_concept_count: int
+    reasons: list[str] = Field(default_factory=list)
+
+
+_ACTION_FAMILIES: tuple[tuple[str, str], ...] = (
+    ("reach", r"\b(?:reach(?:es|ed|ing)?|approach(?:es|ed|ing)?)\b"),
+    ("fail", r"\b(?:fail(?:s|ed|ing)?|go(?:es)? out|went out)\b"),
+    ("climb", r"\b(?:climb(?:s|ed|ing)?|ascend(?:s|ed|ing)?)\b"),
+    ("break", r"\b(?:break(?:s|ing)?|broke|broken|collapse(?:s|d|ing)?)\b"),
+    ("move", r"\b(?:move(?:s|d|ing)?|shift(?:s|ed|ing)?|vibrat(?:e|es|ed|ing))\b"),
+    ("rise", r"\b(?:rise(?:s|n)?|rising|rose|flood(?:s|ed|ing)?)\b"),
+    ("fall", r"\b(?:fall(?:s|en|ing)?|fell|drop(?:s|ped|ping)?)\b"),
+    ("blocked", r"\b(?:block(?:s|ed|ing)?|seal(?:s|ed|ing)?)\b"),
+    ("travel", r"\b(?:walk(?:s|ed|ing)?|run(?:s|ning)?|enter(?:s|ed|ing)?|leave(?:s|d|ing)?)\b"),
+    ("ignite", r"\b(?:ignit(?:e|es|ed|ing)|burn(?:s|ed|ing)?)\b"),
+)
+
+
+def assess_visual_beat_complexity(beat: VisualBeat) -> VisualComplexityAssessment:
+    """Deterministically enforce the beat's own visible-complexity contract."""
+    omitted = " ".join(beat.optional_entities_to_omit).casefold()
+    visible_objects = [
+        item for item in dict.fromkeys(beat.important_objects)
+        if item.casefold() not in omitted
+    ]
+    visible_cues = [
+        item for item in dict.fromkeys(beat.essential_environment_cues)
+        if not _cue_is_fully_omitted(item, beat.optional_entities_to_omit)
+    ]
+    action_families = _visual_action_families(
+        f"{beat.main_visual_idea}. {beat.visible_physical_state}"
+    )
+    action_count = max(1, len(action_families))
+    character_count = beat.character_count_target
+    object_count = len(visible_objects)
+    environment_count = len(visible_cues)
+    budget = beat.complexity_budget
+    reasons: list[str] = []
+    split_required = False
+    if action_count > budget.max_main_actions:
+        reasons.append(
+            f"{action_count} independent visible actions exceed {budget.max_main_actions}"
+        )
+        split_required = True
+    if object_count > budget.max_supporting_objects:
+        reasons.append(
+            f"{object_count} story-critical objects exceed {budget.max_supporting_objects}"
+        )
+        split_required = True
+    if character_count > budget.max_main_subjects:
+        reasons.append(
+            f"{character_count} visible characters exceed {budget.max_main_subjects}"
+        )
+    if environment_count > budget.max_environment_concepts:
+        reasons.append(
+            f"{environment_count} environment cues exceed {budget.max_environment_concepts}"
+        )
+    return VisualComplexityAssessment(
+        budget_exceeded=bool(reasons),
+        split_required=split_required,
+        main_action_count=action_count,
+        visible_character_count=character_count,
+        supporting_object_count=object_count,
+        environment_concept_count=environment_count,
+        reasons=reasons,
+    )
+
+
+def _visual_action_families(value: str) -> set[str]:
+    lowered = value.casefold()
+    return {
+        family
+        for family, pattern in _ACTION_FAMILIES
+        if re.search(pattern, lowered)
+    }
+
+
+def _cue_is_fully_omitted(cue: str, omitted_entities: Sequence[str]) -> bool:
+    cue_tokens = set(re.findall(r"[a-z0-9_]+", cue.casefold()))
+    if not cue_tokens:
+        return True
+    for omitted in omitted_entities:
+        omitted_tokens = set(re.findall(r"[a-z0-9_]+", omitted.casefold()))
+        if omitted_tokens and cue_tokens <= omitted_tokens:
+            return True
+    return False
 
 
 def _unique_ids(items: Sequence[_Identified], label: str) -> set[str]:
